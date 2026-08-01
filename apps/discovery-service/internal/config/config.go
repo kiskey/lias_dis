@@ -3,7 +3,7 @@
 // following the structure defined in Appendix A of the implementation specification.
 //
 // File:    apps/discovery-service/internal/config/config.go
-// Version: 1.1
+// Version: 1.2
 package config
 
 import (
@@ -49,12 +49,14 @@ type PiholeConfig struct {
 }
 
 // DHCPConfig configures the DHCP lease file parser.
-// v1.1: Added LeaseURL to support fetching leases from remote routers over HTTP.
+// v1.2: Added SSH support to natively pull /tmp/dhcp.leases from OpenWrt routers.
 type DHCPConfig struct {
     Enabled   bool   `yaml:"enabled"`
     Type      string `yaml:"type"`       // router, pihole, dnsmasq, kea
-    LeaseFile string `yaml:"lease_file"` // Local file path (e.g., if DIS runs on the router itself)
-    LeaseURL  string `yaml:"lease_url"`  // Remote URL (e.g., http://192.168.1.1/dhcp.leases)
+    LeaseFile string `yaml:"lease_file"` // Local file path (if DIS runs on the router itself)
+    LeaseURL  string `yaml:"lease_url"`  // Remote HTTP URL (if served via custom script)
+    SSHHost   string `yaml:"ssh_host"`   // Remote SSH host (e.g., 192.168.1.1)
+    SSHUser   string `yaml:"ssh_user"`   // SSH user (e.g., root)
 }
 
 // EnrichmentConfig enables or disables on-demand enrichers.
