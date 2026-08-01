@@ -2,14 +2,13 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 1.2
+// Version: 1.3
 package discovery
 
 import (
     "context"
     "fmt"
     "log/slog"
-    "net"
     "time"
 
     "github.com/vishvananda/netlink"
@@ -26,7 +25,6 @@ type NetlinkProvider struct {
 }
 
 // NewNetlinkProvider initializes the netlink subscriber for a specific interface.
-// If iface is empty, it subscribes to all interfaces.
 func NewNetlinkProvider(iface string) *NetlinkProvider {
     return &NetlinkProvider{
         events: make(chan Observation, 256),
@@ -39,16 +37,16 @@ func NewNetlinkProvider(iface string) *NetlinkProvider {
 func (p *NetlinkProvider) Name() string { return "netlink" }
 
 // Start begins listening for neighbor updates. It uses NeighSubscribeWithOptions
-// with ListExisting: true to atomically seed the cache with currently connected
-// devices and subscribe to live updates without missing events.
+// with ListExisting: true to atomically seed the cache.
 func (p *NetlinkProvider) Start(ctx context.Context) error {
     p.ctx, p.cancel = context.WithCancel(ctx)
 
     ch := make(chan netlink.NeighUpdate)
     done := make(chan struct{})
     
-    opt := func(cfg *netlink.NeighSubscribeOptions) {
-        cfg.ListExisting = true
+    // FIX: NeighSubscribeWithOptions expects a struct, not a functional option
+    opt := netlink.NeighSubscribeOptions{
+        ListExisting: true,
     }
     
     if err := netlink.NeighSubscribeWithOptions(ch, done, opt); err != nil {
@@ -67,7 +65,6 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
                 if !ok {
                     return
                 }
-                // Filter by interface if configured
                 if p.iface != "" {
                     link, err := netlink.LinkByIndex(update.Neigh.LinkIndex)
                     if err != nil || link.Attrs().Name != p.iface {
@@ -75,8 +72,7 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
                     }
                 }
                 
-                // RTM_NEWNEIGH (0x01) is add/update, RTM_DELNEIGH (0x02) is delete
-                isAdd := update.Type == 0x01 
+                isAdd := update.Type == 0x01 // RTM_NEWNEIGH
                 p.emitObservation(update.Neigh, isAdd)
             }
         }
@@ -88,20 +84,17 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
 // emitObservation translates a netlink.Neigh into an Observation and sends it.
 func (p *NetlinkProvider) emitObservation(n netlink.Neigh, online bool) {
     if n.HardwareAddr == nil || len(n.HardwareAddr) == 0 {
-        return // Skip incomplete entries (e.g., failed ARP resolutions)
+        return
     }
 
     obs := Observation{
         Source:     p.Name(),
         MAC:        n.HardwareAddr,
         IP:         n.IP,
-        Online:     online, // Explicitly set online/offline state
-        Confidence: 0.95,   // High confidence for direct kernel observation
+        Online:     online,
+        Confidence: 0.95,
         Timestamp:  time.Now(),
     }
-
-    // We no longer clear obs.IP on offline events. The correlation engine needs
-    // the IP to efficiently find the device in the cache if MAC matching fails.
 
     select {
     case p.events <- obs:
@@ -114,7 +107,7 @@ func (p *NetlinkProvider) emitObservation(n netlink.Neigh, online bool) {
 func (p *NetlinkProvider) Stop() error {
     if p.cancel != nil {
         p.cancel()
-        <-p.done // Wait for goroutine to exit
+        <-p.done
     }
     return nil
 }
