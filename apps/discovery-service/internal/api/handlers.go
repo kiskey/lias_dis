@@ -1,37 +1,38 @@
 // Package api implements the HTTP server, middleware, and SSE broker for DIS.
 //
 // File:    apps/discovery-service/internal/api/handlers.go
-// Version: 1.1
+// Version: 1.2
 package api
 
 import (
-    "context"
     "crypto/rand"
     "encoding/hex"
     "encoding/json"
-    "log/slog"
     "net/http"
-    "time"
 
-    "github.com/user/lias-dis/apps/discovery-service/internal/discovery"
     "github.com/user/lias-dis/apps/discovery-service/internal/inventory"
     "github.com/user/lias-dis/shared/api"
-    "github.com/user/lias-dis/shared/models"
 )
+
+// EnrichmentTrigger defines the interface for triggering on-demand enrichment.
+// This decouples the API layer from the discovery package, preventing cyclic imports.
+type EnrichmentTrigger interface {
+    TriggerEnrichment(pdid string, force bool)
+}
 
 // Handlers contains the HTTP handlers for the DIS REST API.
 type Handlers struct {
-    cache     *inventory.Cache
-    broker    *Broker
-    enrichers []discovery.Enricher
+    cache  *inventory.Cache
+    broker *Broker
+    orch   EnrichmentTrigger
 }
 
 // NewHandlers creates a new Handlers instance.
-func NewHandlers(cache *inventory.Cache, broker *Broker, enrichers []discovery.Enricher) *Handlers {
+func NewHandlers(cache *inventory.Cache, broker *Broker, orch EnrichmentTrigger) *Handlers {
     return &Handlers{
-        cache:     cache,
-        broker:    broker,
-        enrichers: enrichers,
+        cache:  cache,
+        broker: broker,
+        orch:   orch,
     }
 }
 
@@ -65,8 +66,8 @@ func (h *Handlers) GetDevice(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(d)
 }
 
-// RefreshDevice triggers an on-demand enrichment for a device.
-// It executes all configured enrichers asynchronously and updates the cache.
+// RefreshDevice triggers an on-demand enrichment for a device via the orchestrator.
+// The orchestrator handles running primaries and falling back to Nmap if needed.
 func (h *Handlers) RefreshDevice(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
     d := h.cache.Get(pdid)
@@ -75,54 +76,10 @@ func (h *Handlers) RefreshDevice(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Execute enrichers asynchronously to not block the HTTP request
-    go func(dev *models.Device) {
-        for _, e := range h.enrichers {
-            enr, err := e.Enrich(context.Background(), dev)
-            if err != nil {
-                slog.Debug("Enricher failed", "enricher", e.Name(), "error", err)
-                continue
-            }
-            if enr != nil {
-                changed := false
-                // Apply enrichment fields if they are provided and confidence hierarchy allows
-                if enr.Hostname != "" && dev.Hostname != enr.Hostname {
-                    dev.Hostname = enr.Hostname
-                    changed = true
-                }
-                if enr.FriendlyName != "" && dev.FriendlyName != enr.FriendlyName {
-                    dev.FriendlyName = enr.FriendlyName
-                    changed = true
-                }
-                if enr.Manufacturer != "" && dev.Manufacturer != enr.Manufacturer {
-                    dev.Manufacturer = enr.Manufacturer
-                    changed = true
-                }
-                if enr.Vendor != "" && dev.Vendor != enr.Vendor {
-                    dev.Vendor = enr.Vendor
-                    changed = true
-                }
-                if enr.Model != "" && dev.Model != enr.Model {
-                    dev.Model = enr.Model
-                    changed = true
-                }
-                if enr.DeviceType != "" && dev.DeviceType != enr.DeviceType {
-                    dev.DeviceType = enr.DeviceType
-                    changed = true
-                }
-                for _, svc := range enr.Services {
-                    dev.AddService(svc)
-                    changed = true
-                }
-                
-                if changed {
-                    dev.Touch(time.Now())
-                    h.cache.Upsert(dev)
-                    h.broker.Broadcast(models.NewEvent(models.EventFingerprintUpdated, dev.PDID, dev))
-                }
-            }
-        }
-    }(d)
+    // Force enrichment pipeline asynchronously
+    if h.orch != nil {
+        go h.orch.TriggerEnrichment(pdid, true)
+    }
 
     w.Header().Set("Content-Type", "application/json")
     w.WriteHeader(http.StatusAccepted)
