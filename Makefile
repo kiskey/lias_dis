@@ -1,5 +1,5 @@
 # LIAS & DIS Build Automation
-# Version: 1.1
+# Version: 1.2
 
 BINARY_DIS := dis
 BINARY_LIAS := lias
@@ -19,14 +19,14 @@ build: build-dis build-lias
 build-dis:
     @echo "Building $(BINARY_DIS)..."
     @mkdir -p $(BUILD_DIR)
-    cd apps/discovery-service && go mod download
+    cd apps/discovery-service && go mod tidy
     cd apps/discovery-service && CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o ../../$(BUILD_DIR)/$(BINARY_DIS) ./cmd/discovery-service
 
 .PHONY: build-lias
 build-lias:
     @echo "Building $(BINARY_LIAS)..."
     @mkdir -p $(BUILD_DIR)
-    cd apps/lias && go mod download
+    cd apps/lias && go mod tidy
     cd apps/lias && CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o ../../$(BUILD_DIR)/$(BINARY_LIAS) ./cmd/lias
 
 # Cross-compile for linux/amd64 and linux/arm64
@@ -37,18 +37,18 @@ release: release-amd64 release-arm64
 release-amd64: 
     @echo "Cross-compiling for linux/amd64..."
     @mkdir -p $(BUILD_DIR)
-    cd apps/discovery-service && go mod download
+    cd apps/discovery-service && go mod tidy
     cd apps/discovery-service && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o ../../$(BUILD_DIR)/$(BINARY_DIS)-amd64 ./cmd/discovery-service
-    cd apps/lias && go mod download
+    cd apps/lias && go mod tidy
     cd apps/lias && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o ../../$(BUILD_DIR)/$(BINARY_LIAS)-amd64 ./cmd/lias
 
 .PHONY: release-arm64
 release-arm64:
     @echo "Cross-compiling for linux/arm64..."
     @mkdir -p $(BUILD_DIR)
-    cd apps/discovery-service && go mod download
+    cd apps/discovery-service && go mod tidy
     cd apps/discovery-service && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o ../../$(BUILD_DIR)/$(BINARY_DIS)-arm64 ./cmd/discovery-service
-    cd apps/lias && go mod download
+    cd apps/lias && go mod tidy
     cd apps/lias && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o ../../$(BUILD_DIR)/$(BINARY_LIAS)-arm64 ./cmd/lias
 
 # Run DIS locally
