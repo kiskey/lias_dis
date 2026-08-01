@@ -3,7 +3,7 @@
 // devices, and exposes a REST + SSE API for LIAS to consume.
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 1.2
+// Version: 1.3
 package main
 
 import (
@@ -75,31 +75,42 @@ func main() {
         }
     }
     
-    // Initialize Enrichers
-    var enrichers []discovery.Enricher
-    if cfg.Discovery.Enrichment.NmapEnabled {
-        enrichers = append(enrichers, discovery.NewNmapEnricher())
-    }
+    // Initialize Primary Enrichers (Avahi, SSDP, NetBIOS)
+    var primaries []discovery.Enricher
     if cfg.Discovery.Enrichment.AvahiEnabled {
-        enrichers = append(enrichers, discovery.NewAvahiEnricher())
+        e := discovery.NewAvahiEnricher()
+        _ = e.Start(ctx)
+        primaries = append(primaries, e)
     }
     if cfg.Discovery.Enrichment.SSDPEnabled {
-        enrichers = append(enrichers, discovery.NewSSDPEnricher())
+        e := discovery.NewSSDPEnricher()
+        _ = e.Start(ctx)
+        primaries = append(primaries, e)
     }
     if cfg.Discovery.Enrichment.NetbiosEnabled {
-        enrichers = append(enrichers, discovery.NewNetBIOSEnricher())
-    }
-    for _, e := range enrichers {
+        e := discovery.NewNetBIOSEnricher()
         _ = e.Start(ctx)
+        primaries = append(primaries, e)
     }
+
+    // Initialize Fallback Enricher (Nmap)
+    var fallback discovery.Enricher
+    if cfg.Discovery.Enrichment.NmapEnabled {
+        e := discovery.NewNmapEnricher()
+        _ = e.Start(ctx)
+        fallback = e
+    }
+
+    // Initialize Orchestrator and wire to Engine
+    orch := discovery.NewOrchestrator(cache, broker, primaries, fallback)
+    eng.SetOrchestrator(orch)
 
     // Start Correlation Engine
     eng.Run(ctx, providers)
 
     // API Server
     mux := http.NewServeMux()
-    // Pass enrichers to handlers to support /refresh endpoint
-    handlers := disAPI.NewHandlers(cache, broker, enrichers)
+    handlers := disAPI.NewHandlers(cache, broker, orch)
     handlers.RegisterRoutes(mux)
 
     mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
