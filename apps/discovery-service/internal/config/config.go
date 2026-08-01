@@ -3,7 +3,7 @@
 // following the structure defined in Appendix A of the implementation specification.
 //
 // File:    apps/discovery-service/internal/config/config.go
-// Version: 1.0
+// Version: 1.1
 package config
 
 import (
@@ -16,9 +16,9 @@ import (
 
 // Config represents the root configuration object for DIS.
 type Config struct {
-    HTTP       HTTPConfig       `yaml:"http"`
-    Discovery  DiscoveryConfig  `yaml:"discovery"`
-    Logging    LoggingConfig    `yaml:"logging"`
+    HTTP      HTTPConfig      `yaml:"http"`
+    Discovery DiscoveryConfig `yaml:"discovery"`
+    Logging   LoggingConfig   `yaml:"logging"`
 }
 
 // HTTPConfig defines the listen address and optional auth token for the REST API.
@@ -49,19 +49,21 @@ type PiholeConfig struct {
 }
 
 // DHCPConfig configures the DHCP lease file parser.
+// v1.1: Added LeaseURL to support fetching leases from remote routers over HTTP.
 type DHCPConfig struct {
     Enabled   bool   `yaml:"enabled"`
-    Type      string `yaml:"type"` // router, pihole, dnsmasq, kea
-    LeaseFile string `yaml:"lease_file"`
+    Type      string `yaml:"type"`       // router, pihole, dnsmasq, kea
+    LeaseFile string `yaml:"lease_file"` // Local file path (e.g., if DIS runs on the router itself)
+    LeaseURL  string `yaml:"lease_url"`  // Remote URL (e.g., http://192.168.1.1/dhcp.leases)
 }
 
 // EnrichmentConfig enables or disables on-demand enrichers.
 type EnrichmentConfig struct {
-    NmapEnabled       bool          `yaml:"nmap_enabled"`
-    AvahiEnabled      bool          `yaml:"avahi_enabled"`
-    SSDPEnabled       bool          `yaml:"ssdp_enabled"`
-    NetbiosEnabled    bool          `yaml:"netbios_enabled"`
-    UnknownDeviceScan bool          `yaml:"unknown_device_scan"`
+    NmapEnabled        bool          `yaml:"nmap_enabled"`
+    AvahiEnabled       bool          `yaml:"avahi_enabled"`
+    SSDPEnabled        bool          `yaml:"ssdp_enabled"`
+    NetbiosEnabled     bool          `yaml:"netbios_enabled"`
+    UnknownDeviceScan  bool          `yaml:"unknown_device_scan"`
     ValidationInterval time.Duration `yaml:"validation_interval"`
 }
 
