@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 1.0
+// Version: 1.1
 package discovery
 
 import (
@@ -38,40 +38,27 @@ func NewNetlinkProvider(iface string) *NetlinkProvider {
 // Name returns the provider's identifier.
 func (p *NetlinkProvider) Name() string { return "netlink" }
 
-// Start begins listening for neighbor updates. It seeds the initial state
-// with currently existing neighbors, then subscribes to live updates.
+// Start begins listening for neighbor updates. It uses NeighSubscribeWithOptions
+// with ListExisting: true to atomically seed the cache with currently connected
+// devices and subscribe to live updates without missing events.
 func (p *NetlinkProvider) Start(ctx context.Context) error {
     p.ctx, p.cancel = context.WithCancel(ctx)
 
-    // 1. Seed existing neighbors
-    neighs, err := netlink.NeighList(0, 0)
-    if err != nil {
-        return fmt.Errorf("failed to list existing neighbors: %w", err)
+    ch := make(chan netlink.NeighUpdate)
+    done := make(chan struct{})
+    
+    // Atomic subscribe with ListExisting to avoid missing events during startup gap
+    opt := func(cfg *netlink.NeighSubscribeOptions) {
+        cfg.ListExisting = true
+    }
+    
+    if err := netlink.NeighSubscribeWithOptions(ch, done, opt); err != nil {
+        return fmt.Errorf("failed to subscribe to netlink: %w", err)
     }
 
     go func() {
         defer close(p.done)
         
-        // Emit existing neighbors
-        for _, n := range neighs {
-            if p.iface != "" {
-                link, err := netlink.LinkByIndex(n.LinkIndex)
-                if err != nil || link.Attrs().Name != p.iface {
-                    continue
-                }
-            }
-            p.emitObservation(n, true)
-        }
-
-        // 2. Subscribe to live neighbor updates
-        ch := make(chan netlink.NeighUpdate)
-        done := make(chan struct{})
-        
-        if err := netlink.NeighSubscribe(ch, done); err != nil {
-            slog.Error("Netlink subscription failed", "error", err)
-            return
-        }
-
         for {
             select {
             case <-p.ctx.Done():
