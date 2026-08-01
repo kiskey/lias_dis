@@ -3,7 +3,7 @@
 // and manages an isolated nftables table to enforce network access.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 1.2
+// Version: 1.3
 package main
 
 import (
@@ -24,7 +24,7 @@ import (
     "github.com/user/lias-dis/apps/lias/internal/schedule"
     liasSync "github.com/user/lias-dis/apps/lias/internal/sync"
     "github.com/user/lias-dis/apps/lias/internal/tags"
-    "github.com/user/lias-dis/apps/lias/web" // Import the embedded web package
+    "github.com/user/lias-dis/apps/lias/web"
     sharedAPI "github.com/user/lias-dis/shared/api"
 )
 
@@ -48,7 +48,10 @@ func main() {
 
     // Core Components
     cache := liasSync.NewCache()
-    disClient := liasSync.NewDISClient(cfg.DIS, cache)
+    trigger := make(chan struct{}, 1) // Buffered to prevent blocking
+    
+    // FIX: Pass trigger channel to NewDISClient
+    disClient := liasSync.NewDISClient(cfg.DIS, cache, trigger)
     
     tagMgr := tags.NewManager()
     polEng := policy.NewEngine()
@@ -62,7 +65,6 @@ func main() {
     }
 
     builder := nftables.NewBuilder(cache, nftCtrl)
-    trigger := make(chan struct{}, 1) // Buffered to prevent blocking
     nftSync := nftables.NewSync(builder, polEng, schedEng, trigger)
 
     // Context for graceful shutdown
@@ -88,7 +90,7 @@ func main() {
         })
     })
 
-    // Serve embedded Web UI using the web package
+    // Serve embedded Web UI
     mux.Handle("/", http.FileServer(http.FS(web.FS())))
 
     srv := &http.Server{
