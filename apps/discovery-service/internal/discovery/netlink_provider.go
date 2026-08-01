@@ -7,12 +7,12 @@ package discovery
 
 import (
     "context"
+    "fmt"
     "log/slog"
     "net"
     "time"
 
     "github.com/vishvananda/netlink"
-    "github.com/user/lias-dis/shared/models"
 )
 
 // NetlinkProvider subscribes to the Linux kernel neighbor table (ARP/NDP)
@@ -67,9 +67,6 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
         ch := make(chan netlink.NeighUpdate)
         done := make(chan struct{})
         
-        // NeighSubscribeWithOptions with ListExisting:true is ideal, but to avoid 
-        // duplicate initial seeding and ensure stable behavior across kernel versions,
-        // we use a standard subscription here.
         if err := netlink.NeighSubscribe(ch, done); err != nil {
             slog.Error("Netlink subscription failed", "error", err)
             return
@@ -103,8 +100,8 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
 
 // emitObservation translates a netlink.Neigh into an Observation and sends it.
 func (p *NetlinkProvider) emitObservation(n netlink.Neigh, online bool) {
-    if len(n.IP) == 0 || n.HardwareAddr == nil {
-        return // Skip incomplete entries
+    if n.HardwareAddr == nil || len(n.HardwareAddr) == 0 {
+        return // Skip incomplete entries (e.g., failed ARP resolutions)
     }
 
     obs := Observation{
@@ -115,15 +112,8 @@ func (p *NetlinkProvider) emitObservation(n netlink.Neigh, online bool) {
         Timestamp:  time.Now(),
     }
 
-    if online {
-        // We don't set hostname/vendor here; those come from enrichers
-    } else {
-        obs.IP = nil
-        obs.MAC = nil
-        // For offline events, we need to identify the device to the engine.
-        // We'll abuse the MAC field to pass the identifier, or handle it via a 
-        // separate field if needed. For now, the engine will look up by MAC.
-        obs.MAC = n.HardwareAddr 
+    if !online {
+        obs.IP = nil // Clear IP on offline event, but keep MAC for identification
     }
 
     select {
@@ -146,5 +136,3 @@ func (p *NetlinkProvider) Stop() error {
 func (p *NetlinkProvider) Events() <-chan Observation {
     return p.events
 }
-
-// Note: netlink package is imported. fmt needs to be imported.
