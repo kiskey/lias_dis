@@ -1,11 +1,9 @@
 # LIAS & DIS CI/CD Pipeline
-# Version: 1.1
+# Version: 1.2
 name: Release
 
 on:
-#  push:
-#    tags:
-#      - 'v*.*.*'
+
   workflow_dispatch:
 
 jobs:
@@ -25,11 +23,11 @@ jobs:
         with:
           go-version: '1.23'
 
-      # FIX: Dynamically resolve dependencies and generate go.sum before building
-      - name: Download Dependencies
+      # FIX: Use 'go mod tidy' to dynamically resolve all dependencies and generate go.sum
+      - name: Resolve Dependencies
         run: |
           cd apps/${{ matrix.app }}
-          go mod download
+          go mod tidy
 
       - name: Build ${{ matrix.app }} for ${{ matrix.arch }}
         env:
