@@ -3,15 +3,13 @@
 // and manages an isolated nftables table to enforce network access.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 1.1
+// Version: 1.2
 package main
 
 import (
     "context"
-    "embed"
     "encoding/json"
     "errors"
-    "io/fs"
     "log/slog"
     "net/http"
     "os"
@@ -26,14 +24,12 @@ import (
     "github.com/user/lias-dis/apps/lias/internal/schedule"
     liasSync "github.com/user/lias-dis/apps/lias/internal/sync"
     "github.com/user/lias-dis/apps/lias/internal/tags"
+    "github.com/user/lias-dis/apps/lias/web" // Import the embedded web package
     sharedAPI "github.com/user/lias-dis/shared/api"
 )
 
 // version is injected at build time using -ldflags "-X main.version=..."
 var version = "dev"
-
-//go:embed web/*
-var webFS embed.FS
 
 func main() {
     logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -92,13 +88,8 @@ func main() {
         })
     })
 
-    // Serve embedded Web UI
-    webRoot, err := fs.Sub(webFS, "web")
-    if err != nil {
-        slog.Error("Failed to load embedded web UI", "error", err)
-    } else {
-        mux.Handle("/", http.FileServer(http.FS(webRoot)))
-    }
+    // Serve embedded Web UI using the web package
+    mux.Handle("/", http.FileServer(http.FS(web.FS())))
 
     srv := &http.Server{
         Addr:         cfg.HTTP.Listen,
