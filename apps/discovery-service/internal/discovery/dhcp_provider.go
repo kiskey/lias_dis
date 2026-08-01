@@ -9,10 +9,12 @@ import (
     "bufio"
     "bytes"
     "context"
+    "fmt"
     "io"
     "log/slog"
     "net"
     "net/http"
+    "os"
     "os/exec"
     "strings"
     "time"
@@ -98,9 +100,8 @@ func (p *DHCPProvider) poll() {
             user = "root"
         }
         
-        // Use StrictHostKeyChecking=no for homelab convenience, or rely on ~/.ssh/known_hosts
-        cmd := exec.CommandContext(p.ctx, "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", 
-            "%s@%s".format(user, p.cfg.SSHHost), "cat /tmp/dhcp.leases")
+        target := fmt.Sprintf("%s@%s", user, p.cfg.SSHHost)
+        cmd := exec.CommandContext(p.ctx, "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", target, "cat /tmp/dhcp.leases")
         
         var stdout bytes.Buffer
         cmd.Stdout = &stdout
@@ -190,9 +191,4 @@ func (p *DHCPProvider) poll() {
     if err := scanner.Err(); err != nil {
         slog.Error("Error reading DHCP leases", "error", err)
     }
-}
-
-// Helper to format string safely without importing fmt
-func (p *DHCPProvider) format(format string, a ...interface{}) string {
-    return fmt.Sprintf(format, a...)
 }
