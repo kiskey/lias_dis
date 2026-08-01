@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/pihole_provider.go
-// Version: 1.0
+// Version: 1.1
 package discovery
 
 import (
@@ -116,7 +116,6 @@ func (p *PiholeProvider) poll() {
     }
     
     // Pi-hole v6 response structure varies, but typically includes a list of clients.
-    // We use a generic struct to parse the active clients.
     var stats struct {
         Clients []struct {
             IP   string `json:"ip"`
@@ -134,7 +133,8 @@ func (p *PiholeProvider) poll() {
             Source:     p.Name(),
             IP:         net.ParseIP(c.IP),
             Hostname:   c.Name,
-            Confidence: 0.3, // LOW confidence per §3.2
+            Online:     true, // Explicitly mark as online activity
+            Confidence: 0.3,  // LOW confidence per §3.2
             Timestamp:  time.Now(),
         }
         if c.Mac != "" && c.Mac != "00:00:00:00:00:00" {
