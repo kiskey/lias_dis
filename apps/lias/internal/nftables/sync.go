@@ -1,7 +1,7 @@
 // Package nftables implements the isolated firewall controller for LIAS.
 //
 // File:    apps/lias/internal/nftables/sync.go
-// Version: 1.1
+// Version: 1.2
 package nftables
 
 import (
@@ -22,8 +22,6 @@ type Sync struct {
 }
 
 // NewSync initializes the synchronization loop.
-// The trigger channel allows external components (like the API handlers) to
-// request an immediate firewall resync.
 func NewSync(b *Builder, p policy.PolicyEvaluator, s policy.ScheduleEvaluator, trigger chan struct{}) *Sync {
     return &Sync{
         builder: b,
@@ -34,10 +32,14 @@ func NewSync(b *Builder, p policy.PolicyEvaluator, s policy.ScheduleEvaluator, t
 }
 
 // Run starts the synchronization loop.
+// It resyncs immediately when triggered, and falls back to a 10-second
+// periodic self-healing resync to protect against external table flushes.
 func (s *Sync) Run(ctx context.Context) {
-    ticker := time.NewTicker(60 * time.Second)
+    // 10-second self-healing ticker
+    ticker := time.NewTicker(10 * time.Second)
     defer ticker.Stop()
 
+    // Initial sync on startup
     s.resync()
 
     for {
