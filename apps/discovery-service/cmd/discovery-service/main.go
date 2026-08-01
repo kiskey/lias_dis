@@ -3,7 +3,7 @@
 // devices, and exposes a REST + SSE API for LIAS to consume.
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 1.1
+// Version: 1.2
 package main
 
 import (
@@ -75,7 +75,7 @@ func main() {
         }
     }
     
-    // Initialize Enrichers (started to satisfy lifecycle, triggered on-demand)
+    // Initialize Enrichers
     var enrichers []discovery.Enricher
     if cfg.Discovery.Enrichment.NmapEnabled {
         enrichers = append(enrichers, discovery.NewNmapEnricher())
@@ -98,7 +98,8 @@ func main() {
 
     // API Server
     mux := http.NewServeMux()
-    handlers := disAPI.NewHandlers(cache, broker)
+    // Pass enrichers to handlers to support /refresh endpoint
+    handlers := disAPI.NewHandlers(cache, broker, enrichers)
     handlers.RegisterRoutes(mux)
 
     mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
