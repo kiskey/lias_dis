@@ -2,7 +2,7 @@
 // from multiple providers into canonical device records.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 1.2
+// Version: 1.3
 package correlation
 
 import (
@@ -96,9 +96,14 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         ipStr = obs.IP.String()
     }
 
-    // Heuristic for offline events (primarily from netlink RTM_DELNEIGH)
-    if obs.IP == nil && macStr != "" {
-        d := e.findDevice(macStr, "")
+    // Handle explicit offline events (e.g., netlink RTM_DELNEIGH)
+    if !obs.Online {
+        // Must have at least a MAC or IP to identify the device
+        if macStr == "" && ipStr == "" {
+            return
+        }
+        
+        d := e.findDevice(macStr, ipStr)
         if d != nil && d.Online {
             d.Online = false
             d.LastSeen = time.Now()
@@ -111,6 +116,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         return
     }
 
+    // Handle online events
     // Must have at least a MAC or IP to proceed
     if macStr == "" && ipStr == "" {
         return
@@ -154,6 +160,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         Timestamp: time.Now(),
     }
 
+    // If device was offline, mark it online
     if !d.Online {
         d.Online = true
         changed = true
