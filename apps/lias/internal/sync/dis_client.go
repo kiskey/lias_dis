@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 1.0
+// Version: 1.1
 package sync
 
 import (
@@ -22,17 +22,20 @@ import (
 
 // DISClient manages the REST and SSE connections to the Discovery Intelligence Service.
 type DISClient struct {
-    cfg    config.DISConfig
-    cache  *Cache
-    client *http.Client
+    cfg     config.DISConfig
+    cache   *Cache
+    client  *http.Client
+    trigger chan struct{} // Trigger channel for immediate nftables resync
 }
 
 // NewDISClient initializes the DIS client.
-func NewDISClient(cfg config.DISConfig, cache *Cache) *DISClient {
+// The trigger channel is used to notify the nftables sync loop of immediate changes.
+func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}) *DISClient {
     return &DISClient{
-        cfg:    cfg,
-        cache:  cache,
-        client: &http.Client{Timeout: 10 * time.Second},
+        cfg:     cfg,
+        cache:   cache,
+        client:  &http.Client{Timeout: 10 * time.Second},
+        trigger: trigger,
     }
 }
 
@@ -40,12 +43,22 @@ func NewDISClient(cfg config.DISConfig, cache *Cache) *DISClient {
 func (c *DISClient) Run(ctx context.Context) {
     // 1. Initial blocking sync to ensure cache is populated before LIAS activates
     c.pollDevices()
+    // Trigger initial firewall population
+    c.tryTrigger()
 
     // 2. Start background poller (fallback)
     go c.pollerLoop(ctx)
 
     // 3. Start SSE consumer (primary real-time updates)
     go c.sseLoop(ctx)
+}
+
+// tryTrigger sends a non-blocking signal to the nftables sync loop.
+func (c *DISClient) tryTrigger() {
+    select {
+    case c.trigger <- struct{}{}:
+    default:
+    }
 }
 
 // pollerLoop periodically fetches the full device list from DIS.
@@ -59,6 +72,7 @@ func (c *DISClient) pollerLoop(ctx context.Context) {
             return
         case <-ticker.C:
             c.pollDevices()
+            c.tryTrigger() // Resync firewall after poll
         }
     }
 }
@@ -114,7 +128,6 @@ func (c *DISClient) sseLoop(ctx context.Context) {
 
         err := c.consumeSSE(ctx)
         if err == nil {
-            // Should only exit nil if context is cancelled
             return
         }
 
@@ -142,7 +155,6 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
     }
     req.Header.Set("Accept", "text/event-stream")
 
-    // Use a client with no timeout for SSE
     sseClient := &http.Client{}
     resp, err := sseClient.Do(req)
     if err != nil {
@@ -154,7 +166,6 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
         return fmt.Errorf("SSE returned non-200 status: %d", resp.StatusCode)
     }
 
-    // Reset backoff on successful connection
     slog.Info("Connected to DIS SSE stream")
 
     scanner := bufio.NewScanner(resp.Body)
@@ -165,7 +176,6 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
         line := scanner.Text()
 
         if line == "" {
-            // Empty line signals end of event. Dispatch if we have data.
             if dataBuf.Len() > 0 {
                 event.Payload = json.RawMessage(dataBuf.String())
                 c.handleEvent(event)
@@ -179,8 +189,6 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
             event.Type = models.EventType(strings.TrimPrefix(line, "event: "))
         } else if strings.HasPrefix(line, "data: ") {
             dataBuf.WriteString(strings.TrimPrefix(line, "data: "))
-        } else if strings.HasPrefix(line, "id: ") {
-            // We don't replay Last-Event-ID yet in v1.0, but could in the future.
         }
     }
 
@@ -191,9 +199,6 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
 }
 
 // handleEvent processes a single SSE event and applies it to the local cache.
-// In v1.0, it mostly triggers a re-poll of the single device or relies on the 
-// presence data. To keep the cache strictly consistent without duplicate logic, 
-// we trigger a lightweight local update or fetch.
 func (c *DISClient) handleEvent(e models.Event) {
     if e.DeviceID == "" {
         return
@@ -203,21 +208,26 @@ func (c *DISClient) handleEvent(e models.Event) {
     case models.EventDeviceRemoved:
         c.cache.RemoveDevice(e.DeviceID)
         slog.Info("Removed device from local cache", "pdid", e.DeviceID)
+        c.tryTrigger() // Trigger immediate firewall resync
 
     case models.EventDeviceAdded, models.EventDeviceOnline, models.EventDeviceOffline,
         models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged, models.EventFingerprintUpdated:
         
-        // For v1.0 simplicity and consistency, we fetch the updated single device.
-        // This ensures the LocalDevice overlay is preserved while base data updates.
-        go c.fetchSingleDevice(e.DeviceID)
+        // Fetch the updated single device to sync base data while preserving overlays
+        go func(pdid string) {
+            if c.fetchSingleDevice(pdid) {
+                c.tryTrigger() // Trigger immediate firewall resync on successful update
+            }
+        }(e.DeviceID)
     }
 }
 
 // fetchSingleDevice fetches a specific device from DIS and updates the cache.
-func (c *DISClient) fetchSingleDevice(pdid string) {
+// Returns true if the device was successfully fetched and updated.
+func (c *DISClient) fetchSingleDevice(pdid string) bool {
     req, err := http.NewRequest("GET", c.cfg.URL+"/api/v1/devices/"+pdid, nil)
     if err != nil {
-        return
+        return false
     }
     if c.cfg.AuthToken != "" {
         req.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
@@ -226,18 +236,19 @@ func (c *DISClient) fetchSingleDevice(pdid string) {
     resp, err := c.client.Do(req)
     if err != nil {
         slog.Error("Failed to fetch single device from DIS", "pdid", pdid, "error", err)
-        return
+        return false
     }
     defer resp.Body.Close()
 
     if resp.StatusCode != http.StatusOK {
-        return
+        return false
     }
 
     var d models.Device
     if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-        return
+        return false
     }
 
     c.cache.UpsertDevice(d)
+    return true
 }
