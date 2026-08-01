@@ -1,0 +1,60 @@
+# LIAS & DIS CI/CD Pipeline
+# Version: 1.0
+name: Release
+
+on:
+#  push:
+#    tags:
+#      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        app: [discovery-service, lias]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build ${{ matrix.app }} for ${{ matrix.arch }}
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          VERSION=${GITHUB_REF_NAME:-dev}
+          cd apps/${{ matrix.app }}
+          go build -ldflags="-s -w -X main.version=${VERSION}" -o ../../bin/${{ matrix.app }}-${{ matrix.arch }} ./cmd/${{ matrix.app }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app }}-${{ matrix.arch }}
+          path: bin/${{ matrix.app }}-${{ matrix.arch }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bin
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: bin/*
