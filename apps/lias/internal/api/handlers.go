@@ -1,7 +1,7 @@
 // Package api implements the HTTP server and REST handlers for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 1.1
+// Version: 1.2
 package api
 
 import (
@@ -148,18 +148,23 @@ func (h *Handlers) CreateTag(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) UpdateTag(w http.ResponseWriter, r *http.Request) {
-    // v1.1: Removed 501 Not Implemented stub. 
-    // Since tags manager v1.0 doesn't expose an Update method, we echo the payload 
-    // to satisfy REST contracts. Full mutation logic deferred to v1.2.
     id := r.PathValue("id")
     var t tags.Tag
     if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
         http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
         return
     }
-    t.ID = id
+    
+    // FIX: Actually persist the update to the manager
+    updated, err := h.tagMgr.Update(id, t.Name, t.Color)
+    if err != nil {
+        http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+        return
+    }
+    
+    h.tryTrigger()
     w.Header().Set("Content-Type", "application/json")
-    _ = json.NewEncoder(w).Encode(t)
+    _ = json.NewEncoder(w).Encode(updated)
 }
 
 func (h *Handlers) DeleteTag(w http.ResponseWriter, r *http.Request) {
