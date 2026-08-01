@@ -2,7 +2,7 @@
 // It enforces the one-tag-per-device rule and handles tag precedence.
 //
 // File:    apps/lias/internal/tags/manager.go
-// Version: 1.0
+// Version: 1.1
 package tags
 
 import (
@@ -68,6 +68,37 @@ func (m *Manager) Create(name, color string) (Tag, error) {
     }
     m.tags = append(m.tags, t)
     return t, nil
+}
+
+// Update modifies an existing custom tag's name and color.
+// Built-in tags cannot be modified.
+func (m *Manager) Update(id, name, color string) (Tag, error) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    for i, t := range m.tags {
+        if t.ID == id {
+            if t.Builtin {
+                return Tag{}, fmt.Errorf("cannot modify built-in tag")
+            }
+            
+            if name != "" && name != t.Name {
+                // Check for name conflicts
+                for _, other := range m.tags {
+                    if other.ID != id && other.Name == name {
+                        return Tag{}, fmt.Errorf("tag name '%s' already exists", name)
+                    }
+                }
+                m.tags[i].Name = name
+            }
+            
+            if color != "" {
+                m.tags[i].Color = color
+            }
+            return m.tags[i], nil
+        }
+    }
+    return Tag{}, fmt.Errorf("tag not found")
 }
 
 // Delete removes a custom tag. Built-in tags cannot be deleted.
