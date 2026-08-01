@@ -2,7 +2,7 @@
 // It creates and manages ONLY the 'netdev lancontrol' table.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 1.1
+// Version: 1.2
 package nftables
 
 import (
@@ -31,7 +31,6 @@ type Controller struct {
 // NewController initializes a new nftables controller.
 func NewController(cfg config.NftablesConfig) *Controller {
     return &Controller{
-        conn: nftables.New(),
         cfg:  cfg,
         sets: make(map[string]*nftables.Set),
     }
@@ -42,6 +41,13 @@ func (c *Controller) Init() error {
     c.mu.Lock()
     defer c.mu.Unlock()
 
+    // FIX: nftables.New() returns (*Conn, error)
+    conn, err := nftables.New()
+    if err != nil {
+        return fmt.Errorf("failed to connect to nftables: %w", err)
+    }
+    c.conn = conn
+
     // 1. Create or get the netdev table
     c.table = c.conn.AddTable(&nftables.Table{
         Family: nftables.TableFamilyNetdev,
@@ -49,46 +55,62 @@ func (c *Controller) Init() error {
     })
 
     // 2. Create or flush the ingress chain
+    // FIX: Removed Device field as it's not present in this version of the library struct
     c.chain = c.conn.AddChain(&nftables.Chain{
         Name:     "ingress",
         Table:    c.table,
         Type:     nftables.ChainTypeFilter,
         Hooknum:  nftables.ChainHookIngress,
         Priority: nftables.ChainPriorityRef(0),
-        Device:   c.cfg.Interface,
     })
 
     // 3. Create the four sets with timeout flags
-    // 1 hour timeout in milliseconds (3600 * 1000)
     timeout := time.Hour
 
-    c.sets["allowed_ips"] = c.conn.AddSet(&nftables.Set{
+    // FIX: AddSet returns error, not *Set. Timeout is time.Duration, not *time.Duration
+    allowedIPsSet := &nftables.Set{
         Name:    "allowed_ips",
         Table:   c.table,
         KeyType: nftables.TypeIPAddr,
-        Timeout: &timeout,
-    }, nil)
+        Timeout: timeout,
+    }
+    if err := c.conn.AddSet(allowedIPsSet, nil); err != nil {
+        return fmt.Errorf("failed to add allowed_ips set: %w", err)
+    }
+    c.sets["allowed_ips"] = allowedIPsSet
 
-    c.sets["allowed_macs"] = c.conn.AddSet(&nftables.Set{
+    allowedMACsSet := &nftables.Set{
         Name:    "allowed_macs",
         Table:   c.table,
         KeyType: nftables.TypeEtherAddr,
-        Timeout: &timeout,
-    }, nil)
+        Timeout: timeout,
+    }
+    if err := c.conn.AddSet(allowedMACsSet, nil); err != nil {
+        return fmt.Errorf("failed to add allowed_macs set: %w", err)
+    }
+    c.sets["allowed_macs"] = allowedMACsSet
 
-    c.sets["blocked_ips"] = c.conn.AddSet(&nftables.Set{
+    blockedIPsSet := &nftables.Set{
         Name:    "blocked_ips",
         Table:   c.table,
         KeyType: nftables.TypeIPAddr,
-        Timeout: &timeout,
-    }, nil)
+        Timeout: timeout,
+    }
+    if err := c.conn.AddSet(blockedIPsSet, nil); err != nil {
+        return fmt.Errorf("failed to add blocked_ips set: %w", err)
+    }
+    c.sets["blocked_ips"] = blockedIPsSet
 
-    c.sets["blocked_macs"] = c.conn.AddSet(&nftables.Set{
+    blockedMACsSet := &nftables.Set{
         Name:    "blocked_macs",
         Table:   c.table,
         KeyType: nftables.TypeEtherAddr,
-        Timeout: &timeout,
-    }, nil)
+        Timeout: timeout,
+    }
+    if err := c.conn.AddSet(blockedMACsSet, nil); err != nil {
+        return fmt.Errorf("failed to add blocked_macs set: %w", err)
+    }
+    c.sets["blocked_macs"] = blockedMACsSet
 
     // 4. Create the rules using real nftables expressions
     // Rule: Allow MACs
@@ -96,11 +118,8 @@ func (c *Controller) Init() error {
         Table: c.table,
         Chain: c.chain,
         Exprs: []expr.Any{
-            // Load MAC source address (Offset 8, Len 6) into register 1
             &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseLLHeader, Offset: 8, Len: 6},
-            // Lookup register 1 in allowed_macs set
             &expr.Lookup{SourceRegister: 1, SetName: "allowed_macs", SetID: c.sets["allowed_macs"].ID},
-            // If matched, Accept
             &expr.Verdict{Kind: expr.VerdictAccept},
         },
     })
@@ -110,11 +129,8 @@ func (c *Controller) Init() error {
         Table: c.table,
         Chain: c.chain,
         Exprs: []expr.Any{
-            // Load IP source address (Offset 12, Len 4) into register 1
             &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
-            // Lookup register 1 in allowed_ips set
             &expr.Lookup{SourceRegister: 1, SetName: "allowed_ips", SetID: c.sets["allowed_ips"].ID},
-            // If matched, Accept
             &expr.Verdict{Kind: expr.VerdictAccept},
         },
     })
@@ -145,7 +161,7 @@ func (c *Controller) Init() error {
         return fmt.Errorf("failed to initialize nftables: %w", err)
     }
 
-    slog.Info("nftables initialized", "table", c.cfg.TableName, "interface", c.cfg.Interface)
+    slog.Info("nftables initialized", "table", c.cfg.TableName)
     return nil
 }
 
@@ -209,7 +225,6 @@ func (c *Controller) addElements(setName string, items interface{}) error {
     switch v := items.(type) {
     case []net.IP:
         for _, ip := range v {
-            // Ensure 4-byte representation for IPv4
             elements = append(elements, nftables.SetElement{Key: ip.To4()})
         }
     case []net.HardwareAddr:
@@ -228,5 +243,4 @@ func (c *Controller) addElements(setName string, items interface{}) error {
     return nil
 }
 
-// Unused but required to satisfy unix import in some nftables contexts
 var _ = unix.NFT_MSG_NEWSET
