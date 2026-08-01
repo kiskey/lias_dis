@@ -1,7 +1,7 @@
 // Package nftables implements the isolated firewall controller for LIAS.
 //
 // File:    apps/lias/internal/nftables/builder.go
-// Version: 1.1
+// Version: 1.2
 package nftables
 
 import (
@@ -30,7 +30,6 @@ func NewBuilder(cache *liasSync.Cache, controller *Controller) *Builder {
 
 // Sync evaluates all devices in the cache and applies the resulting
 // allow/block sets to nftables.
-// FIX: Uses policy.PolicyEvaluator and policy.ScheduleEvaluator directly to avoid interface mismatch.
 func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.ScheduleEvaluator) error {
     b.mu.Lock()
     defer b.mu.Unlock()
