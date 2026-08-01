@@ -8,6 +8,7 @@ package main
 
 import (
     "context"
+    "encoding/json"
     "errors"
     "log/slog"
     "net/http"
@@ -31,7 +32,7 @@ func main() {
 
     mux := http.NewServeMux()
 
-    // /health endpoint
+    // /health endpoint (using Go 1.22+ routing patterns)
     mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")
         w.WriteHeader(http.StatusOK)
@@ -74,8 +75,3 @@ func main() {
 
     slog.Info("Discovery Intelligence Service stopped gracefully")
 }
-
-// json is imported here to keep the file self-contained without requiring
-// an internal package yet. It will be refactored to use a shared middleware
-// package in Phase 2.
-import "encoding/json"
