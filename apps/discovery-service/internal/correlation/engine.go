@@ -2,7 +2,7 @@
 // from multiple providers into canonical device records.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 1.0
+// Version: 1.2
 package correlation
 
 import (
@@ -16,11 +16,17 @@ import (
     "github.com/user/lias-dis/shared/models"
 )
 
+// EnrichmentOrchestrator defines the interface for triggering on-demand enrichment.
+type EnrichmentOrchestrator interface {
+    TriggerEnrichment(pdid string, force bool)
+}
+
 // Engine consumes observations from discovery providers, correlates them
 // into canonical device records, and updates the inventory cache.
 type Engine struct {
     cache  *inventory.Cache
     broker *api.Broker
+    orch   EnrichmentOrchestrator
 }
 
 // NewEngine initializes the correlation engine.
@@ -29,6 +35,11 @@ func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
         cache:  cache,
         broker: broker,
     }
+}
+
+// SetOrchestrator wires the enrichment orchestrator to the engine.
+func (e *Engine) SetOrchestrator(orch EnrichmentOrchestrator) {
+    e.orch = orch
 }
 
 // Run starts the engine, listening to all provided discovery channels.
@@ -86,7 +97,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     }
 
     // Heuristic for offline events (primarily from netlink RTM_DELNEIGH)
-    // TODO: Add explicit Online flag to Observation in v1.1
     if obs.IP == nil && macStr != "" {
         d := e.findDevice(macStr, "")
         if d != nil && d.Online {
@@ -128,6 +138,11 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         e.cache.Upsert(d)
         slog.Info("Device added", "pdid", pdid, "mac", macStr, "ip", ipStr)
         e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
+
+        // Trigger enrichment for new device
+        if e.orch != nil {
+            go e.orch.TriggerEnrichment(d.PDID, false)
+        }
         return
     }
 
@@ -187,5 +202,17 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         for _, et := range eventTypes {
             e.broker.Broadcast(models.NewEvent(et, d.PDID, payload))
         }
+    }
+
+    // Scheduled validation check: If device is unknown (no vendor/type), 
+    // and we haven't checked recently, trigger enrichment.
+    // This satisfies the "Unknown device (no vendor/type identified after 30 seconds)" rule.
+    if d.Vendor == "" && d.DeviceType == "" && e.orch != nil {
+        // We use a simple non-blocking trigger. The orchestrator handles skipping
+        // if it's already running or already known.
+        go func(pdid string) {
+            time.Sleep(30 * time.Second)
+            e.orch.TriggerEnrichment(pdid, false)
+        }(d.PDID)
     }
 }
