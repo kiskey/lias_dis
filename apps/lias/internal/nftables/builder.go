@@ -1,13 +1,14 @@
 // Package nftables implements the isolated firewall controller for LIAS.
 //
 // File:    apps/lias/internal/nftables/builder.go
-// Version: 1.0
+// Version: 1.1
 package nftables
 
 import (
     "net"
     "sync"
 
+    "github.com/user/lias-dis/apps/lias/internal/policy"
     liasSync "github.com/user/lias-dis/apps/lias/internal/sync"
     "github.com/user/lias-dis/shared/models"
 )
@@ -29,7 +30,8 @@ func NewBuilder(cache *liasSync.Cache, controller *Controller) *Builder {
 
 // Sync evaluates all devices in the cache and applies the resulting
 // allow/block sets to nftables.
-func (b *Builder) Sync(policyEngine PolicyEvaluator, schedEngine ScheduleEvaluator) error {
+// FIX: Uses policy.PolicyEvaluator and policy.ScheduleEvaluator directly to avoid interface mismatch.
+func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.ScheduleEvaluator) error {
     b.mu.Lock()
     defer b.mu.Unlock()
 
@@ -42,8 +44,6 @@ func (b *Builder) Sync(policyEngine PolicyEvaluator, schedEngine ScheduleEvaluat
             continue // Only apply rules to online devices
         }
 
-        // Use the policy engine to determine the effective action
-        // We make a copy of the device to avoid race conditions during evaluation
         localDev := d 
         action := policyEngine.EvaluateAction(&localDev, schedEngine)
 
@@ -77,14 +77,4 @@ func (b *Builder) Sync(policyEngine PolicyEvaluator, schedEngine ScheduleEvaluat
         SetElements{IPs: allowedIPs, MACs: allowedMACs},
         SetElements{IPs: blockedIPs, MACs: blockedMACs},
     )
-}
-
-// PolicyEvaluator is implemented by the policy.Engine.
-type PolicyEvaluator interface {
-    EvaluateAction(d *liasSync.LocalDevice, sched ScheduleEvaluator) models.Action
-}
-
-// ScheduleEvaluator is implemented by the schedule.Engine.
-type ScheduleEvaluator interface {
-    EvaluateNow(schedID string) models.Action
 }
