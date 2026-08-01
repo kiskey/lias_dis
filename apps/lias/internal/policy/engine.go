@@ -3,7 +3,7 @@
 // and device-specific rules.
 //
 // File:    apps/lias/internal/policy/engine.go
-// Version: 1.1
+// Version: 1.2
 package policy
 
 import (
@@ -12,6 +12,12 @@ import (
     liasSync "github.com/user/lias-dis/apps/lias/internal/sync"
     "github.com/user/lias-dis/shared/models"
 )
+
+// PolicyEvaluator is the interface for evaluating the final action of a device.
+// Exported so the nftables builder can consume it without cyclic dependencies.
+type PolicyEvaluator interface {
+    EvaluateAction(d *liasSync.LocalDevice, sched ScheduleEvaluator) models.Action
+}
 
 // ScheduleEvaluator is implemented by the schedule engine to resolve
 // scheduled actions in real-time.
@@ -66,12 +72,6 @@ func (e *Engine) ListPolicies() []models.Policy {
 }
 
 // GetEffectivePolicy determines the highest precedence policy applicable to the device.
-// Order of precedence:
-// 1. Infrastructure override (never blocked)
-// 2. Device-specific policy (highest Priority wins)
-// 3. Tag policy (highest Priority wins)
-// 4. Global default policy (highest Priority wins)
-// 5. Generic fallback (allow)
 func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
     e.mu.RLock()
     defer e.mu.RUnlock()
@@ -91,7 +91,7 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
     for _, p := range e.policies {
         if p.Type == models.PolicyTypeDevice && p.TargetID == d.PDID {
             if bestDevPolicy == nil || p.Priority > bestDevPolicy.Priority {
-                pp := p // copy pointer
+                pp := p
                 bestDevPolicy = &pp
             }
         }
@@ -141,8 +141,7 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 }
 
 // EvaluateAction resolves the final action (allow/block) for a device.
-// If the effective policy is a schedule, it queries the schedule evaluator.
-// Fails closed (block) if schedule evaluation fails or evaluator is missing.
+// Satisfies the PolicyEvaluator interface.
 func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvaluator) models.Action {
     p := e.GetEffectivePolicy(d)
 
