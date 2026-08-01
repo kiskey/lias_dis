@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 1.1
+// Version: 1.2
 package discovery
 
 import (
@@ -47,7 +47,6 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
     ch := make(chan netlink.NeighUpdate)
     done := make(chan struct{})
     
-    // Atomic subscribe with ListExisting to avoid missing events during startup gap
     opt := func(cfg *netlink.NeighSubscribeOptions) {
         cfg.ListExisting = true
     }
@@ -76,7 +75,8 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
                     }
                 }
                 
-                isAdd := update.Type == 0x01 // RTM_NEWNEIGH
+                // RTM_NEWNEIGH (0x01) is add/update, RTM_DELNEIGH (0x02) is delete
+                isAdd := update.Type == 0x01 
                 p.emitObservation(update.Neigh, isAdd)
             }
         }
@@ -95,13 +95,13 @@ func (p *NetlinkProvider) emitObservation(n netlink.Neigh, online bool) {
         Source:     p.Name(),
         MAC:        n.HardwareAddr,
         IP:         n.IP,
-        Confidence: 0.95, // High confidence for direct kernel observation
+        Online:     online, // Explicitly set online/offline state
+        Confidence: 0.95,   // High confidence for direct kernel observation
         Timestamp:  time.Now(),
     }
 
-    if !online {
-        obs.IP = nil // Clear IP on offline event, but keep MAC for identification
-    }
+    // We no longer clear obs.IP on offline events. The correlation engine needs
+    // the IP to efficiently find the device in the cache if MAC matching fails.
 
     select {
     case p.events <- obs:
