@@ -3,7 +3,7 @@
 // and device-specific rules.
 //
 // File:    apps/lias/internal/policy/engine.go
-// Version: 1.0
+// Version: 1.1
 package policy
 
 import (
@@ -68,9 +68,9 @@ func (e *Engine) ListPolicies() []models.Policy {
 // GetEffectivePolicy determines the highest precedence policy applicable to the device.
 // Order of precedence:
 // 1. Infrastructure override (never blocked)
-// 2. Device-specific policy
-// 3. Tag policy
-// 4. Global default policy
+// 2. Device-specific policy (highest Priority wins)
+// 3. Tag policy (highest Priority wins)
+// 4. Global default policy (highest Priority wins)
 // 5. Generic fallback (allow)
 func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
     e.mu.RLock()
@@ -87,27 +87,48 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
     }
 
     // 1. Device-specific policy
+    var bestDevPolicy *models.Policy
     for _, p := range e.policies {
         if p.Type == models.PolicyTypeDevice && p.TargetID == d.PDID {
-            return p
+            if bestDevPolicy == nil || p.Priority > bestDevPolicy.Priority {
+                pp := p // copy pointer
+                bestDevPolicy = &pp
+            }
         }
+    }
+    if bestDevPolicy != nil {
+        return *bestDevPolicy
     }
 
     // 2. Tag policy
     if len(d.Tags) > 0 {
         tagID := d.Tags[0]
+        var bestTagPolicy *models.Policy
         for _, p := range e.policies {
             if p.Type == models.PolicyTypeTag && p.TargetID == tagID {
-                return p
+                if bestTagPolicy == nil || p.Priority > bestTagPolicy.Priority {
+                    pp := p
+                    bestTagPolicy = &pp
+                }
             }
+        }
+        if bestTagPolicy != nil {
+            return *bestTagPolicy
         }
     }
 
     // 3. Global default
+    var bestGlobalPolicy *models.Policy
     for _, p := range e.policies {
         if p.Type == models.PolicyTypeGlobal {
-            return p
+            if bestGlobalPolicy == nil || p.Priority > bestGlobalPolicy.Priority {
+                pp := p
+                bestGlobalPolicy = &pp
+            }
         }
+    }
+    if bestGlobalPolicy != nil {
+        return *bestGlobalPolicy
     }
 
     // 4. Generic fallback (fail-open)
