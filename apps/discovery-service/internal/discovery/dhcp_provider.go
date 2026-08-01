@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/dhcp_provider.go
-// Version: 1.0
+// Version: 1.1
 package discovery
 
 import (
@@ -81,7 +81,6 @@ func (p *DHCPProvider) run() {
 func (p *DHCPProvider) poll() {
     file, err := os.Open(p.cfg.LeaseFile)
     if err != nil {
-        // Don't log as error every 60s if file just doesn't exist
         slog.Debug("Failed to open DHCP lease file", "file", p.cfg.LeaseFile, "error", err)
         return
     }
@@ -90,23 +89,25 @@ func (p *DHCPProvider) poll() {
     scanner := bufio.NewScanner(file)
     for scanner.Scan() {
         line := scanner.Text()
-        // Standard dnsmasq/OpenWrt format: <mac> <ip> <hostname> <client_id>
+        // Standard dnsmasq/OpenWrt format: <expiry_timestamp> <mac> <ip> <hostname> <client_id>
+        // e.g., 1690891200 aa:bb:cc:dd:ee:ff 192.168.1.50 android-12345 *
         parts := strings.Fields(line)
-        if len(parts) < 3 {
+        if len(parts) < 4 {
             continue
         }
         
-        mac, err := net.ParseMAC(parts[0])
+        // FIX: Indexes shifted right by 1 to account for expiry timestamp
+        mac, err := net.ParseMAC(parts[1])
         if err != nil {
             continue
         }
         
-        ip := net.ParseIP(parts[1])
+        ip := net.ParseIP(parts[2])
         if ip == nil {
             continue
         }
         
-        hostname := parts[2]
+        hostname := parts[3]
         if hostname == "*" {
             hostname = ""
         }
@@ -116,7 +117,8 @@ func (p *DHCPProvider) poll() {
             MAC:        mac,
             IP:         ip,
             Hostname:   hostname,
-            Confidence: 0.5, // MEDIUM confidence per §3.2
+            Online:     true, // Explicitly mark as online
+            Confidence: 0.5,  // MEDIUM confidence per §3.2
             Timestamp:  time.Now(),
         }
         
