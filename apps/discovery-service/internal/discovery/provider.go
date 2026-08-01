@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/provider.go
-// Version: 1.0
+// Version: 1.1
 package discovery
 
 import (
@@ -45,4 +45,5 @@ type Observation struct {
     Services   []string
     Confidence float64 // 0.0 - 1.0
     Timestamp  time.Time
+    Online     bool // Explicit online/offline flag (v1.1)
 }
