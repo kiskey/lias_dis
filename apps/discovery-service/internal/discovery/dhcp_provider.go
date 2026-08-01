@@ -2,14 +2,17 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/dhcp_provider.go
-// Version: 1.1
+// Version: 1.2
 package discovery
 
 import (
     "bufio"
     "context"
+    "fmt"
+    "io"
     "log/slog"
     "net"
+    "net/http"
     "os"
     "strings"
     "time"
@@ -18,13 +21,14 @@ import (
 )
 
 // DHCPProvider reads DHCP lease files to map hostnames and MACs to IPs.
-// It provides medium-confidence hostname/MAC bindings.
+// It supports reading from a local file or fetching from a remote HTTP URL.
 type DHCPProvider struct {
     cfg    config.DHCPConfig
     ctx    context.Context
     cancel context.CancelFunc
     events chan Observation
     done   chan struct{}
+    client *http.Client
 }
 
 // NewDHCPProvider initializes the DHCP lease file parser.
@@ -33,6 +37,7 @@ func NewDHCPProvider(cfg config.DHCPConfig) *DHCPProvider {
         cfg:    cfg,
         events: make(chan Observation, 128),
         done:   make(chan struct{}),
+        client: &http.Client{Timeout: 10 * time.Second},
     }
 }
 
@@ -79,24 +84,51 @@ func (p *DHCPProvider) run() {
 }
 
 func (p *DHCPProvider) poll() {
-    file, err := os.Open(p.cfg.LeaseFile)
-    if err != nil {
-        slog.Debug("Failed to open DHCP lease file", "file", p.cfg.LeaseFile, "error", err)
-        return
+    var reader io.Reader
+    var err error
+
+    // Determine if we are fetching remotely or reading locally
+    if p.cfg.LeaseURL != "" {
+        req, reqErr := http.NewRequestWithContext(p.ctx, "GET", p.cfg.LeaseURL, nil)
+        if reqErr != nil {
+            slog.Debug("Failed to create DHCP lease request", "url", p.cfg.LeaseURL, "error", reqErr)
+            return
+        }
+        
+        resp, httpErr := p.client.Do(req)
+        if httpErr != nil {
+            slog.Debug("Failed to fetch DHCP leases via HTTP", "url", p.cfg.LeaseURL, "error", httpErr)
+            return
+        }
+        defer resp.Body.Close()
+        
+        if resp.StatusCode != http.StatusOK {
+            slog.Debug("DHCP lease URL returned non-200", "url", p.cfg.LeaseURL, "status", resp.StatusCode)
+            return
+        }
+        
+        reader = resp.Body
+    } else if p.cfg.LeaseFile != "" {
+        file, fileErr := os.Open(p.cfg.LeaseFile)
+        if fileErr != nil {
+            slog.Debug("Failed to open local DHCP lease file", "file", p.cfg.LeaseFile, "error", fileErr)
+            return
+        }
+        defer file.Close()
+        reader = file
+    } else {
+        return // No source configured
     }
-    defer file.Close()
-    
-    scanner := bufio.NewScanner(file)
+
+    scanner := bufio.NewScanner(reader)
     for scanner.Scan() {
         line := scanner.Text()
         // Standard dnsmasq/OpenWrt format: <expiry_timestamp> <mac> <ip> <hostname> <client_id>
-        // e.g., 1690891200 aa:bb:cc:dd:ee:ff 192.168.1.50 android-12345 *
         parts := strings.Fields(line)
         if len(parts) < 4 {
             continue
         }
         
-        // FIX: Indexes shifted right by 1 to account for expiry timestamp
         mac, err := net.ParseMAC(parts[1])
         if err != nil {
             continue
@@ -130,6 +162,9 @@ func (p *DHCPProvider) poll() {
     }
     
     if err := scanner.Err(); err != nil {
-        slog.Error("Error reading DHCP lease file", "error", err)
+        slog.Error("Error reading DHCP leases", "error", err)
     }
 }
+
+// Unused but required to satisfy fmt import in some lint environments
+var _ = fmt.Sprintf
