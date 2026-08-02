@@ -1,7 +1,7 @@
 /*
  * LIAS Control Center - API Client
  * File:    apps/lias/web/src/api.js
- * Version: 1.1 (Includes PUT Endpoints & Named SSE Listener Subscriptions)
+ * Version: 1.2 (Includes Real-Time SSE Named Event Listeners)
  */
 
 const BASE_URL = '/api/v1';
@@ -167,7 +167,6 @@ export const API = {
       }
     };
 
-    // Attach listeners for standard onmessage and DIS named event streams
     es.onmessage = handler;
     eventTypes.forEach((type) => {
       es.addEventListener(type, handler);
