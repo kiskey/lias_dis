@@ -1,7 +1,7 @@
 // Package policy implements the rule evaluation engine for LIAS.
 //
 // File:    apps/lias/internal/policy/engine.go
-// Version: 1.6
+// Version: 1.7
 package policy
 
 import (
@@ -24,6 +24,7 @@ type Engine struct {
 	policies map[string]models.Policy
 }
 
+// NewEngine initializes policy engine with 'global_default' defaulted to ActionSchedule.
 func NewEngine() *Engine {
 	return &Engine{
 		policies: map[string]models.Policy{
@@ -31,7 +32,7 @@ func NewEngine() *Engine {
 				ID:       "global_default",
 				Name:     "Global Access Switch",
 				Type:     models.PolicyTypeGlobal,
-				Action:   models.ActionAllow,
+				Action:   models.ActionSchedule, // Default is "Schedule" selected on unpersisted initial boot
 				Priority: 0,
 			},
 		},
@@ -106,7 +107,7 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 		return *bestDevPolicy
 	}
 
-	// 4. TAG-GROUP POLICIES (Supports multiple policies/schedules per tag group)
+	// 4. TAG-GROUP POLICIES
 	var tagPolicies []models.Policy
 	for _, tagID := range d.Tags {
 		for _, p := range e.policies {
@@ -139,7 +140,7 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 	}
 }
 
-// EvaluateAction resolves final action, evaluating ALL policies attached to the device's tag group.
+// EvaluateAction resolves final action for a device record.
 func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvaluator) models.Action {
 	if d == nil {
 		return models.ActionAllow
@@ -153,9 +154,14 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// Global kill-switch check
-	if globalPol, ok := e.policies["global_default"]; ok && globalPol.Action == models.ActionBlock {
-		return models.ActionBlock
+	// Global switch check
+	if globalPol, ok := e.policies["global_default"]; ok {
+		if globalPol.Action == models.ActionBlock {
+			return models.ActionBlock
+		}
+		if globalPol.Action == models.ActionAllow {
+			return models.ActionAllow
+		}
 	}
 
 	// Evaluate device policies
@@ -182,7 +188,7 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
 		}
 	}
 
-	// Fail-Closed Rule for multiple tag policies: If ANY attached policy/schedule resolves to BLOCK, drop traffic.
+	// Fail-Closed Rule for multiple tag policies: If ANY attached policy resolves to BLOCK, drop traffic.
 	if len(tagActions) > 0 {
 		for _, act := range tagActions {
 			if act == models.ActionBlock {
