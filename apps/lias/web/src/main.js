@@ -1,7 +1,7 @@
 /*
  * LIAS Control Center - Main Dashboard Application
  * File:    apps/lias/web/src/main.js
- * Version: 1.8 (Complete Tag-Policy Binding, Dynamic Select Menu Refinement, Real-time SSE)
+ * Version: 1.9 (Hostname-First Primary Device Name Priority)
  */
 
 import { API } from './api.js';
@@ -218,11 +218,9 @@ class LiasDashboard {
   }
 
   getEffectiveTags() {
-    // Guarantees 100% of devices render by dynamically building active tag groups
     const tagMap = new Map();
     this.tags.forEach((t) => tagMap.set(t.id, t));
 
-    // Fallback registration for any tag referenced by an active device
     this.devices.forEach((d) => {
       const tagId = (d.tags && d.tags[0]) || 'generic';
       if (!tagMap.has(tagId)) {
@@ -307,6 +305,11 @@ class LiasDashboard {
           const vendorName = d.vendor || d.manufacturer || 'Generic Hardware';
           const lastSeenHTML = this.formatLastSeen(d.last_seen, d.online);
 
+          // Name Priority: d.hostname -> d.friendly_name -> 'Unknown Device'
+          const displayName = (d.hostname && d.hostname.trim()) || 
+                              (d.friendly_name && d.friendly_name.trim()) || 
+                              'Unknown Device';
+
           let servicePills = '';
           if (d.services && d.services.length > 0) {
             servicePills = `
@@ -321,7 +324,7 @@ class LiasDashboard {
               <div style="display: flex; align-items: flex-start; gap: 14px;">
                 <div class="status-indicator ${d.online ? 'online' : 'offline'}" style="margin-top: 4px;" title="${d.online ? 'Online' : 'Offline'}"></div>
                 <div>
-                  <h4 style="font-size: 15px; font-weight: 600;">${d.friendly_name || d.hostname || 'Unknown Device'}</h4>
+                  <h4 style="font-size: 15px; font-weight: 600;">${displayName}</h4>
                   <p style="font-size: 12px; color: var(--text-secondary); margin-top: 2px;">
                     ${d.current_ip || 'No IP'} &bull; ${d.current_mac || 'No MAC'} &bull; ${vendorName}
                   </p>
@@ -481,7 +484,7 @@ class LiasDashboard {
       <div class="card">
         <h3>System Settings</h3>
         <p style="color: var(--text-secondary); margin-top: 8px;">
-          LIAS Version: 1.8 &bull; Netfilter Table: <code>netdev lancontrol</code>
+          LIAS Version: 1.9 &bull; Netfilter Table: <code>netdev lancontrol</code>
         </p>
       </div>
     `;
