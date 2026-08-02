@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 1.8
+// Version: 1.9
 package discovery
 
 import (
@@ -63,6 +63,9 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to subscribe to netlink neighbor updates: %w", err)
 	}
 
+	// Start Active L2 Neighbor Reachability Monitor
+	go p.monitorStaleNeighbors()
+
 	go func() {
 		defer close(p.done)
 
@@ -83,6 +86,70 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
 	return nil
 }
 
+// monitorStaleNeighbors periodically audits kernel neighbor states and triggers ARP re-probes for STALE entries.
+func (p *NetlinkProvider) monitorStaleNeighbors() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			p.auditKernelNeighbors()
+		}
+	}
+}
+
+func (p *NetlinkProvider) auditKernelNeighbors() {
+	neighs, err := netlink.NeighList(p.targetIdx, netlink.FAMILY_V4)
+	if err != nil {
+		return
+	}
+
+	for _, n := range neighs {
+		if n.HardwareAddr == nil || len(n.HardwareAddr) != 6 {
+			continue
+		}
+		if IsMulticastOrBroadcast(n.HardwareAddr, n.IP) {
+			continue
+		}
+
+		// If neighbor is in NUD_FAILED or NUD_INCOMPLETE, emit explicit offline observation
+		if (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0 {
+			obs := Observation{
+				Source:     p.Name(),
+				MAC:        n.HardwareAddr,
+				IP:         n.IP,
+				Vendor:     oui.Lookup(n.HardwareAddr.String()),
+				Online:     false,
+				Confidence: 0.95,
+				Timestamp:  time.Now(),
+			}
+			select {
+			case p.events <- obs:
+			default:
+			}
+			continue
+		}
+
+		// If neighbor is NUD_STALE, send a lightweight ARP/UDP probe to force kernel state transition to REACHABLE or FAILED
+		if (n.State & unix.NUD_STALE) != 0 && n.IP != nil {
+			go p.probeNeighborIP(n.IP)
+		}
+	}
+}
+
+// probeNeighborIP transmits a lightweight UDP probe packet to trigger kernel ARP re-probing.
+func (p *NetlinkProvider) probeNeighborIP(ip net.IP) {
+	addr := net.JoinHostPort(ip.String(), "64111")
+	conn, err := net.DialTimeout("udp4", addr, 1*time.Second)
+	if err == nil {
+		_, _ = conn.Write([]byte{0x00})
+		_ = conn.Close()
+	}
+}
+
 func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
 	n := update.Neigh
 
@@ -98,11 +165,9 @@ func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
 		return
 	}
 
-	// Devices remain ONLINE during NUD_STALE, NUD_DELAY, NUD_PROBE (normal ARP re-probe cycles)
 	isFailed := (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0
 	isOnline := !isFailed && (n.State&(unix.NUD_REACHABLE|unix.NUD_PERMANENT|unix.NUD_STALE|unix.NUD_DELAY|unix.NUD_PROBE|unix.NUD_NOARP)) != 0
 
-	// Mark offline ONLY on explicit deletion events
 	if update.Type == unix.RTM_DELNEIGH {
 		isOnline = false
 	}
