@@ -1,7 +1,7 @@
 // Binary lias implements the LAN Internet Access Scheduler.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 1.7
+// Version: 1.8
 package main
 
 import (
@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,9 +31,6 @@ import (
 var version = "dev"
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
-
 	cfgPath := "/etc/lias/config.yaml"
 	if envPath := os.Getenv("LIAS_CONFIG"); envPath != "" {
 		cfgPath = envPath
@@ -40,9 +38,32 @@ func main() {
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
+		// Fallback logger for load failure
 		slog.Error("Failed to load configuration", "error", err)
 		os.Exit(1)
 	}
+
+	// FIX: Wire slog handler AFTER parsing config settings
+	var level slog.Level
+	switch strings.ToLower(cfg.Logging.Level) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
+	if strings.ToLower(cfg.Logging.Format) == "text" {
+		handler = slog.NewTextHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	}
+	slog.SetDefault(slog.New(handler))
 
 	cache := liasSync.NewCache()
 	trigger := make(chan struct{}, 1)
@@ -99,7 +120,7 @@ func main() {
 		Addr:         cfg.HTTP.Listen,
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 0, // Set WriteTimeout to 0 (unlimited) for long-lived HTTP streams
+		WriteTimeout: 0, // Unlimited write timeout for long-lived HTTP streams
 		IdleTimeout:  120 * time.Second,
 	}
 
