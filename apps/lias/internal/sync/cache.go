@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/cache.go
-// Version: 1.4
+// Version: 1.5
 package sync
 
 import (
@@ -44,7 +44,10 @@ func (c *Cache) LoadStickyTags(pdidTags, macTags map[string]string) {
 		c.stickyTags[pdid] = tagID
 	}
 	for mac, tagID := range macTags {
-		c.stickyMACs[strings.ToLower(mac)] = tagID
+		cleanMAC := strings.ToLower(strings.TrimSpace(mac))
+		if cleanMAC != "" {
+			c.stickyMACs[cleanMAC] = tagID
+		}
 	}
 
 	for _, d := range c.devices {
@@ -55,19 +58,42 @@ func (c *Cache) LoadStickyTags(pdidTags, macTags map[string]string) {
 func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
 	assignedTag := "generic"
 
-	// Priority: Sticky PDID Tag > Sticky MAC Tag > Existing Tag > DIS Tag > "generic"
+	// 1. Direct PDID match
 	if tag, found := c.stickyTags[d.PDID]; found && tag != "" {
 		assignedTag = tag
-	} else if macTag, found := c.stickyMACs[strings.ToLower(d.CurrentMAC)]; found && macTag != "" {
-		assignedTag = macTag
-	} else if len(d.Tags) > 0 && d.Tags[0] != "" {
-		assignedTag = d.Tags[0]
-	} else if len(d.Device.Tags) > 0 && d.Device.Tags[0] != "" {
-		assignedTag = d.Device.Tags[0]
+	} else {
+		// 2. Multi-MAC fallback: Check ALL MAC addresses on the device record
+		for _, mac := range d.MACs {
+			cleanMAC := strings.ToLower(strings.TrimSpace(mac))
+			if macTag, found := c.stickyMACs[cleanMAC]; found && macTag != "" {
+				assignedTag = macTag
+				c.stickyTags[d.PDID] = assignedTag // Auto-repair stickyTags for current PDID
+				break
+			}
+		}
+	}
+
+	// 3. Fallback to DIS or existing tag
+	if assignedTag == "generic" {
+		if len(d.Tags) > 0 && d.Tags[0] != "" {
+			assignedTag = d.Tags[0]
+		} else if len(d.Device.Tags) > 0 && d.Device.Tags[0] != "" {
+			assignedTag = d.Device.Tags[0]
+		}
 	}
 
 	d.Tags = []string{assignedTag}
-	d.Device.Tags = []string{assignedTag} // Synchronize inner embedded struct tags!
+	d.Device.Tags = []string{assignedTag}
+
+	// 4. Backfill stickyMACs for all known MAC addresses on tagged device
+	if assignedTag != "generic" {
+		for _, mac := range d.MACs {
+			cleanMAC := strings.ToLower(strings.TrimSpace(mac))
+			if cleanMAC != "" {
+				c.stickyMACs[cleanMAC] = assignedTag
+			}
+		}
+	}
 }
 
 func (c *Cache) Get(pdid string) *LocalDevice {
@@ -79,6 +105,7 @@ func (c *Cache) Get(pdid string) *LocalDevice {
 		return nil
 	}
 	devCopy := *d
+	c.applyStickyTagLocked(&devCopy)
 	return &devCopy
 }
 
@@ -146,8 +173,11 @@ func (c *Cache) SetTags(pdid string, tags []string) {
 	c.stickyTags[pdid] = tagID
 
 	if d, ok := c.devices[pdid]; ok {
-		if d.CurrentMAC != "" {
-			c.stickyMACs[strings.ToLower(d.CurrentMAC)] = tagID
+		for _, mac := range d.MACs {
+			cleanMAC := strings.ToLower(strings.TrimSpace(mac))
+			if cleanMAC != "" {
+				c.stickyMACs[cleanMAC] = tagID
+			}
 		}
 		d.Tags = []string{tagID}
 		d.Device.Tags = []string{tagID}
