@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/pihole_provider.go
-// Version: 1.5
+// Version: 1.6
 package discovery
 
 import (
@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -248,14 +249,15 @@ func (p *PiholeProvider) authenticate() error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("pihole auth endpoint returned HTTP %d", resp.StatusCode)
-	}
+	bodyBytes, _ := io.ReadAll(resp.Body)
 
+	// Decode Pi-hole v6 authentication response payload
 	var authResp struct {
 		Session struct {
-			SID   string `json:"sid"`
-			Valid bool   `json:"valid"`
+			SID      string `json:"sid"`
+			Valid    bool   `json:"valid"`
+			Message  string `json:"message"`  // Pi-hole v6 session rejection message (e.g. "password incorrect")
+			Validity int    `json:"validity"`
 		} `json:"session"`
 		Error struct {
 			Key     string `json:"key"`
@@ -263,13 +265,33 @@ func (p *PiholeProvider) authenticate() error {
 		} `json:"error"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&authResp); err != nil {
-		return fmt.Errorf("failed to decode pihole auth response: %w", err)
+	_ = json.Unmarshal(bodyBytes, &authResp)
+
+	// Handle HTTP 4xx/5xx transport status codes (e.g. 429 Too Many Requests, 401 Unauthorized)
+	if resp.StatusCode != http.StatusOK {
+		reason := authResp.Error.Message
+		if reason == "" {
+			reason = authResp.Error.Key
+		}
+		if reason == "" {
+			reason = string(bodyBytes)
+		}
+		return fmt.Errorf("pihole auth endpoint returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(reason))
 	}
 
-	if !authResp.Session.Valid || authResp.Session.SID == "" {
-		return fmt.Errorf("pihole auth returned invalid session state: key=%q message=%q",
-			authResp.Error.Key, authResp.Error.Message)
+	// Validate Session Payload
+	if !authResp.Session.Valid || authResp.Session.SID == "" || authResp.Session.SID == "null" {
+		reason := authResp.Session.Message
+		if reason == "" {
+			reason = authResp.Error.Message
+		}
+		if reason == "" {
+			reason = authResp.Error.Key
+		}
+		if reason == "" {
+			reason = "password incorrect or session rejected"
+		}
+		return fmt.Errorf("pihole auth returned invalid session state: %s", reason)
 	}
 
 	p.sid = authResp.Session.SID
