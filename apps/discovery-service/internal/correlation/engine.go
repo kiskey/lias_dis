@@ -2,7 +2,7 @@
 // from multiple providers into canonical device records.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 2.0
+// Version: 2.1
 package correlation
 
 import (
@@ -120,9 +120,11 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
 	cleanHost := discovery.UnescapeHostname(obs.Hostname)
 
-	// Handle offline observation
+	// 1. QUERY EXISTING DEVICE
+	d := e.cache.GetByMACOrIP(macStr, ipStr)
+
+	// Handle offline observation (Must originate from high-confidence L2 netlink provider or active probe)
 	if !obs.Online {
-		d := e.cache.GetByMACOrIP(macStr, ipStr)
 		if d != nil && d.Online {
 			d.Online = false
 			d.LastSeen = time.Now()
@@ -136,17 +138,33 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 				IP:        ipStr,
 				Timestamp: time.Now(),
 			}))
-			slog.Info("Device transitioned offline", "pdid", d.PDID, "mac", macStr, "ip", ipStr)
+			slog.Info("Device transitioned offline", "pdid", d.PDID, "mac", macStr, "ip", ipStr, "source", obs.Source)
 		}
 		return
 	}
 
-	// 1. SMART DHCP IP-REUSE GUARD & PRIVATE-MAC CONTINUITY
+	// 2. PROVIDER CONFIDENCE & L2 REACHABILITY PRIMACY GUARD
+	// Low-confidence background polling providers (Pi-hole 0.3, DHCP 0.5) CANNOT resurrect
+	// an offline device to Online: true if high-confidence L2 Netlink (0.95) marked it offline!
+	if d != nil && !d.Online && obs.Confidence < 0.8 {
+		slog.Debug("Ignoring Online: true from low-confidence background provider for L2-offline device",
+			"pdid", d.PDID, "source", obs.Source, "confidence", obs.Confidence)
+
+		// Still update hostnames/services if provided, but DO NOT flip online status
+		if cleanHost != "" && d.Hostname != cleanHost {
+			d.Hostname = cleanHost
+			e.cache.Upsert(d)
+			if e.store != nil {
+				_ = e.store.SaveDevice(d)
+			}
+		}
+		return
+	}
+
+	// 3. SMART DHCP IP-REUSE GUARD & PRIVATE-MAC CONTINUITY
 	if ipStr != "" && macStr != "" {
 		if ipMatch := e.cache.GetByIP(ipStr); ipMatch != nil {
 			if !ipMatch.HasMAC(macStr) {
-				// If incoming MAC is a randomized MAC on the exact same IP and old MAC is silent,
-				// merge MAC rotation into existing record rather than evicting the IP index.
 				if oui.IsRandomizedMAC(macStr) && !ipMatch.Online {
 					slog.Info("Observed Private MAC rotation on same IP",
 						"pdid", ipMatch.PDID, "ip", ipStr, "new_mac", macStr)
@@ -166,7 +184,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 					return
 				}
 
-				// Otherwise, treat as genuine DHCP IP reassignment by a different device
 				slog.Info("DHCP IP reassignment detected, invalidating stale IP binding",
 					"ip", ipStr, "old_pdid", ipMatch.PDID, "new_mac", macStr)
 				e.cache.RemoveIPIndex(ipStr)
@@ -174,9 +191,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		}
 	}
 
-	// 2. QUERY CACHE (With LAA Private MAC Hostname Match Fallback)
-	d := e.cache.GetByMACOrIP(macStr, ipStr)
-
+	// 4. PRIVATE MAC HOSTNAME FALLBACK
 	if d == nil && macStr != "" && oui.IsRandomizedMAC(macStr) && cleanHost != "" {
 		if hostMatch := e.cache.GetByHostname(cleanHost); hostMatch != nil {
 			slog.Info("Linked rotated Private MAC address to existing device record by L7 Hostname",
@@ -224,7 +239,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// 3. TENTATIVE PDID PROMOTION (Fixed: Uses d.IsTentative)
+	// 5. TENTATIVE PDID PROMOTION
 	if d.IsTentative && macStr != "" {
 		oldPDID := d.PDID
 		newPDID := inventory.GeneratePDID(macStr, cleanHost, d.Vendor)
@@ -254,7 +269,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// 4. UPDATE EXISTING DEVICE RECORD
+	// 6. UPDATE EXISTING DEVICE RECORD
 	changed := false
 	var eventTypes []models.EventType
 	payload := models.DeviceEventPayload{
