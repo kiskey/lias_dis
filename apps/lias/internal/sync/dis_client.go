@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 1.6
+// Version: 1.7 (Inline device payload parsing from SSE events)
 package sync
 
 import (
@@ -21,21 +21,18 @@ import (
 	"github.com/user/lias-dis/shared/models"
 )
 
-// EventBroadcaster defines the interface for broadcasting real-time events to connected clients.
 type EventBroadcaster interface {
 	Broadcast(event models.Event)
 }
 
-// DISClient manages the REST polling and SSE streaming connections to DIS.
 type DISClient struct {
 	cfg     config.DISConfig
 	cache   *Cache
 	client  *http.Client
-	trigger chan struct{}    // Non-blocking notification channel for immediate nftables resync
-	broker  EventBroadcaster // Interface handle to proxy real-time events to Web Dashboard
+	trigger chan struct{}
+	broker  EventBroadcaster
 }
 
-// NewDISClient initializes the DIS client.
 func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, broker EventBroadcaster) *DISClient {
 	return &DISClient{
 		cfg:     cfg,
@@ -46,7 +43,6 @@ func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, bro
 	}
 }
 
-// Run starts the initial sync, polling fallback, and real-time SSE stream.
 func (c *DISClient) Run(ctx context.Context) {
 	c.pollDevices()
 	c.tryTrigger()
@@ -269,9 +265,15 @@ func (c *DISClient) handleEvent(e models.Event) {
 		models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged, models.EventFingerprintUpdated:
 
 		go func(pdid string, evt models.Event) {
-			if c.fetchSingleDevice(pdid) {
+			// Attempt to unmarshal full Device payload directly from event to avoid extra REST call
+			var inlineDev models.Device
+			if len(evt.Payload) > 0 && json.Unmarshal(evt.Payload, &inlineDev) == nil && inlineDev.PDID == pdid {
+				c.cache.UpsertDevice(inlineDev)
+				c.tryTrigger()
+			} else if c.fetchSingleDevice(pdid) {
 				c.tryTrigger()
 			}
+
 			if c.broker != nil {
 				c.broker.Broadcast(evt)
 			}
