@@ -1,7 +1,7 @@
 // Binary lias implements the LAN Internet Access Scheduler.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 1.8
+// Version: 1.9
 package main
 
 import (
@@ -38,12 +38,10 @@ func main() {
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		// Fallback logger for load failure
 		slog.Error("Failed to load configuration", "error", err)
 		os.Exit(1)
 	}
 
-	// FIX: Wire slog handler AFTER parsing config settings
 	var level slog.Level
 	switch strings.ToLower(cfg.Logging.Level) {
 	case "debug":
@@ -79,7 +77,7 @@ func main() {
 	} else {
 		defer st.Close()
 		deviceTags, macTags, _ := st.LoadHydrate(tagMgr, polEng, schedEng)
-		cache.LoadStickyTags(deviceTags, macTags) // Hydrate sticky user-assigned tags into cache
+		cache.LoadStickyTags(deviceTags, macTags)
 		store = st
 	}
 
@@ -97,9 +95,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Initial DIS inventory sync & immediate atomic nftables sync on boot
 	go disClient.Run(ctx)
 	go schedEng.Run(ctx)
 	go nftSync.Run(ctx)
+
+	// Atomic initial resync guarantee on boot
+	if err := builder.Sync(polEng, schedEng); err != nil {
+		slog.Warn("Initial nftables sync warning", "error", err)
+	}
 
 	mux := http.NewServeMux()
 	handlers := liasAPI.NewHandlers(cache, tagMgr, polEng, schedEng, nftCtrl, store, trigger)
@@ -120,7 +124,7 @@ func main() {
 		Addr:         cfg.HTTP.Listen,
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 0, // Unlimited write timeout for long-lived HTTP streams
+		WriteTimeout: 0,
 		IdleTimeout:  120 * time.Second,
 	}
 
