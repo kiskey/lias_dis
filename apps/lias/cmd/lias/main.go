@@ -1,7 +1,7 @@
 // Binary lias implements the LAN Internet Access Scheduler.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 1.6
+// Version: 1.7
 package main
 
 import (
@@ -57,8 +57,8 @@ func main() {
 		slog.Warn("Storage initialization failed, running in memory-only mode", "error", err)
 	} else {
 		defer st.Close()
-		deviceTags, _ := st.LoadHydrate(tagMgr, polEng, schedEng)
-		cache.LoadStickyTags(deviceTags) // Hydrate sticky user-assigned tags into cache
+		deviceTags, macTags, _ := st.LoadHydrate(tagMgr, polEng, schedEng)
+		cache.LoadStickyTags(deviceTags, macTags) // Hydrate sticky user-assigned tags into cache
 		store = st
 	}
 
