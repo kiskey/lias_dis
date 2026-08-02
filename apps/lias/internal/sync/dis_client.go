@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 1.4
+// Version: 1.5
 package sync
 
 import (
@@ -16,11 +16,16 @@ import (
 	"strings"
 	"time"
 
-	liasAPI "github.com/user/lias-dis/apps/lias/internal/api"
 	"github.com/user/lias-dis/apps/lias/internal/config"
 	"github.com/user/lias-dis/shared/api"
 	"github.com/user/lias-dis/shared/models"
 )
+
+// EventBroadcaster defines the interface for broadcasting real-time events to connected clients.
+// Defining this interface breaks the circular dependency between package sync and package api.
+type EventBroadcaster interface {
+	Broadcast(event models.Event)
+}
 
 // DISClient manages the REST polling and SSE streaming connections to DIS.
 type DISClient struct {
@@ -28,11 +33,11 @@ type DISClient struct {
 	cache   *Cache
 	client  *http.Client
 	trigger chan struct{}    // Non-blocking notification channel for immediate nftables resync
-	broker  *liasAPI.Broker // LIAS SSE Broker handle to proxy real-time events to Web Dashboard
+	broker  EventBroadcaster // Interface handle to proxy real-time events to Web Dashboard
 }
 
 // NewDISClient initializes the DIS client.
-func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, broker *liasAPI.Broker) *DISClient {
+func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, broker EventBroadcaster) *DISClient {
 	return &DISClient{
 		cfg:     cfg,
 		cache:   cache,
@@ -243,7 +248,7 @@ func (c *DISClient) handleEvent(e models.Event) {
 
 	slog.Debug("Received real-time event from DIS", "type", e.Type, "device_id", e.DeviceID)
 
-	// FIX: Proxy real-time DIS events to LIAS SSE broker for browser clients on :8081
+	// Proxy real-time DIS events to LIAS SSE broker interface for browser clients on :8081
 	if c.broker != nil {
 		c.broker.Broadcast(e)
 	}
