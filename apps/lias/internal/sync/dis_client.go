@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 1.2
+// Version: 1.3
 package sync
 
 import (
@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -78,10 +79,32 @@ func (c *DISClient) pollerLoop(ctx context.Context) {
 	}
 }
 
-func (c *DISClient) pollDevices() {
-	req, err := http.NewRequest("GET", strings.TrimRight(c.cfg.URL, "/")+":8080/api/v1/devices", nil)
+// getEndpointURL safely constructs a DIS endpoint URL, ensuring explicit ports are not duplicated.
+func (c *DISClient) getEndpointURL(path string) string {
+	rawURL := strings.TrimSpace(c.cfg.URL)
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		rawURL = "http://" + rawURL
+	}
+
+	u, err := url.Parse(rawURL)
 	if err != nil {
-		slog.Error("Failed to create DIS request", "error", err)
+		return strings.TrimRight(c.cfg.URL, "/") + path
+	}
+
+	// Default DIS port is :8080 if unspecified
+	if u.Port() == "" {
+		u.Host = u.Host + ":8080"
+	}
+
+	u.Path = strings.TrimRight(u.Path, "/") + path
+	return u.String()
+}
+
+func (c *DISClient) pollDevices() {
+	targetURL := c.getEndpointURL("/api/v1/devices")
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		slog.Error("Failed to create DIS request", "url", targetURL, "error", err)
 		return
 	}
 	if c.cfg.AuthToken != "" {
@@ -90,7 +113,7 @@ func (c *DISClient) pollDevices() {
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		slog.Error("Failed to poll DIS devices", "error", err)
+		slog.Error("Failed to poll DIS devices", "url", targetURL, "error", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -142,7 +165,8 @@ func (c *DISClient) sseLoop(ctx context.Context) {
 }
 
 func (c *DISClient) consumeSSE(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(c.cfg.URL, "/")+":8080/api/v1/events", nil)
+	targetURL := c.getEndpointURL("/api/v1/events")
+	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 	if err != nil {
 		return err
 	}
@@ -162,7 +186,7 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
 		return fmt.Errorf("SSE stream endpoint returned status: %d", resp.StatusCode)
 	}
 
-	slog.Info("Successfully connected to DIS SSE event stream")
+	slog.Info("Successfully connected to DIS SSE event stream", "url", targetURL)
 
 	scanner := bufio.NewScanner(resp.Body)
 	var event models.Event
@@ -237,7 +261,8 @@ func (c *DISClient) handleEvent(e models.Event) {
 }
 
 func (c *DISClient) fetchSingleDevice(pdid string) bool {
-	req, err := http.NewRequest("GET", strings.TrimRight(c.cfg.URL, "/")+":8080/api/v1/devices/"+pdid, nil)
+	targetURL := c.getEndpointURL("/api/v1/devices/" + pdid)
+	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		return false
 	}
