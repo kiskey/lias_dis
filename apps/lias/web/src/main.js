@@ -1,7 +1,7 @@
 /*
  * LIAS Control Center - Main Dashboard Application
  * File:    apps/lias/web/src/main.js
- * Version: 1.2
+ * Version: 1.3 (Auto-Detected Timezone & Dropdown Upgrade)
  */
 
 import { API } from './api.js';
@@ -32,7 +32,6 @@ class LiasDashboard {
   }
 
   initEvents() {
-    // Navigation routing for desktop sidebar AND mobile bottom bar
     document.querySelectorAll('[data-view]').forEach((btn) => {
       btn.addEventListener('click', (e) => {
         const view = e.currentTarget.getAttribute('data-view');
@@ -124,7 +123,6 @@ class LiasDashboard {
     const globalPol = this.policies.find((p) => p.id === 'global_default') || { action: 'allow' };
 
     this.viewContainer.innerHTML = `
-      <!-- Global Access Kill-Switch Banner -->
       <div class="global-switch-banner">
         <div>
           <h3 style="font-size: 18px; font-weight: 700;">Global Network Switch</h3>
@@ -155,7 +153,6 @@ class LiasDashboard {
       </div>
     `;
 
-    // Attach Global Switch listeners
     this.viewContainer.querySelectorAll('[data-global-act]').forEach((btn) => {
       btn.addEventListener('click', async (e) => {
         const action = e.currentTarget.getAttribute('data-global-act');
@@ -183,7 +180,6 @@ class LiasDashboard {
   renderDevicesView() {
     let html = `<div style="display: flex; flex-direction: column; gap: 24px;">`;
 
-    // Group devices by Tag ID
     this.tags.forEach((tag) => {
       const groupDevs = this.devices.filter((d) => {
         const devTag = (d.tags && d.tags[0]) || 'generic';
@@ -252,7 +248,6 @@ class LiasDashboard {
     html += `</div>`;
     this.viewContainer.innerHTML = html;
 
-    // Attach Tag Policy Button Listeners
     this.viewContainer.querySelectorAll('[data-tag-policy]').forEach((btn) => {
       btn.addEventListener('click', (e) => {
         const tagId = e.currentTarget.getAttribute('data-tag-policy');
@@ -260,7 +255,6 @@ class LiasDashboard {
       });
     });
 
-    // Attach Move Tag Select Listeners
     this.viewContainer.querySelectorAll('[data-move-pdid]').forEach((select) => {
       select.addEventListener('change', async (e) => {
         const pdid = e.currentTarget.getAttribute('data-move-pdid');
@@ -296,7 +290,7 @@ class LiasDashboard {
           rulesSummary = s.rules
             .map(
               (r) =>
-                `<span style="display: inline-block; padding: 4px 8px; border-radius: 6px; background: var(--bg-tertiary); font-size: 12px; margin-right: 6px; margin-top: 6px;">
+                `<span style="display: inline-block; padding: 4px 10px; border-radius: 6px; background: var(--bg-tertiary); font-size: 12px; margin-right: 6px; margin-top: 6px; font-weight: 600;">
                   ${r.days.join(', ').toUpperCase()}: ${r.start_time} - ${r.end_time} (${r.action.toUpperCase()})
                 </span>`
             )
@@ -309,7 +303,9 @@ class LiasDashboard {
           <div class="card" style="margin: 0; display: flex; justify-content: space-between; align-items: flex-start;">
             <div>
               <h4 style="font-size: 16px; font-weight: 700;">${s.name}</h4>
-              <p style="font-size: 12px; color: var(--text-secondary); margin-top: 2px;">Timezone: ${s.timezone}</p>
+              <p style="font-size: 12px; color: var(--text-secondary); margin-top: 2px;">
+                <span style="display: inline-block; padding: 2px 8px; border-radius: 4px; background: var(--bg-tertiary); color: var(--accent); font-weight: 600;">Timezone: ${s.timezone}</span>
+              </p>
               <div style="margin-top: 10px;">${rulesSummary}</div>
             </div>
             <button class="btn btn-danger" data-del-sched="${s.id}">Delete</button>
@@ -364,17 +360,36 @@ class LiasDashboard {
   // --- Modals ---
 
   openAddScheduleModal() {
+    // Detect browser local timezone automatically
+    let detectedTz = 'UTC';
+    try {
+      detectedTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    } catch (e) {
+      detectedTz = 'UTC';
+    }
+
     this.modalTitle.textContent = 'Create New Schedule Window';
     this.modalBody.innerHTML = `
       <div style="display: flex; flex-direction: column; gap: 16px;">
         <div>
           <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Schedule Name</label>
-          <input type="text" id="sched-name" placeholder="e.g. Bedtime Schedule" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
+          <input type="text" id="sched-name" placeholder="e.g. Weekend Gaming Whitelist" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
         </div>
 
         <div>
-          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Timezone</label>
-          <input type="text" id="sched-tz" value="UTC" placeholder="e.g. UTC, America/Los_Angeles" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
+          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Timezone (Auto-Detected)</label>
+          <select id="sched-tz" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary); font-weight: 600;">
+            <option value="${detectedTz}" selected>Local Browser (${detectedTz})</option>
+            <option value="UTC">UTC (Coordinated Universal Time)</option>
+            <option value="America/New_York">Eastern Time (America/New_York)</option>
+            <option value="America/Chicago">Central Time (America/Chicago)</option>
+            <option value="America/Denver">Mountain Time (America/Denver)</option>
+            <option value="America/Los_Angeles">Pacific Time (America/Los_Angeles)</option>
+            <option value="Europe/London">London / GMT (Europe/London)</option>
+            <option value="Europe/Paris">Central European (Europe/Paris)</option>
+            <option value="Asia/Tokyo">Japan Standard (Asia/Tokyo)</option>
+            <option value="Australia/Sydney">Australian Eastern (Australia/Sydney)</option>
+          </select>
         </div>
 
         <div>
@@ -393,25 +408,24 @@ class LiasDashboard {
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
           <div>
             <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Start Time</label>
-            <input type="time" id="sched-start" value="22:00" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
+            <input type="time" id="sched-start" value="12:00" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
           </div>
           <div>
             <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">End Time</label>
-            <input type="time" id="sched-end" value="06:00" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
+            <input type="time" id="sched-end" value="18:00" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
           </div>
         </div>
 
         <div>
           <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Action Within Window</label>
           <select id="sched-act" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
-            <option value="block">Block Access (Downtime)</option>
             <option value="allow">Allow Access (Whitelist Window)</option>
+            <option value="block">Block Access (Downtime Window)</option>
           </select>
         </div>
       </div>
     `;
 
-    // Attach Day Chip Selection Handler
     this.modalBody.querySelectorAll('.day-chip').forEach((chip) => {
       chip.addEventListener('click', (e) => {
         e.currentTarget.classList.toggle('selected');
@@ -453,7 +467,7 @@ class LiasDashboard {
         this.schedules.push(created);
         this.hideModal();
         this.renderSchedulesView();
-        this.showToast('Schedule created successfully', 'success');
+        this.showToast(`Schedule created (${tz})`, 'success');
       } catch (err) {
         this.showToast('Failed to create schedule', 'danger');
       }
