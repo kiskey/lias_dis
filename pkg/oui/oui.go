@@ -2,7 +2,7 @@
 // from IEEE Organizationally Unique Identifiers (OUI).
 //
 // File:    pkg/oui/oui.go
-// Version: 1.1
+// Version: 1.2
 package oui
 
 import (
@@ -105,7 +105,7 @@ func (db *Database) loadBuiltin() {
 		"086698": "Apple, Inc.", "086D41": "Apple, Inc.", "087402": "Apple, Inc.",
 		"0C15C4": "Apple, Inc.", "0C3021": "Apple, Inc.", "0C4DE9": "Apple, Inc.",
 		"0C74C2": "Apple, Inc.", "0CB319": "Apple, Inc.", "101C0C": "Apple, Inc.",
-		"1040F3": "Apple, Inc.", "109add": "Apple, Inc.", "10ddb1": "Apple, Inc.",
+		"1040F3": "Apple, Inc.", "109ADD": "Apple, Inc.", "10DDB1": "Apple, Inc.",
 		"14109F": "Apple, Inc.", "14205E": "Apple, Inc.", "145A05": "Apple, Inc.",
 		"148F21": "Apple, Inc.", "1499E2": "Apple, Inc.", "182032": "Apple, Inc.",
 		"183429": "Apple, Inc.", "18AF61": "Apple, Inc.", "18E728": "Apple, Inc.",
@@ -151,12 +151,12 @@ func (db *Database) loadBuiltin() {
 		"04180F": "Samsung Electronics", "044E5A": "Samsung Electronics",
 		"0808C2": "Samsung Electronics", "08373D": "Samsung Electronics",
 
-		// Raspberry Pi Trading Ltd
+		// Raspberry Pi
 		"28CDC1": "Raspberry Pi Trading Ltd", "3A3541": "Raspberry Pi Trading Ltd",
 		"B827EB": "Raspberry Pi Foundation", "D83ADD": "Raspberry Pi Trading Ltd",
 		"E45F01": "Raspberry Pi Trading Ltd", "D43A2B": "Raspberry Pi Trading Ltd",
 
-		// Espressif Systems (ESP8266 / ESP32 IoT Devices)
+		// Espressif Systems (ESP8266 / ESP32)
 		"18FE34": "Espressif Inc.", "240AC4": "Espressif Inc.", "246F28": "Espressif Inc.",
 		"24B28A": "Espressif Inc.", "30AEA4": "Espressif Inc.", "3C71BF": "Espressif Inc.",
 		"4022D8": "Espressif Inc.", "483FDA": "Espressif Inc.", "4C11AE": "Espressif Inc.",
@@ -170,7 +170,7 @@ func (db *Database) loadBuiltin() {
 		"D8A01D": "Espressif Inc.", "DC4F22": "Espressif Inc.", "E09806": "Espressif Inc.",
 		"E831CD": "Espressif Inc.", "ECFABC": "Espressif Inc.", "F4CFA2": "Espressif Inc.",
 
-		// Tuya Smart / Hangzhou Tuya Information (Smart Plugs, Bulbs, Switches)
+		// Tuya Smart
 		"10D7B1": "Tuya Smart Inc.", "1869D8": "Tuya Smart Inc.", "2050E7": "Tuya Smart Inc.",
 		"385B44": "Tuya Smart Inc.", "508A06": "Tuya Smart Inc.", "68572D": "Tuya Smart Inc.",
 		"708976": "Tuya Smart Inc.", "780F77": "Tuya Smart Inc.", "840265": "Tuya Smart Inc.",
@@ -183,7 +183,7 @@ func (db *Database) loadBuiltin() {
 		"A47733": "Google LLC", "D86C63": "Google LLC", "E4F042": "Google LLC",
 		"F4F5DB": "Google LLC", "F88FCA": "Google LLC", "18B430": "Nest Labs",
 
-		// Amazon Technologies (Kindle, Echo, FireTV, Ring)
+		// Amazon Technologies
 		"00FC8B": "Amazon Technologies Inc.", "0C47C9": "Amazon Technologies Inc.",
 		"10CE10": "Amazon Technologies Inc.", "18742E": "Amazon Technologies Inc.",
 		"34D270": "Amazon Technologies Inc.", "3C5C24": "Amazon Technologies Inc.",
@@ -212,10 +212,10 @@ func (db *Database) loadBuiltin() {
 		"000143": "Cisco Systems, Inc.", "000196": "Cisco Systems, Inc.",
 		"000197": "Cisco Systems, Inc.", "000216": "Cisco Systems, Inc.",
 		"000217": "Cisco Systems, Inc.", "00024A": "Cisco Systems, Inc.",
-		"00024B": "Cisco Systems, Inc.", "00180A": "Cisco Systems, Inc.",
+		"00024B": "Cisco Systems, Inc.", "00180A": "Cisco Meraki",
 		"001818": "Cisco Systems, Inc.", "001874": "Cisco Systems, Inc.",
 		"0018B9": "Cisco Systems, Inc.", "0018BA": "Cisco Systems, Inc.",
-		"E0553D": "Cisco Systems, Inc.", "00180A": "Meraki, Inc.",
+		"E0553D": "Cisco Systems, Inc.",
 
 		// TP-Link
 		"000F78": "TP-Link Corporation Limited", "001478": "TP-Link Corporation Limited",
@@ -236,7 +236,7 @@ func (db *Database) loadBuiltin() {
 		"D807B6": "TP-Link Corporation Limited", "E894F6": "TP-Link Corporation Limited",
 		"EC086B": "TP-Link Corporation Limited", "F4EC38": "TP-Link Corporation Limited",
 
-		// Ubiquiti Networks (UniFi)
+		// Ubiquiti Networks
 		"00156D": "Ubiquiti Networks Inc.", "002722": "Ubiquiti Networks Inc.",
 		"0418D6": "Ubiquiti Networks Inc.", "18E829": "Ubiquiti Networks Inc.",
 		"24A43C": "Ubiquiti Networks Inc.", "687251": "Ubiquiti Networks Inc.",
@@ -265,7 +265,7 @@ func (db *Database) loadBuiltin() {
 		"7828CA": "Sonos, Inc.", "949F3E": "Sonos, Inc.", "B8E937": "Sonos, Inc.",
 		"C43875": "Sonos, Inc.", "D88039": "Sonos, Inc.", "F0F6C1": "Sonos, Inc.",
 
-		// Philips Lighting / Signify (Philips Hue)
+		// Philips Lighting
 		"001788": "Philips Lighting BV", "001EC0": "Philips Lighting BV",
 		"ECB5FA": "Philips Lighting BV",
 
@@ -283,7 +283,7 @@ func (db *Database) loadBuiltin() {
 		"B8AE6E": "Nintendo Co., Ltd.", "CC9E00": "Nintendo Co., Ltd.",
 		"D86B7D": "Nintendo Co., Ltd.", "E00C7F": "Nintendo Co., Ltd.",
 
-		// Sony Interactive Entertainment (PlayStation / Bravia TV)
+		// Sony
 		"00014A": "Sony Interactive Entertainment Inc.", "000413": "Sony Corporation",
 		"000A28": "Sony Corporation", "000B24": "Sony Corporation",
 		"000D00": "Sony Corporation", "000E07": "Sony Corporation",
@@ -294,14 +294,13 @@ func (db *Database) loadBuiltin() {
 		"001FA7": "Sony Corporation", "00248D": "Sony Corporation",
 		"0025E7": "Sony Corporation", "00D029": "Sony Interactive Entertainment Inc.",
 		"04766E": "Sony Corporation", "080046": "Sony Corporation",
-		"0013A9": "Sony Interactive Entertainment Inc.",
 		"709E29": "Sony Interactive Entertainment Inc.",
 		"A41566": "Sony Interactive Entertainment Inc.",
 		"A8E3EE": "Sony Interactive Entertainment Inc.",
 		"B449A5": "Sony Interactive Entertainment Inc.",
 		"FC0F04": "Sony Interactive Entertainment Inc.",
 
-		// Microsoft (Xbox / Surface)
+		// Microsoft
 		"0003FF": "Microsoft Corporation", "000D3A": "Microsoft Corporation",
 		"00125A": "Microsoft Corporation", "00155D": "Microsoft Corporation",
 		"0017FA": "Microsoft Corporation", "001DD8": "Microsoft Corporation",
@@ -314,7 +313,7 @@ func (db *Database) loadBuiltin() {
 		"C0335E": "Microsoft Corporation", "DC5360": "Microsoft Corporation",
 		"E0D55E": "Microsoft Corporation", "F4428F": "Microsoft Corporation",
 
-		// LG Electronics (Smart TVs, Appliances)
+		// LG Electronics
 		"0005C9": "LG Electronics", "000B97": "LG Electronics",
 		"000E6D": "LG Electronics", "001256": "LG Electronics",
 		"0013E0": "LG Electronics", "0015C9": "LG Electronics",
@@ -339,9 +338,9 @@ func (db *Database) loadBuiltin() {
 		"BCF5AC": "LG Electronics", "C436DA": "LG Electronics",
 		"CC2D83": "LG Electronics", "D01827": "LG Electronics",
 		"E42686": "LG Electronics", "E85B5B": "LG Electronics",
-		"F80C2A": "LG Electronics", "F80L43": "LG Electronics",
+		"F80C2A": "LG Electronics",
 
-		// Xiaomi / Lei Jun (Smart Home, Phones, TVs)
+		// Xiaomi
 		"009EA1": "Xiaomi Communications Co Ltd", "04CF8C": "Xiaomi Communications Co Ltd",
 		"08E689": "Xiaomi Communications Co Ltd", "102A14": "Xiaomi Communications Co Ltd",
 		"14F65A": "Xiaomi Communications Co Ltd", "185936": "Xiaomi Communications Co Ltd",
@@ -372,11 +371,11 @@ func (db *Database) loadBuiltin() {
 		"F44EFD": "Xiaomi Communications Co Ltd", "F4848D": "Xiaomi Communications Co Ltd",
 		"FC643A": "Xiaomi Communications Co Ltd", "FC7A15": "Xiaomi Communications Co Ltd",
 
-		// Synology (NAS)
+		// Synology
 		"001132": "Synology Incorporated", "002155": "Synology Incorporated",
 		"D7B5D8": "Synology Incorporated",
 
-		// QNAP (NAS)
+		// QNAP
 		"00089B": "QNAP Systems, Inc.", "245EBE": "QNAP Systems, Inc.",
 	}
 
