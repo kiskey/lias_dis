@@ -1,7 +1,7 @@
 /* 
  * LIAS Dashboard Styles
  * File:    apps/lias/web/src/styles.css
- * Version: 1.4
+ * Version: 1.5 (Desktop Day Chip Segmented Tiles & Time Picker Styling)
  */
 
 :root {
@@ -177,6 +177,61 @@ html, body {
 }
 .segmented-btn.active { background: var(--bg-secondary); color: var(--text-primary); box-shadow: var(--shadow-sm); }
 .segmented-btn.danger.active { background: var(--danger); color: #fff; }
+
+/* Day Chips Selector - Fixed Desktop & Mobile HIG Segmented Flex Layout */
+.day-chip-group {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: wrap !important;
+  gap: 8px !important;
+  margin-top: 6px !important;
+}
+
+.day-chip {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  min-width: 44px !important;
+  height: 38px !important;
+  padding: 0 12px !important;
+  border-radius: 10px !important;
+  border: 1px solid var(--separator) !important;
+  background-color: var(--bg-tertiary) !important;
+  color: var(--text-secondary) !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  cursor: pointer !important;
+  user-select: none !important;
+  transition: all 0.2s ease !important;
+}
+
+.day-chip:hover {
+  background-color: var(--bg-secondary) !important;
+  color: var(--text-primary) !important;
+}
+
+.day-chip.selected {
+  background-color: var(--accent) !important;
+  color: #ffffff !important;
+  border-color: var(--accent) !important;
+  box-shadow: var(--shadow-sm) !important;
+}
+
+/* Time Picker Styling */
+input[type="time"] {
+  appearance: none;
+  -webkit-appearance: none;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--separator);
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 600;
+  font-family: inherit;
+  outline: none;
+  cursor: pointer;
+}
 
 .btn {
   padding: 10px 18px; border-radius: var(--border-radius-button); border: none;
