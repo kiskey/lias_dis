@@ -1,7 +1,7 @@
 // Binary discovery-service implements the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 1.5
+// Version: 1.6
 package main
 
 import (
