@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 1.4
+// Version: 1.5
 package nftables
 
 import (
@@ -52,16 +52,17 @@ func (c *Controller) Init() error {
 		Name:   c.cfg.TableName,
 	})
 
-	// 2. Create the ingress chain on netdev table
+	// 2. Create the ingress chain with HIGHEST priority (-500)
+	// Priority -500 ensures lancontrol executes BEFORE sing-box (-150) and inet filter (0)
 	c.chain = c.conn.AddChain(&nftables.Chain{
 		Name:     "ingress",
 		Table:    c.table,
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookIngress,
-		Priority: nftables.ChainPriorityRef(0),
+		Priority: nftables.ChainPriorityRef(-500),
 	})
 
-	// Flush existing chain rules to prevent duplicate rule accumulation on re-initialization
+	// Flush existing chain rules to prevent duplicate rule accumulation
 	c.conn.FlushChain(c.chain)
 
 	// 3. Create sets for allowed and blocked elements
@@ -114,8 +115,8 @@ func (c *Controller) Init() error {
 	// Interface match bytes (null-terminated interface string)
 	ifaceBytes := []byte(c.cfg.Interface + "\x00")
 
-	// 4. Create filtering rules using iifname interface matching and correct payload offsets
-	// Rule 1: Allow MACs on c.cfg.Interface
+	// 4. DROP RULES FIRST (Highest Precedence)
+	// Rule 1: BLOCK MACs on c.cfg.Interface (DROPS FIRST!)
 	c.conn.AddRule(&nftables.Rule{
 		Table: c.table,
 		Chain: c.chain,
@@ -131,52 +132,6 @@ func (c *Controller) Init() error {
 			},
 			&expr.Lookup{
 				SourceRegister: 1,
-				SetName:        "allowed_macs",
-				SetID:          c.sets["allowed_macs"].ID,
-			},
-			&expr.Verdict{Kind: expr.VerdictAccept},
-		},
-	})
-
-	// Rule 2: Allow IPs on c.cfg.Interface
-	c.conn.AddRule(&nftables.Rule{
-		Table: c.table,
-		Chain: c.chain,
-		Exprs: []expr.Any{
-			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
-			&expr.Payload{
-				OperationType: expr.PayloadLoad,
-				DestRegister:  1,
-				Base:          expr.PayloadBaseNetworkHeader,
-				Offset:        12, // Source IPv4 starts at byte 12
-				Len:           4,
-			},
-			&expr.Lookup{
-				SourceRegister: 1,
-				SetName:        "allowed_ips",
-				SetID:          c.sets["allowed_ips"].ID,
-			},
-			&expr.Verdict{Kind: expr.VerdictAccept},
-		},
-	})
-
-	// Rule 3: Block MACs on c.cfg.Interface
-	c.conn.AddRule(&nftables.Rule{
-		Table: c.table,
-		Chain: c.chain,
-		Exprs: []expr.Any{
-			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
-			&expr.Payload{
-				OperationType: expr.PayloadLoad,
-				DestRegister:  1,
-				Base:          expr.PayloadBaseLLHeader,
-				Offset:        6, // Source MAC starts at byte 6
-				Len:           6,
-			},
-			&expr.Lookup{
-				SourceRegister: 1,
 				SetName:        "blocked_macs",
 				SetID:          c.sets["blocked_macs"].ID,
 			},
@@ -184,7 +139,7 @@ func (c *Controller) Init() error {
 		},
 	})
 
-	// Rule 4: Block IPs on c.cfg.Interface
+	// Rule 2: BLOCK IPs on c.cfg.Interface (DROPS SECOND!)
 	c.conn.AddRule(&nftables.Rule{
 		Table: c.table,
 		Chain: c.chain,
@@ -207,11 +162,58 @@ func (c *Controller) Init() error {
 		},
 	})
 
+	// Rule 3: ALLOW MACs on c.cfg.Interface
+	c.conn.AddRule(&nftables.Rule{
+		Table: c.table,
+		Chain: c.chain,
+		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
+			&expr.Payload{
+				OperationType: expr.PayloadLoad,
+				DestRegister:  1,
+				Base:          expr.PayloadBaseLLHeader,
+				Offset:        6,
+				Len:           6,
+			},
+			&expr.Lookup{
+				SourceRegister: 1,
+				SetName:        "allowed_macs",
+				SetID:          c.sets["allowed_macs"].ID,
+			},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		},
+	})
+
+	// Rule 4: ALLOW IPs on c.cfg.Interface
+	c.conn.AddRule(&nftables.Rule{
+		Table: c.table,
+		Chain: c.chain,
+		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
+			&expr.Payload{
+				OperationType: expr.PayloadLoad,
+				DestRegister:  1,
+				Base:          expr.PayloadBaseNetworkHeader,
+				Offset:        12,
+				Len:           4,
+			},
+			&expr.Lookup{
+				SourceRegister: 1,
+				SetName:        "allowed_ips",
+				SetID:          c.sets["allowed_ips"].ID,
+			},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		},
+	})
+
 	if err := c.conn.Flush(); err != nil {
 		return fmt.Errorf("failed to initialize netdev lancontrol table: %w", err)
 	}
 
-	slog.Info("nftables netdev table initialized successfully", "table", c.cfg.TableName, "iface", c.cfg.Interface)
+	slog.Info("nftables netdev table initialized successfully with priority -500 and drop-first rules",
+		"table", c.cfg.TableName, "iface", c.cfg.Interface)
 	return nil
 }
 
