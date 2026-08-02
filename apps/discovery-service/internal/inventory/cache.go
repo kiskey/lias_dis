@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/cache.go
-// Version: 1.4
+// Version: 1.5
 package inventory
 
 import (
@@ -68,6 +68,25 @@ func (c *Cache) GetByIP(ipStr string) *models.Device {
 	return nil
 }
 
+// GetByHostname searches for an existing cached device record matching a clean, normalized hostname.
+func (c *Cache) GetByHostname(hostname string) *models.Device {
+	cleanHost := strings.ToLower(strings.TrimSpace(hostname))
+	if cleanHost == "" {
+		return nil
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, d := range c.devices {
+		if strings.ToLower(strings.TrimSpace(d.Hostname)) == cleanHost {
+			devCopy := *d
+			return &devCopy
+		}
+	}
+	return nil
+}
+
 // RemoveIPIndex removes a stale IP index mapping when DHCP reassigns an IP to another MAC.
 func (c *Cache) RemoveIPIndex(ipStr string) {
 	cleanIP := strings.TrimSpace(ipStr)
@@ -79,7 +98,6 @@ func (c *Cache) RemoveIPIndex(ipStr string) {
 	defer c.mu.Unlock()
 
 	if d, found := c.ipIndex[cleanIP]; found {
-		// Strip the IP from the device's slice of IPs
 		newIPs := make([]string, 0, len(d.IPs))
 		for _, ip := range d.IPs {
 			if ip != cleanIP {
