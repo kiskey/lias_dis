@@ -1,41 +1,68 @@
 // Package api implements the HTTP server, middleware, and SSE broker for DIS.
 //
 // File:    apps/discovery-service/internal/api/sse.go
-// Version: 1.1
+// Version: 1.2
 package api
 
 import (
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/user/lias-dis/shared/models"
 )
 
 const historyBufferCapacity = 100
 
-// Client represents a connected SSE consumer.
 type Client struct {
 	ID     string
 	Events chan models.Event
 }
 
-// Broker manages connected SSE clients, broadcasts events, and maintains a ring buffer for event replay.
 type Broker struct {
 	mu       sync.RWMutex
 	clients  map[string]*Client
 	history  []models.Event
 	histHead int
+	stopPing chan struct{}
 }
 
-// NewBroker initializes a new SSE broker.
 func NewBroker() *Broker {
-	return &Broker{
-		clients: make(map[string]*Client),
-		history: make([]models.Event, 0, historyBufferCapacity),
+	b := &Broker{
+		clients:  make(map[string]*Client),
+		history:  make([]models.Event, 0, historyBufferCapacity),
+		stopPing: make(chan struct{}),
+	}
+	go b.pingLoop()
+	return b
+}
+
+func (b *Broker) pingLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-b.stopPing:
+			return
+		case <-ticker.C:
+			b.mu.RLock()
+			// Broadcast empty ping frame to keep TCP connections alive
+			pingEvent := models.Event{
+				Type:      models.EventType("ping"),
+				Timestamp: time.Now(),
+			}
+			for _, client := range b.clients {
+				select {
+				case client.Events <- pingEvent:
+				default:
+				}
+			}
+			b.mu.RUnlock()
+		}
 	}
 }
 
-// Subscribe registers a new client and replays missed events if lastEventID > 0.
 func (b *Broker) Subscribe(clientID string, lastEventID int64) *Client {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -47,7 +74,6 @@ func (b *Broker) Subscribe(clientID string, lastEventID int64) *Client {
 	b.clients[clientID] = client
 	slog.Info("SSE client subscribed", "client_id", clientID, "total_clients", len(b.clients))
 
-	// Replay missed events from ring buffer if requested
 	if lastEventID > 0 {
 		b.replayEventsLocked(client, lastEventID)
 	}
@@ -55,7 +81,6 @@ func (b *Broker) Subscribe(clientID string, lastEventID int64) *Client {
 	return client
 }
 
-// Unsubscribe removes a client and closes its channel.
 func (b *Broker) Unsubscribe(clientID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -67,12 +92,10 @@ func (b *Broker) Unsubscribe(clientID string) {
 	}
 }
 
-// Broadcast sends an event to all clients and appends it to the history ring buffer.
 func (b *Broker) Broadcast(event models.Event) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Append to ring buffer
 	if len(b.history) < historyBufferCapacity {
 		b.history = append(b.history, event)
 	} else {
@@ -80,7 +103,6 @@ func (b *Broker) Broadcast(event models.Event) {
 		b.histHead = (b.histHead + 1) % historyBufferCapacity
 	}
 
-	// Non-blocking broadcast
 	for _, client := range b.clients {
 		select {
 		case client.Events <- event:
