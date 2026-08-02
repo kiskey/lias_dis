@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 1.1
+// Version: 1.2
 package storage
 
 import (
@@ -69,7 +69,8 @@ func (s *Storage) initSchema() error {
 
 	CREATE TABLE IF NOT EXISTS device_tags (
 		pdid TEXT PRIMARY KEY,
-		tag_id TEXT NOT NULL
+		tag_id TEXT NOT NULL,
+		mac TEXT NOT NULL DEFAULT ''
 	);
 
 	CREATE TABLE IF NOT EXISTS policies (
@@ -98,11 +99,12 @@ func (s *Storage) initSchema() error {
 	return nil
 }
 
-func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, schedEng *schedule.Engine) (map[string]string, error) {
+func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, schedEng *schedule.Engine) (map[string]string, map[string]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	deviceTags := make(map[string]string)
+	macTags := make(map[string]string)
 
 	// 1. Hydrate Tags
 	rows, err := s.db.Query("SELECT id, name, color, precedence, builtin FROM tags")
@@ -118,14 +120,19 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 		}
 	}
 
-	// 2. Hydrate Device Tags (Sticky Assignments)
-	dtRows, err := s.db.Query("SELECT pdid, tag_id FROM device_tags")
+	// 2. Hydrate Device Tags (PDID and MAC Sticky Assignments)
+	dtRows, err := s.db.Query("SELECT pdid, tag_id, mac FROM device_tags")
 	if err == nil {
 		defer dtRows.Close()
 		for dtRows.Next() {
-			var pdid, tagID string
-			if err := dtRows.Scan(&pdid, &tagID); err == nil {
-				deviceTags[pdid] = tagID
+			var pdid, tagID, mac string
+			if err := dtRows.Scan(&pdid, &tagID, &mac); err == nil {
+				if pdid != "" {
+					deviceTags[pdid] = tagID
+				}
+				if mac != "" {
+					macTags[mac] = tagID
+				}
 			}
 		}
 	}
@@ -160,19 +167,19 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 		}
 	}
 
-	slog.Info("Successfully hydrated LIAS state from persistent storage", "loaded_device_tags", len(deviceTags))
-	return deviceTags, nil
+	slog.Info("Successfully hydrated LIAS state from persistent storage", "device_tags", len(deviceTags), "mac_tags", len(macTags))
+	return deviceTags, macTags, nil
 }
 
-func (s *Storage) SaveDeviceTag(pdid, tagID string) error {
+func (s *Storage) SaveDeviceTag(pdid, tagID, mac string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	_, err := s.db.Exec(`
-		INSERT INTO device_tags (pdid, tag_id)
-		VALUES (?, ?)
-		ON CONFLICT(pdid) DO UPDATE SET tag_id=excluded.tag_id
-	`, pdid, tagID)
+		INSERT INTO device_tags (pdid, tag_id, mac)
+		VALUES (?, ?, ?)
+		ON CONFLICT(pdid) DO UPDATE SET tag_id=excluded.tag_id, mac=excluded.mac
+	`, pdid, tagID, mac)
 
 	return err
 }
