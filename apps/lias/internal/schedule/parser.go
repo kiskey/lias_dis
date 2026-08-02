@@ -1,7 +1,7 @@
 // Package schedule implements time-based rule parsing and evaluation for LIAS.
 //
 // File:    apps/lias/internal/schedule/parser.go
-// Version: 1.3
+// Version: 1.4
 package schedule
 
 import (
@@ -23,7 +23,10 @@ var dayMap = map[string]time.Weekday{
 }
 
 // Evaluate determines the effective action for a schedule at a specific time.
-// Properly supports cross-midnight time windows (e.g. Start 22:00, End 06:00).
+//
+// Handles both:
+// 1. Scheduled Whitelist Mode (Action: ALLOW rules) -> Default state outside windows is BLOCK.
+// 2. Scheduled Downtime Mode (Action: BLOCK rules)  -> Default state outside windows is ALLOW.
 func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
 	loc, err := time.LoadLocation(s.Timezone)
 	if err != nil {
@@ -71,12 +74,11 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
 		var windowDuration time.Duration
 
 		if end.After(start) {
-			// Normal same-day window (e.g., 08:00 to 17:00)
+			// Normal same-day window (e.g., 12:00 to 18:00)
 			isMatch = (now.Equal(start) || now.After(start)) && now.Before(end)
 			windowDuration = end.Sub(start)
 		} else {
 			// Cross-midnight window (e.g., 22:00 to 06:00)
-			// Matches if now >= 22:00 yesterday OR now < 06:00 today
 			startOvernight := start.AddDate(0, 0, -1) // Yesterday's start
 
 			isMatchYesterday := (now.Equal(startOvernight) || now.After(startOvernight)) && now.Before(end)
@@ -96,16 +98,33 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
 		}
 	}
 
+	// 1. If a rule window is currently active, enforce the rule's specified action (ALLOW or BLOCK)
 	if bestMatch != nil {
 		return bestMatch.Action, nil
 	}
 
-	// Fail closed (block) if no schedule rules match
-	return models.ActionBlock, nil
+	// 2. DYNAMIC DEFAULT FALLBACK (When outside all configured windows):
+	// Check if the schedule contains any ALLOW rules (Scheduled Whitelist Mode)
+	hasAllowRules := false
+	for _, r := range s.Rules {
+		if r.Action == models.ActionAllow {
+			hasAllowRules = true
+			break
+		}
+	}
+
+	// If schedule is a Whitelist (e.g., Weekend Gaming 12:00-18:00 ALLOW):
+	// Default state outside the window is BLOCK.
+	if hasAllowRules {
+		return models.ActionBlock, nil
+	}
+
+	// If schedule is a Blacklist (e.g., Bedtime 22:00-06:00 BLOCK):
+	// Default state outside the window is ALLOW.
+	return models.ActionAllow, nil
 }
 
 // NextStateChange calculates the exact next timestamp when the schedule action will transition.
-// Efficiently evaluates transition boundaries without brute-force minute loops.
 func NextStateChange(s models.Schedule, now time.Time) (time.Time, error) {
 	loc, err := time.LoadLocation(s.Timezone)
 	if err != nil {
@@ -115,7 +134,6 @@ func NextStateChange(s models.Schedule, now time.Time) (time.Time, error) {
 
 	currentAction, _ := Evaluate(s, now)
 
-	// Collect upcoming rule transition points over the next 8 days
 	var transitionPoints []time.Time
 	year, month, day := now.Date()
 
@@ -143,12 +161,10 @@ func NextStateChange(s models.Schedule, now time.Time) (time.Time, error) {
 		return now.Add(24 * time.Hour), nil
 	}
 
-	// Sort transition timestamps chronologically
 	sort.Slice(transitionPoints, func(i, j int) bool {
 		return transitionPoints[i].Before(transitionPoints[j])
 	})
 
-	// Find the first transition boundary that alters the current action
 	for _, t := range transitionPoints {
 		nextAction, _ := Evaluate(s, t.Add(1*time.Second))
 		if nextAction != currentAction {
