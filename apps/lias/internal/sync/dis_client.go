@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 1.3
+// Version: 1.4
 package sync
 
 import (
@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	liasAPI "github.com/user/lias-dis/apps/lias/internal/api"
 	"github.com/user/lias-dis/apps/lias/internal/config"
 	"github.com/user/lias-dis/shared/api"
 	"github.com/user/lias-dis/shared/models"
@@ -26,16 +27,18 @@ type DISClient struct {
 	cfg     config.DISConfig
 	cache   *Cache
 	client  *http.Client
-	trigger chan struct{} // Non-blocking notification channel for immediate nftables resync
+	trigger chan struct{}    // Non-blocking notification channel for immediate nftables resync
+	broker  *liasAPI.Broker // LIAS SSE Broker handle to proxy real-time events to Web Dashboard
 }
 
 // NewDISClient initializes the DIS client.
-func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}) *DISClient {
+func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, broker *liasAPI.Broker) *DISClient {
 	return &DISClient{
 		cfg:     cfg,
 		cache:   cache,
 		client:  &http.Client{Timeout: 10 * time.Second},
 		trigger: trigger,
+		broker:  broker,
 	}
 }
 
@@ -91,7 +94,6 @@ func (c *DISClient) getEndpointURL(path string) string {
 		return strings.TrimRight(c.cfg.URL, "/") + path
 	}
 
-	// Default DIS port is :8080 if unspecified
 	if u.Port() == "" {
 		u.Host = u.Host + ":8080"
 	}
@@ -175,7 +177,7 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
 	}
 	req.Header.Set("Accept", "text/event-stream")
 
-	sseClient := &http.Client{Timeout: 0} // Long-lived HTTP stream
+	sseClient := &http.Client{Timeout: 0}
 	resp, err := sseClient.Do(req)
 	if err != nil {
 		return err
@@ -199,7 +201,6 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
 			if dataBuf.Len() > 0 {
 				event.Payload = json.RawMessage(dataBuf.String())
 
-				// Extract PDID / DeviceID from payload if empty on envelope
 				if event.DeviceID == "" {
 					var payloadMeta struct {
 						PDID     string `json:"pdid"`
@@ -216,7 +217,6 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
 
 				c.handleEvent(event)
 
-				// Reset buffer
 				event = models.Event{}
 				dataBuf.Reset()
 			}
@@ -243,6 +243,11 @@ func (c *DISClient) handleEvent(e models.Event) {
 
 	slog.Debug("Received real-time event from DIS", "type", e.Type, "device_id", e.DeviceID)
 
+	// FIX: Proxy real-time DIS events to LIAS SSE broker for browser clients on :8081
+	if c.broker != nil {
+		c.broker.Broadcast(e)
+	}
+
 	switch e.Type {
 	case models.EventDeviceRemoved:
 		c.cache.RemoveDevice(e.DeviceID)
@@ -254,7 +259,7 @@ func (c *DISClient) handleEvent(e models.Event) {
 
 		go func(pdid string) {
 			if c.fetchSingleDevice(pdid) {
-				c.tryTrigger() // Trigger immediate firewall update upon state sync
+				c.tryTrigger()
 			}
 		}(e.DeviceID)
 	}
