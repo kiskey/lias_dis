@@ -1,7 +1,7 @@
 // Binary discovery-service implements the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 1.6
+// Version: 1.7
 package main
 
 import (
@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/user/lias-dis/apps/discovery-service/internal/correlation"
 	"github.com/user/lias-dis/apps/discovery-service/internal/discovery"
 	"github.com/user/lias-dis/apps/discovery-service/internal/inventory"
+	"github.com/user/lias-dis/apps/discovery-service/internal/storage"
 	"github.com/user/lias-dis/pkg/oui"
 	sharedAPI "github.com/user/lias-dis/shared/api"
 )
@@ -27,9 +29,6 @@ import (
 var version = "dev"
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
-
 	_ = oui.Get()
 
 	cfgPath := "/etc/dis/config.yaml"
@@ -39,15 +38,55 @@ func main() {
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
+		// Fallback logger for load failure
 		slog.Error("Failed to load configuration", "error", err)
 		os.Exit(1)
 	}
 
+	// FIX: Wire slog handler AFTER parsing config settings
+	var level slog.Level
+	switch strings.ToLower(cfg.Logging.Level) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
+	if strings.ToLower(cfg.Logging.Format) == "text" {
+		handler = slog.NewTextHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	}
+	slog.SetDefault(slog.New(handler))
+
 	cache := inventory.NewCache()
 	defer cache.Stop()
 
+	// Initialize DIS SQLite storage engine
+	st, err := storage.NewStorage(cfg.Storage.Path)
+	if err != nil {
+		slog.Warn("DIS Storage initialization failed, running in memory-only mode", "error", err)
+	} else {
+		defer st.Close()
+		if hydratedDevs, err := st.LoadHydrate(); err == nil {
+			for _, dev := range hydratedDevs {
+				dCopy := dev
+				cache.Upsert(&dCopy)
+			}
+		}
+	}
+
 	broker := disAPI.NewBroker()
 	eng := correlation.NewEngine(cache, broker)
+	if st != nil {
+		eng.SetStorage(st)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -117,7 +156,7 @@ func main() {
 		Addr:         cfg.HTTP.Listen,
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 0, // Set WriteTimeout to 0 (unlimited) for long-lived SSE streams
+		WriteTimeout: 0, // Unlimited write timeout for long-lived SSE streams
 		IdleTimeout:  120 * time.Second,
 	}
 
