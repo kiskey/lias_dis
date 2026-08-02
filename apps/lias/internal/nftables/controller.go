@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 1.7
+// Version: 1.8
 package nftables
 
 import (
@@ -52,15 +52,14 @@ func (c *Controller) Init() error {
 		Name:   c.cfg.TableName,
 	})
 
-	// 2. Create the ingress chain with HIGHEST priority (-500) and MANDATORY interface binding (Device: c.cfg.Interface)
-	// Passing Device: c.cfg.Interface binds the netdev ingress hook directly to eth0 in the Linux kernel!
+	// 2. Create the ingress chain with HIGHEST priority (-500)
+	// Priority -500 ensures lancontrol executes BEFORE sing-box (-150) and inet filter (0)
 	c.chain = c.conn.AddChain(&nftables.Chain{
 		Name:     "ingress",
 		Table:    c.table,
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookIngress,
 		Priority: nftables.ChainPriorityRef(-500),
-		Device:   c.cfg.Interface, // <-- FIXED: Uses "Device" string field per github.com/google/nftables v0.2.0 API
 	})
 
 	// Flush existing chain rules to prevent duplicate rule accumulation
@@ -113,11 +112,11 @@ func (c *Controller) Init() error {
 	}
 	c.sets["blocked_macs"] = blockedMACsSet
 
-	// Interface match bytes (null-terminated interface string)
+	// Interface match bytes (null-terminated interface string for iifname "eth0" matching)
 	ifaceBytes := []byte(c.cfg.Interface + "\x00")
 
 	// 4. DROP RULES FIRST (Highest Precedence)
-	// Rule 1: BLOCK MACs on c.cfg.Interface (DROPS FIRST!)
+	// Rule 1: BLOCK MACs on c.cfg.Interface (iifname "eth0" @blocked_macs drop)
 	c.conn.AddRule(&nftables.Rule{
 		Table: c.table,
 		Chain: c.chain,
@@ -140,7 +139,7 @@ func (c *Controller) Init() error {
 		},
 	})
 
-	// Rule 2: BLOCK IPs on c.cfg.Interface (DROPS SECOND!)
+	// Rule 2: BLOCK IPs on c.cfg.Interface (iifname "eth0" @blocked_ips drop)
 	c.conn.AddRule(&nftables.Rule{
 		Table: c.table,
 		Chain: c.chain,
@@ -163,7 +162,7 @@ func (c *Controller) Init() error {
 		},
 	})
 
-	// Rule 3: ALLOW MACs on c.cfg.Interface
+	// Rule 3: ALLOW MACs on c.cfg.Interface (iifname "eth0" @allowed_macs accept)
 	c.conn.AddRule(&nftables.Rule{
 		Table: c.table,
 		Chain: c.chain,
@@ -186,7 +185,7 @@ func (c *Controller) Init() error {
 		},
 	})
 
-	// Rule 4: ALLOW IPs on c.cfg.Interface
+	// Rule 4: ALLOW IPs on c.cfg.Interface (iifname "eth0" @allowed_ips accept)
 	c.conn.AddRule(&nftables.Rule{
 		Table: c.table,
 		Chain: c.chain,
@@ -213,7 +212,7 @@ func (c *Controller) Init() error {
 		return fmt.Errorf("failed to initialize netdev lancontrol table: %w", err)
 	}
 
-	slog.Info("nftables netdev table initialized successfully with interface binding, priority -500, and drop-first rules",
+	slog.Info("nftables netdev table initialized successfully with priority -500 and drop-first rules",
 		"table", c.cfg.TableName, "iface", c.cfg.Interface)
 	return nil
 }
