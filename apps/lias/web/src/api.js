@@ -1,13 +1,15 @@
 /*
  * LIAS Control Center - API Client
  * File:    apps/lias/web/src/api.js
- * Version: 1.0
+ * Version: 1.1 (Includes PUT Endpoints & Named SSE Listener Subscriptions)
  */
 
 const BASE_URL = '/api/v1';
 
 export const API = {
+  // ---------------------------------------------------------------------------
   // Devices
+  // ---------------------------------------------------------------------------
   async getDevices() {
     const res = await fetch(`${BASE_URL}/devices`);
     if (!res.ok) throw new Error('Failed to fetch devices');
@@ -29,7 +31,9 @@ export const API = {
     if (!res.ok) throw new Error('Failed to assign tag');
   },
 
+  // ---------------------------------------------------------------------------
   // Tags
+  // ---------------------------------------------------------------------------
   async getTags() {
     const res = await fetch(`${BASE_URL}/tags`);
     if (!res.ok) throw new Error('Failed to fetch tags');
@@ -46,12 +50,24 @@ export const API = {
     return await res.json();
   },
 
+  async updateTag(id, name, color) {
+    const res = await fetch(`${BASE_URL}/tags/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, color }),
+    });
+    if (!res.ok) throw new Error('Failed to update tag');
+    return await res.json();
+  },
+
   async deleteTag(id) {
     const res = await fetch(`${BASE_URL}/tags/${id}`, { method: 'DELETE' });
     if (!res.ok) throw new Error('Failed to delete tag');
   },
 
+  // ---------------------------------------------------------------------------
   // Policies
+  // ---------------------------------------------------------------------------
   async getPolicies() {
     const res = await fetch(`${BASE_URL}/policies`);
     if (!res.ok) throw new Error('Failed to fetch policies');
@@ -68,12 +84,24 @@ export const API = {
     return await res.json();
   },
 
+  async updatePolicy(id, policy) {
+    const res = await fetch(`${BASE_URL}/policies/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(policy),
+    });
+    if (!res.ok) throw new Error('Failed to update policy');
+    return await res.json();
+  },
+
   async deletePolicy(id) {
     const res = await fetch(`${BASE_URL}/policies/${id}`, { method: 'DELETE' });
     if (!res.ok) throw new Error('Failed to delete policy');
   },
 
+  // ---------------------------------------------------------------------------
   // Schedules
+  // ---------------------------------------------------------------------------
   async getSchedules() {
     const res = await fetch(`${BASE_URL}/schedules`);
     if (!res.ok) throw new Error('Failed to fetch schedules');
@@ -90,25 +118,65 @@ export const API = {
     return await res.json();
   },
 
+  async updateSchedule(id, schedule) {
+    const res = await fetch(`${BASE_URL}/schedules/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(schedule),
+    });
+    if (!res.ok) throw new Error('Failed to update schedule');
+    return await res.json();
+  },
+
   async deleteSchedule(id) {
     const res = await fetch(`${BASE_URL}/schedules/${id}`, { method: 'DELETE' });
     if (!res.ok) throw new Error('Failed to delete schedule');
   },
 
-  // SSE Real-Time Stream Subscription
+  // ---------------------------------------------------------------------------
+  // Nftables Management
+  // ---------------------------------------------------------------------------
+  async flushNftables() {
+    const res = await fetch(`${BASE_URL}/nftables/flush`, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to flush nftables');
+  },
+
+  // ---------------------------------------------------------------------------
+  // SSE Real-Time Stream Subscription (Listens for named event types)
+  // ---------------------------------------------------------------------------
   subscribeEvents(onEvent) {
     const es = new EventSource(`${BASE_URL}/events`);
-    es.onmessage = (e) => {
+
+    const eventTypes = [
+      'device.added',
+      'device.removed',
+      'device.online',
+      'device.offline',
+      'device.hostname_changed',
+      'device.fingerprint_updated',
+      'device.ip_changed',
+      'device.mac_changed'
+    ];
+
+    const handler = (e) => {
       try {
-        const data = JSON.parse(e.data);
-        onEvent({ type: e.type, ...data });
+        const payload = JSON.parse(e.data);
+        onEvent({ type: e.type, payload });
       } catch (err) {
         console.error('Failed to parse SSE frame', err);
       }
     };
+
+    // Attach listeners for standard onmessage and DIS named event streams
+    es.onmessage = handler;
+    eventTypes.forEach((type) => {
+      es.addEventListener(type, handler);
+    });
+
     es.onerror = () => {
       console.warn('SSE connection lost, reconnecting...');
     };
+
     return es;
   },
 };
