@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/cache.go
-// Version: 1.6
+// Version: 1.7
 package sync
 
 import (
@@ -21,7 +21,7 @@ type LocalDevice struct {
 }
 
 type Cache struct {
-	mu         sync.RWMutex
+	mu         sync.Mutex // Exclusive Mutex protecting all read/write map operations
 	devices    map[string]*LocalDevice
 	stickyTags map[string]string // PDID -> TagID
 	stickyMACs map[string]string // MAC -> TagID
@@ -55,6 +55,7 @@ func (c *Cache) LoadStickyTags(pdidTags, macTags map[string]string) {
 	}
 }
 
+// applyStickyTagLocked MUST be called while holding c.mu.Lock() (Exclusive Write Lock).
 func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
 	assignedTag := "generic"
 
@@ -67,7 +68,7 @@ func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
 			cleanMAC := strings.ToLower(strings.TrimSpace(mac))
 			if macTag, found := c.stickyMACs[cleanMAC]; found && macTag != "" {
 				assignedTag = macTag
-				c.stickyTags[d.PDID] = assignedTag // Auto-repair stickyTags for current PDID
+				c.stickyTags[d.PDID] = assignedTag // Thread-safe write under c.mu.Lock()
 				break
 			}
 		}
@@ -90,15 +91,15 @@ func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
 		for _, mac := range d.MACs {
 			cleanMAC := strings.ToLower(strings.TrimSpace(mac))
 			if cleanMAC != "" {
-				c.stickyMACs[cleanMAC] = assignedTag
+				c.stickyMACs[cleanMAC] = assignedTag // Thread-safe write under c.mu.Lock()
 			}
 		}
 	}
 }
 
 func (c *Cache) Get(pdid string) *LocalDevice {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	d, ok := c.devices[pdid]
 	if !ok {
@@ -106,17 +107,25 @@ func (c *Cache) Get(pdid string) *LocalDevice {
 	}
 	devCopy := *d
 	c.applyStickyTagLocked(&devCopy)
+	if ptr, exists := c.devices[pdid]; exists {
+		ptr.Tags = devCopy.Tags
+		ptr.Device.Tags = devCopy.Device.Tags
+	}
 	return &devCopy
 }
 
 func (c *Cache) List() []LocalDevice {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	list := make([]LocalDevice, 0, len(c.devices))
-	for _, d := range c.devices {
+	for pdid, d := range c.devices {
 		devCopy := *d
 		c.applyStickyTagLocked(&devCopy)
+		if ptr, exists := c.devices[pdid]; exists {
+			ptr.Tags = devCopy.Tags
+			ptr.Device.Tags = devCopy.Device.Tags
+		}
 		list = append(list, devCopy)
 	}
 	return list
