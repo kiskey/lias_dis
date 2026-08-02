@@ -1,7 +1,7 @@
 /*
  * LIAS Control Center - Main Dashboard Application
  * File:    apps/lias/web/src/main.js
- * Version: 1.3 (Auto-Detected Timezone & Dropdown Upgrade)
+ * Version: 1.4 (Multiple Tag Policies & Sticky Tag Support)
  */
 
 import { API } from './api.js';
@@ -195,20 +195,39 @@ class LiasDashboard {
         return matchesGroup && matchesQuery;
       });
 
-      const tagPolicy = this.policies.find((p) => p.type === 'tag' && p.target_id === tag.id);
-      const tagPolicyBadge = tagPolicy
-        ? `<span style="font-size: 12px; padding: 4px 10px; border-radius: 6px; background: var(--bg-tertiary); color: var(--accent); font-weight: 600;">Policy: ${tagPolicy.action.toUpperCase()}</span>`
-        : `<span style="font-size: 12px; padding: 4px 10px; border-radius: 6px; background: var(--bg-tertiary); color: var(--text-secondary);">Default Inherit</span>`;
+      // Find ALL policies attached to this tag group
+      const tagPolicies = this.policies.filter((p) => p.type === 'tag' && p.target_id === tag.id);
+      
+      let tagPolicyBadges = '';
+      if (tagPolicies.length > 0) {
+        tagPolicyBadges = tagPolicies
+          .map((p) => {
+            const schedObj = p.schedule_id ? this.schedules.find((s) => s.id === p.schedule_id) : null;
+            const schedName = schedObj ? schedObj.name : '';
+            const label = p.action === 'schedule' ? `SCHEDULE (${schedName})` : p.action.toUpperCase();
+            return `
+              <span style="display: inline-flex; align-items: center; gap: 6px; font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--bg-tertiary); color: var(--accent); font-weight: 600; margin-right: 6px; margin-top: 4px;">
+                ${p.name || 'Rule'}: ${label}
+                <button data-del-pol="${p.id}" style="border:none; background:none; color:var(--danger); cursor:pointer; font-weight:bold; font-size:14px; line-height:1;">&times;</button>
+              </span>
+            `;
+          })
+          .join('');
+      } else {
+        tagPolicyBadges = `<span style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--bg-tertiary); color: var(--text-secondary);">Default Inherit</span>`;
+      }
 
       html += `
         <div class="card" style="margin: 0;">
-          <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--separator); padding-bottom: 14px; margin-bottom: 16px;">
-            <div style="display: flex; align-items: center; gap: 12px;">
-              <div style="width: 14px; height: 14px; border-radius: 4px; background-color: ${tag.color};"></div>
-              <h3 style="font-size: 18px; font-weight: 700;">${tag.name} (${groupDevs.length})</h3>
-              ${tagPolicyBadge}
+          <div style="display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid var(--separator); padding-bottom: 14px; margin-bottom: 16px;">
+            <div>
+              <div style="display: flex; align-items: center; gap: 10px;">
+                <div style="width: 14px; height: 14px; border-radius: 4px; background-color: ${tag.color};"></div>
+                <h3 style="font-size: 18px; font-weight: 700;">${tag.name} (${groupDevs.length})</h3>
+              </div>
+              <div style="margin-top: 8px;">${tagPolicyBadges}</div>
             </div>
-            ${tag.id !== 'infrastructure' ? `<button class="btn btn-ghost" data-tag-policy="${tag.id}" style="font-size: 13px;">Attach Schedule / Policy</button>` : `<span style="font-size: 12px; color: var(--success); font-weight: 600;">Immune to Block Rules</span>`}
+            ${tag.id !== 'infrastructure' ? `<button class="btn btn-primary" data-add-tag-policy="${tag.id}" style="font-size: 12px;">+ Attach Rule / Schedule</button>` : `<span style="font-size: 12px; color: var(--success); font-weight: 600;">Immune to Block Rules</span>`}
           </div>
 
           <div style="display: flex; flex-direction: column; gap: 10px;">
@@ -224,7 +243,7 @@ class LiasDashboard {
           html += `
             <div style="display: flex; align-items: center; justify-content: space-between; background: var(--bg-tertiary); padding: 12px 16px; border-radius: 12px;">
               <div style="display: flex; align-items: center; gap: 14px;">
-                <div style="width: 10px; height: 10px; border-radius: 50%; background-color: ${onlineDot}; flex-shrink: 0;"></div>
+                <div style="width: 100%; max-width: 10px; height: 10px; border-radius: 50%; background-color: ${onlineDot}; flex-shrink: 0;"></div>
                 <div>
                   <h4 style="font-size: 15px; font-weight: 600;">${d.friendly_name || d.hostname || 'Unknown Device'}</h4>
                   <p style="font-size: 12px; color: var(--text-secondary); margin-top: 2px;">
@@ -248,13 +267,30 @@ class LiasDashboard {
     html += `</div>`;
     this.viewContainer.innerHTML = html;
 
-    this.viewContainer.querySelectorAll('[data-tag-policy]').forEach((btn) => {
+    // Attach Policy Add Button Listeners
+    this.viewContainer.querySelectorAll('[data-add-tag-policy]').forEach((btn) => {
       btn.addEventListener('click', (e) => {
-        const tagId = e.currentTarget.getAttribute('data-tag-policy');
+        const tagId = e.currentTarget.getAttribute('data-add-tag-policy');
         this.openTagPolicyModal(tagId);
       });
     });
 
+    // Attach Policy Delete Button Listeners
+    this.viewContainer.querySelectorAll('[data-del-pol]').forEach((btn) => {
+      btn.addEventListener('click', async (e) => {
+        const polId = e.currentTarget.getAttribute('data-del-pol');
+        try {
+          await API.deletePolicy(polId);
+          this.policies = this.policies.filter((p) => p.id !== polId);
+          this.renderDevicesView();
+          this.showToast('Policy removed from group', 'success');
+        } catch (err) {
+          this.showToast('Failed to delete policy', 'danger');
+        }
+      });
+    });
+
+    // Attach Move Tag Select Listeners
     this.viewContainer.querySelectorAll('[data-move-pdid]').forEach((select) => {
       select.addEventListener('change', async (e) => {
         const pdid = e.currentTarget.getAttribute('data-move-pdid');
@@ -264,7 +300,7 @@ class LiasDashboard {
           const dev = this.devices.find((d) => d.pdid === pdid);
           if (dev) dev.tags = [newTagId];
           this.renderDevicesView();
-          this.showToast('Device moved to new group', 'success');
+          this.showToast('Device reassigned & saved persistently', 'success');
         } catch (err) {
           this.showToast('Failed to reassign device', 'danger');
         }
@@ -351,7 +387,7 @@ class LiasDashboard {
       <div class="card">
         <h3>System Settings</h3>
         <p style="color: var(--text-secondary); margin-top: 8px;">
-          LIAS Version: 1.5 &bull; Netfilter Table: <code>netdev lancontrol</code>
+          LIAS Version: 1.6 &bull; Netfilter Table: <code>netdev lancontrol</code>
         </p>
       </div>
     `;
@@ -360,7 +396,6 @@ class LiasDashboard {
   // --- Modals ---
 
   openAddScheduleModal() {
-    // Detect browser local timezone automatically
     let detectedTz = 'UTC';
     try {
       detectedTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
@@ -480,9 +515,14 @@ class LiasDashboard {
     const tag = this.tags.find((t) => t.id === tagId);
     if (!tag) return;
 
-    this.modalTitle.textContent = `Group Policy: ${tag.name}`;
+    this.modalTitle.textContent = `Attach Policy / Schedule to ${tag.name}`;
     this.modalBody.innerHTML = `
       <div style="display: flex; flex-direction: column; gap: 16px;">
+        <div>
+          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Rule Name</label>
+          <input type="text" id="tag-pol-name" value="${tag.name} Access Rule" placeholder="Rule Name" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
+        </div>
+
         <div>
           <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Access Action</label>
           <select id="tag-act-select" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
@@ -493,7 +533,7 @@ class LiasDashboard {
         </div>
 
         <div id="tag-sched-container" style="display: none;">
-          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Select Schedule</label>
+          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Select Time Schedule</label>
           <select id="tag-sched-select" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
             ${this.schedules.map((s) => `<option value="${s.id}">${s.name} (${s.timezone})</option>`).join('')}
           </select>
@@ -508,14 +548,15 @@ class LiasDashboard {
       schedContainer.style.display = e.target.value === 'schedule' ? 'block' : 'none';
     });
 
-    this.modalFooter.innerHTML = `<button class="btn btn-primary" id="save-tag-pol-btn">Apply Policy</button>`;
+    this.modalFooter.innerHTML = `<button class="btn btn-primary" id="save-tag-pol-btn">Attach Policy</button>`;
 
     document.getElementById('save-tag-pol-btn').onclick = async () => {
+      const polName = document.getElementById('tag-pol-name').value;
       const action = actSelect.value;
       const schedId = document.getElementById('tag-sched-select').value;
 
       const policyPayload = {
-        name: `${tag.name} Group Policy`,
+        name: polName || `${tag.name} Access Rule`,
         type: 'tag',
         target_id: tagId,
         action: action,
@@ -527,12 +568,13 @@ class LiasDashboard {
       }
 
       try {
-        await API.createPolicy(policyPayload);
-        this.showToast(`Policy updated for ${tag.name}`, 'success');
+        const created = await API.createPolicy(policyPayload);
+        this.policies.push(created);
+        this.showToast(`Policy attached to ${tag.name}`, 'success');
         this.hideModal();
-        await this.loadInitialData();
+        this.renderDevicesView();
       } catch (err) {
-        this.showToast('Failed to apply tag policy', 'danger');
+        this.showToast('Failed to attach policy', 'danger');
       }
     };
 
