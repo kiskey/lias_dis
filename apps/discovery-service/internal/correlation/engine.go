@@ -2,14 +2,13 @@
 // from multiple providers into canonical device records.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 1.6
+// Version: 1.7
 package correlation
 
 import (
 	"context"
 	"log/slog"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -113,7 +112,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	cleanHost := UnescapeHostname(obs.Hostname)
+	cleanHost := discovery.UnescapeHostname(obs.Hostname)
 
 	// Handle offline event
 	if !obs.Online {
@@ -225,31 +224,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	if (d.Vendor == "" || d.DeviceType == "") && e.orch != nil {
 		go e.orch.TriggerEnrichment(d.PDID, false)
 	}
-}
-
-// UnescapeHostname converts raw octal escape sequences (\058 -> :) and cleans mDNS hostnames.
-func UnescapeHostname(raw string) string {
-	if raw == "" {
-		return ""
-	}
-
-	s := raw
-	for {
-		idx := strings.Index(s, "\\0")
-		if idx == -1 || idx+4 > len(s) {
-			break
-		}
-		octalCode := s[idx+2 : idx+4]
-		if val, err := strconv.ParseInt(octalCode, 8, 64); err == nil {
-			s = s[:idx] + string(rune(val)) + s[idx+4:]
-		} else {
-			break
-		}
-	}
-
-	s = strings.ReplaceAll(s, "\\.", ".")
-	s = strings.ReplaceAll(s, "\\", "")
-	return strings.TrimSpace(s)
 }
 
 // ApplySmartClassifications automatically categorizes routers and Amazon Echo devices.
