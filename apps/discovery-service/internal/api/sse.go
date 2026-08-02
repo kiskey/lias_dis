@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, middleware, and SSE broker for DIS.
 //
 // File:    apps/discovery-service/internal/api/sse.go
-// Version: 1.2
+// Version: 1.3
 package api
 
 import (
@@ -47,7 +47,6 @@ func (b *Broker) pingLoop() {
 			return
 		case <-ticker.C:
 			b.mu.RLock()
-			// Broadcast empty ping frame to keep TCP connections alive
 			pingEvent := models.Event{
 				Type:      models.EventType("ping"),
 				Timestamp: time.Now(),
