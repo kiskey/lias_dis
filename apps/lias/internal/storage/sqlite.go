@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 1.4
+// Version: 1.5
 package storage
 
 import (
@@ -124,6 +124,21 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 				t.Builtin = builtin == 1
 				_ = tagMgr.RestoreTag(t)
 			}
+		}
+	}
+
+	// Automatic DB Seeding: Ensure new built-in tags are persisted to SQLite
+	for _, builtInTag := range tagMgr.List() {
+		if builtInTag.Builtin {
+			builtinInt := 1
+			_, _ = s.db.Exec(`
+				INSERT INTO tags (id, name, color, precedence, builtin)
+				VALUES (?, ?, ?, ?, ?)
+				ON CONFLICT(id) DO UPDATE SET
+					name=excluded.name,
+					color=excluded.color,
+					precedence=excluded.precedence
+			`, builtInTag.ID, builtInTag.Name, builtInTag.Color, builtInTag.Precedence, builtinInt)
 		}
 	}
 
