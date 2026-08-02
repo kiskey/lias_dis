@@ -2,7 +2,7 @@
 // from multiple providers into canonical device records.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 2.1
+// Version: 2.2
 package correlation
 
 import (
@@ -53,6 +53,37 @@ func (e *Engine) SetStorage(store *storage.Storage) {
 func (e *Engine) Run(ctx context.Context, providers []discovery.DiscoveryProvider) {
 	for _, p := range providers {
 		go e.consume(ctx, p.Events())
+	}
+	go e.runStalenessSweep(ctx)
+}
+
+func (e *Engine) runStalenessSweep(ctx context.Context) {
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			changedPDIDs := e.cache.DemoteStale()
+			for _, pdid := range changedPDIDs {
+				d := e.cache.Get(pdid)
+				if d == nil {
+					continue
+				}
+				if e.store != nil {
+					_ = e.store.SaveDevice(d)
+				}
+				e.broker.Broadcast(models.NewEvent(models.EventDeviceOffline, d.PDID, models.DeviceEventPayload{
+					PDID:      d.PDID,
+					MAC:       d.CurrentMAC,
+					IP:        d.CurrentIP,
+					Timestamp: time.Now(),
+				}))
+				slog.Info("Device transitioned offline via staleness sweep", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", d.CurrentIP)
+			}
+		}
 	}
 }
 
@@ -144,13 +175,10 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	}
 
 	// 2. PROVIDER CONFIDENCE & L2 REACHABILITY PRIMACY GUARD
-	// Low-confidence background polling providers (Pi-hole 0.3, DHCP 0.5) CANNOT resurrect
-	// an offline device to Online: true if high-confidence L2 Netlink (0.95) marked it offline!
 	if d != nil && !d.Online && obs.Confidence < 0.8 {
 		slog.Debug("Ignoring Online: true from low-confidence background provider for L2-offline device",
 			"pdid", d.PDID, "source", obs.Source, "confidence", obs.Confidence)
 
-		// Still update hostnames/services if provided, but DO NOT flip online status
 		if cleanHost != "" && d.Hostname != cleanHost {
 			d.Hostname = cleanHost
 			e.cache.Upsert(d)
@@ -339,7 +367,6 @@ func ApplySmartClassifications(d *models.Device) {
 		return
 	}
 
-	// 1. Gateway Router Detection (192.168.x.1 or .254)
 	if d.CurrentIP != "" {
 		ip := net.ParseIP(d.CurrentIP)
 		if ip != nil && ip.To4() != nil {
@@ -353,7 +380,6 @@ func ApplySmartClassifications(d *models.Device) {
 		}
 	}
 
-	// 2. Amazon Echo / Alexa Device Detection
 	if strings.HasPrefix(d.Hostname, "amzn.") || strings.Contains(d.Hostname, "amzn.dmgr") {
 		d.Vendor = "Amazon Technologies Inc."
 		d.DeviceType = "iot"
