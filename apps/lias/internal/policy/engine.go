@@ -1,7 +1,7 @@
 // Package policy implements the rule evaluation engine for LIAS.
 //
 // File:    apps/lias/internal/policy/engine.go
-// Version: 1.5
+// Version: 1.6
 package policy
 
 import (
@@ -117,7 +117,6 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 	}
 
 	if len(tagPolicies) > 0 {
-		// Return highest priority policy as representative
 		bestTagPol := tagPolicies[0]
 		for _, p := range tagPolicies {
 			if p.Priority > bestTagPol.Priority {
