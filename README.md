@@ -45,45 +45,44 @@ Binaries will be placed in the `bin/` directory.
 ```yaml
 # ==============================================================================
 # Discovery Intelligence Service (DIS) Configuration
-# Version: 1.4
-# File: /etc/dis/config.yaml
+# Version: 1.3
+# File Path: /etc/dis/config.yaml
 # ==============================================================================
 
-# HTTP Server Settings for the DIS REST API and SSE Event Stream
+# HTTP REST API and SSE Event Stream Server Settings
 http:
   listen: ":8080"            # Address and port to bind (default: ":8080")
   auth_token: ""             # Optional Bearer token for API authentication (empty = open LAN)
 
 # Network Discovery & Observation Providers
 discovery:
-  interface: "eth0"          # Primary network interface to monitor (default: "eth0")
+  interface: "eth0"          # Primary LAN network interface to monitor (default: "eth0")
 
   # Real-time Kernel Netlink Provider (ARP/NDP table subscription)
   netlink:
-    enabled: true            # Enable real-time kernel netlink neighbor monitoring
+    enabled: true            # Enable real-time netlink neighbor monitoring
 
   # Pi-hole v6 API Activity Intelligence Provider
   pihole:
     enabled: true            # Enable polling active DNS clients from Pi-hole
     url: "http://pi.hole"    # Pi-hole v6 base API URL (e.g., http://192.168.1.2 or http://pi.hole)
-    password: "your_pihole_password" # Pi-hole web password (used for /api/auth session tokens)
+    password: "your_pihole_password" # Pi-hole web/app password (used for /api/auth session token)
 
   # DHCP Lease File Provider
   dhcp:
-    enabled: true            # Enable reading DHCP leases to map hostnames and IPs
+    enabled: true            # Enable reading DHCP leases to map hostnames, IPs, and MACs
     type: "router"           # DHCP server type: "router", "pihole", "dnsmasq", or "kea"
     
-    # Select ONE of the 3 data source strategies below:
-    # --------------------------------------------------------------------------
-    # Option A: Remote SSH Execution (Recommended for OpenWrt/Routers)
-    ssh_host: "192.168.1.1"  # Router IP to fetch /tmp/dhcp.leases via SSH key
-    ssh_user: "root"         # SSH username (default: "root")
+    # Select ONE of the data source options below:
+    # Option A: Local File Path (if DIS runs on the router itself or uses NFS)
+    lease_file: "/tmp/dhcp.leases"
     
     # Option B: Remote HTTP URL Fetching
     lease_url: ""            # e.g., "http://192.168.1.1/dhcp.leases"
     
-    # Option C: Local File Path (If DIS runs on the router itself or uses NFS)
-    lease_file: "/tmp/dhcp.leases"
+    # Option C: Remote SSH Execution (Recommended for OpenWrt/Routers)
+    ssh_host: ""             # Router IP to fetch lease file via SSH (e.g., "192.168.1.1")
+    ssh_user: "root"         # SSH username (default: "root")
 
   # On-Demand Device Fingerprinting & Enrichment Pipeline
   enrichment:
@@ -92,9 +91,13 @@ discovery:
     netbios_enabled: true     # Enable UDP port 137 NetBIOS node status queries
     nmap_enabled: true        # Enable Nmap port and OS fingerprinting fallback
     unknown_device_scan: true # Automatically trigger enrichment for unclassified devices
-    validation_interval: "24h"# Periodic re-validation check interval for known devices (default: "24h")
+    validation_interval: "24h"# Periodic re-validation check interval for known devices
 
-# Logging Output Settings
+# CGO-Free Pure-Go SQLite Persistent Identity Engine
+storage:
+  path: "/var/lib/dis/state.db" # Database file path for persisting correlated device state
+
+# Structured Logging Output Settings
 logging:
   level: "info"              # Log verbosity: "debug", "info", "warn", or "error" (default: "info")
   format: "json"             # Log format: "json" or "text" (default: "json")
@@ -104,19 +107,19 @@ logging:
 ```yaml
 # ==============================================================================
 # LAN Internet Access Scheduler (LIAS) Configuration
-# Version: 1.5
-# File: /etc/lias/config.yaml
+# Version: 1.0
+# File Path: /etc/lias/config.yaml
 # ==============================================================================
 
-# HTTP Server Settings for the LIAS API and Embedded Apple HIG Web Dashboard
+# HTTP REST Server & Embedded Web UI Dashboard Settings
 http:
   listen: ":8081"            # Address and port to bind (default: ":8081")
 
-# Discovery Intelligence Service (DIS) Connection Settings
+# Connection Parameters to Discovery Intelligence Service (DIS)
 dis:
-  url: "http://192.168.1.10" # DIS server IP or hostname (DIS port :8080 is targeted automatically)
+  url: "http://127.0.0.1:8080" # DIS server IP or URL (port :8080 targeted automatically)
   auth_token: ""             # Bearer auth token if configured in DIS
-  sync_interval: "30s"       # Background REST poll interval fallback (default: "30s")
+  sync_interval: "30s"       # Background REST polling fallback interval (default: "30s")
 
 # Isolated Netfilter Architecture (netdev ingress table)
 nftables:
@@ -126,13 +129,13 @@ nftables:
 
 # Schedule Engine Evaluation Defaults
 schedules:
-  timezone: "UTC"            # Default IANA timezone (e.g. "America/Los_Angeles", "Europe/London", "UTC")
+  timezone: "UTC"            # Default IANA timezone (e.g., "America/Los_Angeles", "Europe/London", "UTC")
 
 # CGO-Free Pure-Go SQLite Persistent Storage Engine
 storage:
   path: "/var/lib/lias/state.db" # Database file path for persisting Tags, Policies, and Schedules
 
-# Logging Output Settings
+# Structured Logging Output Settings
 logging:
   level: "info"              # Log verbosity: "debug", "info", "warn", or "error" (default: "info")
   format: "json"             # Log format: "json" or "text" (default: "json")
