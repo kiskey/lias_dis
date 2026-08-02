@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/cache.go
-// Version: 1.7
+// Version: 1.8
 package sync
 
 import (
@@ -21,7 +21,7 @@ type LocalDevice struct {
 }
 
 type Cache struct {
-	mu         sync.Mutex // Exclusive Mutex protecting all read/write map operations
+	mu         sync.Mutex // Mutex protecting all read/write map operations
 	devices    map[string]*LocalDevice
 	stickyTags map[string]string // PDID -> TagID
 	stickyMACs map[string]string // MAC -> TagID
@@ -55,7 +55,7 @@ func (c *Cache) LoadStickyTags(pdidTags, macTags map[string]string) {
 	}
 }
 
-// applyStickyTagLocked MUST be called while holding c.mu.Lock() (Exclusive Write Lock).
+// applyStickyTagLocked MUST be called while holding c.mu.Lock().
 func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
 	assignedTag := "generic"
 
@@ -68,7 +68,7 @@ func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
 			cleanMAC := strings.ToLower(strings.TrimSpace(mac))
 			if macTag, found := c.stickyMACs[cleanMAC]; found && macTag != "" {
 				assignedTag = macTag
-				c.stickyTags[d.PDID] = assignedTag // Thread-safe write under c.mu.Lock()
+				c.stickyTags[d.PDID] = assignedTag // Auto-repair stickyTags map for current PDID
 				break
 			}
 		}
@@ -91,7 +91,7 @@ func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
 		for _, mac := range d.MACs {
 			cleanMAC := strings.ToLower(strings.TrimSpace(mac))
 			if cleanMAC != "" {
-				c.stickyMACs[cleanMAC] = assignedTag // Thread-safe write under c.mu.Lock()
+				c.stickyMACs[cleanMAC] = assignedTag
 			}
 		}
 	}
