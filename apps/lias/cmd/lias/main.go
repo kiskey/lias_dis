@@ -1,7 +1,7 @@
 // Binary lias implements the LAN Internet Access Scheduler.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 1.9
+// Version: 2.0
 package main
 
 import (
@@ -66,6 +66,10 @@ func main() {
 	cache := liasSync.NewCache()
 	trigger := make(chan struct{}, 1)
 
+	// Initialize LIAS Real-Time SSE Broker for Web Dashboard clients on :8081
+	broker := liasAPI.NewBroker()
+	defer broker.Stop()
+
 	tagMgr := tags.NewManager()
 	polEng := policy.NewEngine()
 	schedEng := schedule.NewEngine(cache)
@@ -81,7 +85,8 @@ func main() {
 		store = st
 	}
 
-	disClient := liasSync.NewDISClient(cfg.DIS, cache, trigger)
+	// Pass broker handle to disClient to proxy DIS events to connected browser dashboard clients
+	disClient := liasSync.NewDISClient(cfg.DIS, cache, trigger, broker)
 
 	nftCtrl := nftables.NewController(cfg.Nftables)
 	if err := nftCtrl.Init(); err != nil {
@@ -95,7 +100,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Initial DIS inventory sync & immediate atomic nftables sync on boot
 	go disClient.Run(ctx)
 	go schedEng.Run(ctx)
 	go nftSync.Run(ctx)
@@ -106,7 +110,8 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	handlers := liasAPI.NewHandlers(cache, tagMgr, polEng, schedEng, nftCtrl, store, trigger)
+	// Pass broker handle to API handlers to serve GET /api/v1/events on :8081
+	handlers := liasAPI.NewHandlers(cache, tagMgr, polEng, schedEng, nftCtrl, store, trigger, broker)
 	handlers.RegisterRoutes(mux)
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
