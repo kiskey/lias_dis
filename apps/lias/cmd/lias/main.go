@@ -1,7 +1,7 @@
 // Binary lias implements the LAN Internet Access Scheduler.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 2.0
+// Version: 2.1
 package main
 
 import (
@@ -85,7 +85,7 @@ func main() {
 		store = st
 	}
 
-	// Pass broker handle to disClient to proxy DIS events to connected browser dashboard clients
+	// Pass broker (satisfying sync.EventBroadcaster interface) to DISClient
 	disClient := liasSync.NewDISClient(cfg.DIS, cache, trigger, broker)
 
 	nftCtrl := nftables.NewController(cfg.Nftables)
