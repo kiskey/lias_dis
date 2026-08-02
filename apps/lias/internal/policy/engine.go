@@ -1,7 +1,7 @@
 // Package policy implements the rule evaluation engine for LIAS.
 //
 // File:    apps/lias/internal/policy/engine.go
-// Version: 1.3
+// Version: 1.4
 package policy
 
 import (
@@ -27,15 +27,15 @@ type Engine struct {
 	policies map[string]models.Policy
 }
 
-// NewEngine initializes the policy engine with the global default allow policy.
+// NewEngine initializes the policy engine with default global policy settings.
 func NewEngine() *Engine {
 	return &Engine{
 		policies: map[string]models.Policy{
 			"global_default": {
 				ID:       "global_default",
-				Name:     "Global Default Allow",
+				Name:     "Global Access Switch",
 				Type:     models.PolicyTypeGlobal,
-				Action:   models.ActionAllow,
+				Action:   models.ActionAllow, // Default: Always Allow
 				Priority: 0,
 			},
 		},
@@ -68,12 +68,13 @@ func (e *Engine) ListPolicies() []models.Policy {
 	return list
 }
 
-// GetEffectivePolicy determines the active policy for a device based on precedence:
-// 1. Infrastructure Override (Always Allow)
-// 2. Device-Specific Policy (TargetID == PDID)
-// 3. Tag-Based Policy (TargetID in device.Tags)
-// 4. Global Default Policy
-// 5. Hardcoded Fallback Allow
+// GetEffectivePolicy determines the active policy based on strict precedence rules:
+//
+// RULE 1: Infrastructure Immunity (Infrastructure tagged devices are ALWAYS allowed and immune to global switches)
+// RULE 2: Global Kill-Switch Override (If Global Default is set to 'block', non-infrastructure devices are blocked)
+// RULE 3: Device-Specific Policy (TargetID == PDID)
+// RULE 4: Tag-Group Policy (TargetID in device.Tags)
+// RULE 5: Global Default Policy
 func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 	if d == nil {
 		return models.Policy{ID: "fallback", Action: models.ActionAllow}
@@ -82,19 +83,32 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// 1. Infrastructure short-circuit override (Never block routers, switches, gateways)
+	// 1. INFRASTRUCTURE IMMUNITY CHECK
+	// Devices tagged as 'infrastructure' are completely immune to global blocks and device rules.
 	for _, t := range d.Tags {
 		if t == "infrastructure" {
 			return models.Policy{
 				ID:     "infrastructure_override",
-				Name:   "Infrastructure Override",
+				Name:   "Infrastructure Immunity",
 				Type:   models.PolicyTypeTag,
 				Action: models.ActionAllow,
 			}
 		}
 	}
 
-	// 2. Device-Specific Policy
+	// 2. GLOBAL KILL-SWITCH CHECK
+	// If Global Policy is explicitly set to 'block' (Global Downtime Switch), it overrides all regular devices.
+	globalPol, hasGlobal := e.policies["global_default"]
+	if hasGlobal && globalPol.Action == models.ActionBlock {
+		return models.Policy{
+			ID:     "global_killswitch",
+			Name:   "Global Access Switch (Block All)",
+			Type:   models.PolicyTypeGlobal,
+			Action: models.ActionBlock,
+		}
+	}
+
+	// 3. DEVICE-SPECIFIC POLICY
 	var bestDevPolicy *models.Policy
 	for _, p := range e.policies {
 		if p.Type == models.PolicyTypeDevice && p.TargetID == d.PDID {
@@ -108,7 +122,7 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 		return *bestDevPolicy
 	}
 
-	// 3. Tag-Based Policy
+	// 4. TAG-GROUP POLICY (Schedule or Block assigned to entire Tag Group e.g. 'kids')
 	var bestTagPolicy *models.Policy
 	for _, tagID := range d.Tags {
 		for _, p := range e.policies {
@@ -124,21 +138,11 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 		return *bestTagPolicy
 	}
 
-	// 4. Global Default Policy
-	var bestGlobalPolicy *models.Policy
-	for _, p := range e.policies {
-		if p.Type == models.PolicyTypeGlobal {
-			if bestGlobalPolicy == nil || p.Priority > bestGlobalPolicy.Priority {
-				pCopy := p
-				bestGlobalPolicy = &pCopy
-			}
-		}
-	}
-	if bestGlobalPolicy != nil {
-		return *bestGlobalPolicy
+	// 5. GLOBAL POLICY FALLBACK
+	if hasGlobal {
+		return globalPol
 	}
 
-	// 5. Fail-safe fallback
 	return models.Policy{
 		ID:     "fallback",
 		Name:   "Fallback Allow",
@@ -153,7 +157,7 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
 
 	if p.Action == models.ActionSchedule {
 		if p.ScheduleID == nil || *p.ScheduleID == "" || schedEval == nil {
-			return models.ActionBlock // Fail-closed per §6.4 if schedule ID is invalid
+			return models.ActionBlock // Fail-closed if schedule reference is broken
 		}
 		return schedEval.EvaluateNow(*p.ScheduleID)
 	}
