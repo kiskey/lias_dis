@@ -1,73 +1,109 @@
 // Package api implements the HTTP server, middleware, and SSE broker for DIS.
 //
 // File:    apps/discovery-service/internal/api/sse.go
-// Version: 1.0
+// Version: 1.1
 package api
 
 import (
-    "log/slog"
-    "sync"
+	"log/slog"
+	"sync"
 
-    "github.com/user/lias-dis/shared/models"
+	"github.com/user/lias-dis/shared/models"
 )
+
+const historyBufferCapacity = 100
 
 // Client represents a connected SSE consumer.
 type Client struct {
-    ID     string
-    Events chan models.Event
+	ID     string
+	Events chan models.Event
 }
 
-// Broker manages connected SSE clients and broadcasts events to them.
+// Broker manages connected SSE clients, broadcasts events, and maintains a ring buffer for event replay.
 type Broker struct {
-    mu      sync.RWMutex
-    clients map[string]*Client
+	mu       sync.RWMutex
+	clients  map[string]*Client
+	history  []models.Event
+	histHead int
 }
 
 // NewBroker initializes a new SSE broker.
 func NewBroker() *Broker {
-    return &Broker{
-        clients: make(map[string]*Client),
-    }
+	return &Broker{
+		clients: make(map[string]*Client),
+		history: make([]models.Event, 0, historyBufferCapacity),
+	}
 }
 
-// Subscribe registers a new SSE client and returns it.
-func (b *Broker) Subscribe(clientID string) *Client {
-    b.mu.Lock()
-    defer b.mu.Unlock()
+// Subscribe registers a new client and replays missed events if lastEventID > 0.
+func (b *Broker) Subscribe(clientID string, lastEventID int64) *Client {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-    client := &Client{
-        ID:     clientID,
-        Events: make(chan models.Event, 64), // Buffered to prevent slow consumers blocking the broker
-    }
-    b.clients[clientID] = client
-    slog.Info("SSE client subscribed", "client_id", clientID, "total_clients", len(b.clients))
-    return client
+	client := &Client{
+		ID:     clientID,
+		Events: make(chan models.Event, 128),
+	}
+	b.clients[clientID] = client
+	slog.Info("SSE client subscribed", "client_id", clientID, "total_clients", len(b.clients))
+
+	// Replay missed events from ring buffer if requested
+	if lastEventID > 0 {
+		b.replayEventsLocked(client, lastEventID)
+	}
+
+	return client
 }
 
-// Unsubscribe removes a client and closes its event channel.
+// Unsubscribe removes a client and closes its channel.
 func (b *Broker) Unsubscribe(clientID string) {
-    b.mu.Lock()
-    defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-    if client, ok := b.clients[clientID]; ok {
-        close(client.Events)
-        delete(b.clients, clientID)
-        slog.Info("SSE client unsubscribed", "client_id", clientID, "total_clients", len(b.clients))
-    }
+	if client, ok := b.clients[clientID]; ok {
+		close(client.Events)
+		delete(b.clients, clientID)
+		slog.Info("SSE client unsubscribed", "client_id", clientID, "total_clients", len(b.clients))
+	}
 }
 
-// Broadcast sends an event to all connected clients.
-// If a client's buffer is full, the event is dropped for that client to
-// prevent a slow consumer from blocking the entire discovery pipeline.
+// Broadcast sends an event to all clients and appends it to the history ring buffer.
 func (b *Broker) Broadcast(event models.Event) {
-    b.mu.RLock()
-    defer b.mu.RUnlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-    for _, client := range b.clients {
-        select {
-        case client.Events <- event:
-        default:
-            slog.Warn("SSE client buffer full, dropping event", "client_id", client.ID, "event_type", event.Type)
-        }
-    }
+	// Append to ring buffer
+	if len(b.history) < historyBufferCapacity {
+		b.history = append(b.history, event)
+	} else {
+		b.history[b.histHead] = event
+		b.histHead = (b.histHead + 1) % historyBufferCapacity
+	}
+
+	// Non-blocking broadcast
+	for _, client := range b.clients {
+		select {
+		case client.Events <- event:
+		default:
+			slog.Warn("SSE client buffer full, dropping real-time event", "client_id", client.ID, "event_type", event.Type)
+		}
+	}
+}
+
+func (b *Broker) replayEventsLocked(client *Client, lastEventID int64) {
+	count := 0
+	for _, evt := range b.history {
+		if evt.Timestamp.UnixNano() > lastEventID {
+			select {
+			case client.Events <- evt:
+				count++
+			default:
+				slog.Warn("SSE client replay buffer full", "client_id", client.ID)
+				return
+			}
+		}
+	}
+	if count > 0 {
+		slog.Info("Replayed missed SSE events for client", "client_id", client.ID, "count", count)
+	}
 }
