@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 1.5
+// Version: 1.6
 package storage
 
 import (
@@ -151,6 +151,7 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 			if err := dtRows.Scan(&pdid, &tagID, &mac); err == nil {
 				if pdid != "" {
 					deviceTags[pdid] = tagID
+					tagMgr.EnsureTagExists(tagID) // Ensure tag is in TagManager
 				}
 				if mac != "" {
 					macTags[mac] = tagID
