@@ -14,7 +14,6 @@
         <aside id="sidebar">
             <div class="sidebar-header">
                 <div class="logo-icon">
-                    <!-- Inline SVG Shield Icon -->
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
                 </div>
                 <h1 class="sidebar-title">LIAS</h1>
@@ -26,10 +25,10 @@
                 </button>
                 <button class="nav-item" data-view="devices">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
-                    <span>Devices</span>
+                    <span>Device Groups</span>
                 </button>
                 <button class="nav-item" data-view="schedules">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 16 14"></polyline></svg>
                     <span>Schedules</span>
                 </button>
                 <button class="nav-item" data-view="policies">
@@ -54,7 +53,6 @@
             </header>
 
             <div id="view-container" class="smooth-scroll">
-                <!-- Views are injected here by JS in the next batch -->
                 <div class="loader">
                     <div class="spinner"></div>
                 </div>
@@ -63,41 +61,41 @@
 
         <!-- Mobile Bottom Tab Bar -->
         <nav id="mobile-nav">
-            <button class="mob-nav-item active" data-view="dashboard">
+            <button class="mob-nav-item active" data-view="dashboard" aria-label="Dashboard">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+                <span>Home</span>
             </button>
-            <button class="mob-nav-item" data-view="devices">
+            <button class="mob-nav-item" data-view="devices" aria-label="Devices">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+                <span>Groups</span>
             </button>
-            <button class="mob-nav-item" data-view="schedules">
+            <button class="mob-nav-item" data-view="schedules" aria-label="Schedules">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                <span>Schedules</span>
             </button>
-            <button class="mob-nav-item" data-view="policies">
+            <button class="mob-nav-item" data-view="policies" aria-label="Policies">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
+                <span>Rules</span>
             </button>
-            <button class="mob-nav-item" data-view="settings">
+            <button class="mob-nav-item" data-view="settings" aria-label="Settings">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+                <span>Config</span>
             </button>
         </nav>
     </div>
 
-    <!-- Custom Modal Root (No primitive popups) -->
+    <!-- Modal Container -->
     <div id="modal-root" class="modal-backdrop hidden">
         <div class="modal-window" role="dialog" aria-modal="true">
             <div class="modal-header">
                 <h3 id="modal-title">Title</h3>
                 <button class="modal-close-btn" aria-label="Close">&times;</button>
             </div>
-            <div class="modal-body smooth-scroll" id="modal-body">
-                <!-- Content injected here -->
-            </div>
-            <div class="modal-footer" id="modal-footer">
-                <!-- Action buttons injected here -->
-            </div>
+            <div class="modal-body smooth-scroll" id="modal-body"></div>
+            <div class="modal-footer" id="modal-footer"></div>
         </div>
     </div>
 
-    <!-- Toast Notification Root -->
     <div id="toast-root" aria-live="polite"></div>
 
     <script type="module" src="src/main.js"></script>
