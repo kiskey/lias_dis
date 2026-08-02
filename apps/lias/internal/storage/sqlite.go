@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 1.2
+// Version: 1.3
 package storage
 
 import (
@@ -38,6 +38,11 @@ func NewStorage(dbPath string) (*Storage, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
+	}
+
+	// FIX: Enable WAL mode and busy timeout to prevent write lock contention
+	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
+		slog.Warn("Failed to set PRAGMAs on LIAS database", "error", err)
 	}
 
 	s := &Storage{
@@ -90,6 +95,8 @@ func (s *Storage) initSchema() error {
 		timezone TEXT NOT NULL,
 		rules TEXT NOT NULL
 	);
+
+	CREATE INDEX IF NOT EXISTS idx_device_tags_mac ON device_tags(mac);
 	`
 
 	_, err := s.db.Exec(query)
@@ -106,7 +113,7 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 	deviceTags := make(map[string]string)
 	macTags := make(map[string]string)
 
-	// 1. Hydrate Tags
+	// 1. Hydrate Tags - FIX: Preserve restored tag ID and Precedence
 	rows, err := s.db.Query("SELECT id, name, color, precedence, builtin FROM tags")
 	if err == nil {
 		defer rows.Close()
@@ -115,7 +122,7 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 			var builtin int
 			if err := rows.Scan(&t.ID, &t.Name, &t.Color, &t.Precedence, &builtin); err == nil {
 				t.Builtin = builtin == 1
-				_, _ = tagMgr.Create(t.Name, t.Color)
+				_ = tagMgr.RestoreTag(t)
 			}
 		}
 	}
@@ -178,8 +185,26 @@ func (s *Storage) SaveDeviceTag(pdid, tagID, mac string) error {
 	_, err := s.db.Exec(`
 		INSERT INTO device_tags (pdid, tag_id, mac)
 		VALUES (?, ?, ?)
-		ON CONFLICT(pdid) DO UPDATE SET tag_id=excluded.tag_id, mac=excluded.mac
+		ON CONFLICT(pdid) DO UPDATE SET tag_id=excluded.tag_id, mac=CASE WHEN excluded.mac != '' THEN excluded.mac ELSE device_tags.mac END
 	`, pdid, tagID, mac)
+
+	return err
+}
+
+// UpdateDeviceTagMAC backfills a newly learned MAC address into existing device tag records.
+func (s *Storage) UpdateDeviceTagMAC(pdid, mac string) error {
+	if pdid == "" || mac == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		UPDATE device_tags
+		SET mac = ?
+		WHERE pdid = ? AND (mac = '' OR mac IS NULL)
+	`, mac, pdid)
 
 	return err
 }
