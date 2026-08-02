@@ -1,7 +1,7 @@
 /*
  * LIAS Control Center - Main Dashboard Application
  * File:    apps/lias/web/src/main.js
- * Version: 1.7 (Complete Device Math Resolution, Service Pills, Relative Timestamps & Real-time SSE)
+ * Version: 1.8 (Complete Tag-Policy Binding, Dynamic Select Menu Refinement, Real-time SSE)
  */
 
 import { API } from './api.js';
@@ -218,7 +218,7 @@ class LiasDashboard {
   }
 
   getEffectiveTags() {
-    // FIX: Guarantees 100% of devices render by dynamically building active tag groups
+    // Guarantees 100% of devices render by dynamically building active tag groups
     const tagMap = new Map();
     this.tags.forEach((t) => tagMap.set(t.id, t));
 
@@ -331,7 +331,7 @@ class LiasDashboard {
               </div>
               <div>
                 <select data-move-pdid="${d.pdid}" style="padding: 6px 10px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-secondary); color: var(--text-primary); font-size: 12px; font-weight: 600;">
-                  ${this.tags.map((t) => `<option value="${t.id}" ${t.id === tag.id ? 'selected' : ''}>Move to ${t.name}</option>`).join('')}
+                  ${effectiveTags.map((t) => `<option value="${t.id}" ${t.id === tag.id ? 'selected' : ''}>Move to ${t.name}</option>`).join('')}
                 </select>
               </div>
             </div>
