@@ -1,7 +1,7 @@
 // Package tags manages the built-in and custom device tags for LIAS.
 //
 // File:    apps/lias/internal/tags/manager.go
-// Version: 1.3
+// Version: 1.4
 package tags
 
 import (
@@ -30,9 +30,17 @@ func NewManager() *Manager {
 	return &Manager{
 		tags: []Tag{
 			{ID: "infrastructure", Name: "Infrastructure", Color: "#8e8e93", Precedence: 100, Builtin: true},
+			{ID: "work", Name: "Work Devices", Color: "#5856d6", Precedence: 90, Builtin: true},
 			{ID: "kids", Name: "Kids Devices", Color: "#ff9500", Precedence: 80, Builtin: true},
+			{ID: "gaming", Name: "Gaming Consoles", Color: "#ff2d55", Precedence: 70, Builtin: true},
+			{ID: "streaming", Name: "Streaming Devices", Color: "#af52de", Precedence: 65, Builtin: true},
 			{ID: "mobile", Name: "Mobile Devices", Color: "#0a84ff", Precedence: 60, Builtin: true},
-			{ID: "iot", Name: "IoT Devices", Color: "#30d158", Precedence: 40, Builtin: true},
+			{ID: "audio", Name: "Audio Devices", Color: "#00c7be", Precedence: 55, Builtin: true},
+			{ID: "computers", Name: "Desktops & Laptops", Color: "#32ade6", Precedence: 50, Builtin: true},
+			{ID: "smart_home", Name: "Smart Home & Appliances", Color: "#30d158", Precedence: 40, Builtin: true},
+			{ID: "printers", Name: "Printers & Scanners", Color: "#a28b55", Precedence: 35, Builtin: true},
+			{ID: "servers", Name: "Servers & NAS", Color: "#ffcc00", Precedence: 30, Builtin: true},
+			{ID: "guests", Name: "Guest Devices", Color: "#ff3b30", Precedence: 20, Builtin: true},
 			{ID: "generic", Name: "Generic Devices", Color: "#636366", Precedence: 0, Builtin: true},
 		},
 	}
