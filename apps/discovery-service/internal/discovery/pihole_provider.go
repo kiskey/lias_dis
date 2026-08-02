@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/pihole_provider.go
-// Version: 1.8
+// Version: 1.9 (Automatic URL scheme normalization)
 package discovery
 
 import (
@@ -29,7 +29,7 @@ type PiholeProvider struct {
 	client   *http.Client
 	sid      string
 	sidValid bool
-	noAuth   bool // Set to true when Pi-hole v6 has no password set (unauthenticated mode)
+	noAuth   bool
 }
 
 func NewPiholeProvider(cfg config.PiholeConfig) *PiholeProvider {
@@ -93,15 +93,25 @@ func (p *PiholeProvider) run() {
 					}
 					continue
 				}
-				backoff = 10 * time.Second // Reset backoff on success
+				backoff = 10 * time.Second
 			}
 			p.poll()
 		}
 	}
 }
 
+func normalizePiholeURL(raw string) string {
+	u := strings.TrimSpace(raw)
+	if u == "" {
+		return ""
+	}
+	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		u = "http://" + u
+	}
+	return strings.TrimRight(u, "/")
+}
+
 func (p *PiholeProvider) isSessionValid() bool {
-	// If Pi-hole has no password configured, unauthenticated requests are always valid
 	if p.noAuth {
 		return true
 	}
@@ -110,7 +120,11 @@ func (p *PiholeProvider) isSessionValid() bool {
 		return false
 	}
 
-	baseURL := strings.TrimRight(p.cfg.URL, "/")
+	baseURL := normalizePiholeURL(p.cfg.URL)
+	if baseURL == "" {
+		return false
+	}
+
 	req, err := http.NewRequestWithContext(p.ctx, "GET", baseURL+"/api/auth?sid="+p.sid, nil)
 	if err != nil {
 		return false
@@ -147,13 +161,15 @@ func (p *PiholeProvider) poll() {
 		}
 	}
 
-	baseURL := strings.TrimRight(p.cfg.URL, "/")
+	baseURL := normalizePiholeURL(p.cfg.URL)
+	if baseURL == "" {
+		return
+	}
 
-	// Primary Pi-hole v6 Endpoint: GET /api/stats/top_clients
 	targetEndpoints := []string{
 		"/api/stats/top_clients?count=100",
 		"/api/network/devices",
-		"/api/stats/clients", // Legacy fallback
+		"/api/stats/clients",
 	}
 
 	var resp *http.Response
@@ -202,7 +218,6 @@ func (p *PiholeProvider) poll() {
 
 	var clientList []clientItem
 
-	// 1. Decode Pi-hole v6 /api/stats/top_clients format: {"top_clients": [{"ip": "...", "name": "..."}]}
 	var topClientsWrapper struct {
 		TopClients []struct {
 			IP   string `json:"ip"`
@@ -220,14 +235,12 @@ func (p *PiholeProvider) poll() {
 			})
 		}
 	} else {
-		// 2. Decode Pi-hole v6 /api/network/devices format: {"devices": [...]}
 		var devWrapper struct {
 			Devices []clientItem `json:"devices"`
 		}
 		if err := json.Unmarshal(bodyBytes, &devWrapper); err == nil && len(devWrapper.Devices) > 0 {
 			clientList = devWrapper.Devices
 		} else {
-			// 3. Fallback map or array format
 			var rawWrapper struct {
 				Clients json.RawMessage `json:"clients"`
 			}
@@ -271,7 +284,11 @@ func (p *PiholeProvider) poll() {
 }
 
 func (p *PiholeProvider) authenticate() error {
-	baseURL := strings.TrimRight(p.cfg.URL, "/")
+	baseURL := normalizePiholeURL(p.cfg.URL)
+	if baseURL == "" {
+		return fmt.Errorf("pihole URL not configured")
+	}
+
 	payload, _ := json.Marshal(map[string]string{"password": p.cfg.Password})
 
 	req, err := http.NewRequestWithContext(p.ctx, "POST", baseURL+"/api/auth", bytes.NewBuffer(payload))
@@ -292,7 +309,7 @@ func (p *PiholeProvider) authenticate() error {
 		Session struct {
 			SID      string `json:"sid"`
 			Valid    bool   `json:"valid"`
-			Message  string `json:"message"` // "no password set", "password incorrect", "app-password correct"
+			Message  string `json:"message"`
 			Validity int    `json:"validity"`
 		} `json:"session"`
 		Error struct {
@@ -303,7 +320,6 @@ func (p *PiholeProvider) authenticate() error {
 
 	_ = json.Unmarshal(bodyBytes, &authResp)
 
-	// Handle HTTP 4xx/5xx transport status codes
 	if resp.StatusCode != http.StatusOK {
 		reason := authResp.Error.Message
 		if reason == "" {
@@ -315,7 +331,6 @@ func (p *PiholeProvider) authenticate() error {
 		return fmt.Errorf("pihole auth endpoint returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(reason))
 	}
 
-	// 1. DETECT UNAUTHENTICATED OPEN LAN MODE ("no password set")
 	if authResp.Session.Message == "no password set" || (authResp.Session.Valid && authResp.Session.SID == "" && authResp.Session.Validity == -1) {
 		p.noAuth = true
 		p.sidValid = true
@@ -324,7 +339,6 @@ func (p *PiholeProvider) authenticate() error {
 		return nil
 	}
 
-	// 2. VALIDATE AUTHENTICATED SESSION
 	if !authResp.Session.Valid || authResp.Session.SID == "" || authResp.Session.SID == "null" {
 		p.noAuth = false
 		p.sidValid = false
@@ -342,7 +356,6 @@ func (p *PiholeProvider) authenticate() error {
 		return fmt.Errorf("pihole auth returned invalid session state: %s", reason)
 	}
 
-	// 3. SUCCESSFUL AUTHENTICATION WITH SID
 	p.noAuth = false
 	p.sid = authResp.Session.SID
 	p.sidValid = true
