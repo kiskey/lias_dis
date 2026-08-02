@@ -1,7 +1,7 @@
 // Package nftables implements the isolated firewall controller for LIAS.
 //
 // File:    apps/lias/internal/nftables/builder.go
-// Version: 1.4
+// Version: 1.5 (Multi-MAC & Multi-IP set elements synchronization)
 package nftables
 
 import (
@@ -35,8 +35,10 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
 
 	devs := b.cache.List()
 
-	var allowedIPs, blockedIPs []net.IP
-	var allowedMACs, blockedMACs []net.HardwareAddr
+	allowedIPsMap := make(map[string]net.IP)
+	blockedIPsMap := make(map[string]net.IP)
+	allowedMACsMap := make(map[string]net.HardwareAddr)
+	blockedMACsMap := make(map[string]net.HardwareAddr)
 
 	for i := range devs {
 		d := &devs[i]
@@ -50,29 +52,49 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
 
 		switch action {
 		case models.ActionAllow:
-			if d.CurrentIP != "" {
-				if ip := net.ParseIP(d.CurrentIP); ip != nil {
-					allowedIPs = append(allowedIPs, ip.To4())
+			for _, ipStr := range d.IPs {
+				if ip := net.ParseIP(ipStr); ip != nil {
+					if ip4 := ip.To4(); ip4 != nil {
+						allowedIPsMap[ip4.String()] = ip4
+					}
 				}
 			}
-			if d.CurrentMAC != "" {
-				if mac, err := net.ParseMAC(d.CurrentMAC); err == nil {
-					allowedMACs = append(allowedMACs, mac)
+			for _, macStr := range d.MACs {
+				if mac, err := net.ParseMAC(macStr); err == nil && len(mac) == 6 {
+					allowedMACsMap[mac.String()] = mac
 				}
 			}
 
 		case models.ActionBlock:
-			if d.CurrentIP != "" {
-				if ip := net.ParseIP(d.CurrentIP); ip != nil {
-					blockedIPs = append(blockedIPs, ip.To4())
+			for _, ipStr := range d.IPs {
+				if ip := net.ParseIP(ipStr); ip != nil {
+					if ip4 := ip.To4(); ip4 != nil {
+						blockedIPsMap[ip4.String()] = ip4
+					}
 				}
 			}
-			if d.CurrentMAC != "" {
-				if mac, err := net.ParseMAC(d.CurrentMAC); err == nil {
-					blockedMACs = append(blockedMACs, mac)
+			for _, macStr := range d.MACs {
+				if mac, err := net.ParseMAC(macStr); err == nil && len(mac) == 6 {
+					blockedMACsMap[mac.String()] = mac
 				}
 			}
 		}
+	}
+
+	var allowedIPs, blockedIPs []net.IP
+	for _, ip := range allowedIPsMap {
+		allowedIPs = append(allowedIPs, ip)
+	}
+	for _, ip := range blockedIPsMap {
+		blockedIPs = append(blockedIPs, ip)
+	}
+
+	var allowedMACs, blockedMACs []net.HardwareAddr
+	for _, mac := range allowedMACsMap {
+		allowedMACs = append(allowedMACs, mac)
+	}
+	for _, mac := range blockedMACsMap {
+		blockedMACs = append(blockedMACs, mac)
 	}
 
 	return b.controller.Apply(
