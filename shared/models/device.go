@@ -2,7 +2,7 @@
 // Discovery Intelligence Service (DIS) and the LAN Internet Access Scheduler (LIAS).
 //
 // File:    shared/models/device.go
-// Version: 1.1
+// Version: 1.2
 package models
 
 import (
@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 )
+
+const maxHistoricalMACs = 32
 
 // Device is the canonical network device record exchanged between DIS and LIAS.
 type Device struct {
@@ -26,6 +28,7 @@ type Device struct {
 	DeviceType   string                `json:"device_type"`
 	Services     []string              `json:"services"`
 	Online       bool                  `json:"online"`
+	IsTentative  bool                  `json:"is_tentative,omitempty"` // Explicitly tracks if PDID was generated without a MAC
 	FirstSeen    time.Time             `json:"first_seen"`
 	LastSeen     time.Time             `json:"last_seen"`
 	Confidence   float64               `json:"confidence"`
@@ -41,40 +44,6 @@ type SourceMeta struct {
 	Raw        map[string]interface{} `json:"raw,omitempty"`
 }
 
-// PDIDRecord aggregates all known identity observations for a Persistent Device Identity.
-type PDIDRecord struct {
-	ID         string       `json:"id"`
-	PrimaryMAC string       `json:"primary_mac"`
-	KnownMACs  []string     `json:"known_macs"`
-	KnownIPs   []string     `json:"known_ips"`
-	Hostnames  []string     `json:"hostnames"`
-	MergeLog   []MergeEvent `json:"merge_log,omitempty"`
-	Confidence float64      `json:"confidence"`
-}
-
-// MergeEvent records a single correlation merge decision in the PDID history.
-type MergeEvent struct {
-	Timestamp  time.Time `json:"timestamp"`
-	Reason     string    `json:"reason"`
-	FromMAC    string    `json:"from_mac"`
-	ToPDID     string    `json:"to_pdid"`
-	Confidence float64   `json:"confidence"`
-}
-
-// Enrichment represents the structured output of an Enricher invocation.
-type Enrichment struct {
-	Hostname     string                 `json:"hostname,omitempty"`
-	FriendlyName string                 `json:"friendly_name,omitempty"`
-	Manufacturer string                 `json:"manufacturer,omitempty"`
-	Vendor       string                 `json:"vendor,omitempty"`
-	Model        string                 `json:"model,omitempty"`
-	DeviceType   string                 `json:"device_type,omitempty"`
-	Services     []string               `json:"services,omitempty"`
-	Confidence   float64                `json:"confidence"`
-	Source       string                 `json:"source"`
-	Raw          map[string]interface{} `json:"raw,omitempty"`
-}
-
 // FormatMAC normalizes a HardwareAddr to colon-separated lowercase form.
 func FormatMAC(mac net.HardwareAddr) string {
 	if mac == nil {
@@ -84,7 +53,7 @@ func FormatMAC(mac net.HardwareAddr) string {
 }
 
 // AddMAC appends a MAC address to the device's known list if not present, keeping CurrentMAC updated.
-// Automatically converts inputs to lowercase colon-separated format.
+// Bounded to retain at most maxHistoricalMACs (32) to prevent unbounded memory growth on rotating MAC devices.
 func (d *Device) AddMAC(mac string) {
 	if d == nil || mac == "" {
 		return
@@ -101,8 +70,14 @@ func (d *Device) AddMAC(mac string) {
 			return
 		}
 	}
+
 	d.MACs = append(d.MACs, cleanMAC)
 	d.CurrentMAC = cleanMAC
+
+	// Bound history to prevent unbounded growth
+	if len(d.MACs) > maxHistoricalMACs {
+		d.MACs = d.MACs[len(d.MACs)-maxHistoricalMACs:]
+	}
 }
 
 // AddIP appends an IP address to the device's known list if not present, keeping CurrentIP updated.
@@ -124,6 +99,20 @@ func (d *Device) AddIP(ip string) {
 	}
 	d.IPs = append(d.IPs, cleanIP)
 	d.CurrentIP = cleanIP
+}
+
+// HasMAC checks whether a given MAC address exists in the device's MAC history.
+func (d *Device) HasMAC(macStr string) bool {
+	if d == nil || macStr == "" {
+		return false
+	}
+	clean := strings.ToLower(strings.TrimSpace(macStr))
+	for _, m := range d.MACs {
+		if strings.ToLower(strings.TrimSpace(m)) == clean {
+			return true
+		}
+	}
+	return false
 }
 
 // AddService appends a service identifier, deduplicating against existing entries.
