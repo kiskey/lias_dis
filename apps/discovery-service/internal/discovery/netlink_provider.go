@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 1.6
+// Version: 1.7
 package discovery
 
 import (
@@ -94,14 +94,15 @@ func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
 		return
 	}
 
-	// Filter out Broadcast and Multicast MAC/IP addresses
 	if IsMulticastOrBroadcast(n.HardwareAddr, n.IP) {
 		return
 	}
 
+	// Devices remain ONLINE during NUD_STALE, NUD_DELAY, NUD_PROBE (normal ARP re-probe cycles)
 	isFailed := (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0
-	isOnline := !isFailed && (n.State&(unix.NUD_REACHABLE|unix.NUD_PERMANENT|unix.NUD_STALE|unix.NUD_DELAY|unix.NUD_NOARP)) != 0
+	isOnline := !isFailed && (n.State&(unix.NUD_REACHABLE|unix.NUD_PERMANENT|unix.NUD_STALE|unix.NUD_DELAY|unix.NUD_PROBE|unix.NUD_NOARP)) != 0
 
+	// Mark offline ONLY on explicit deletion events
 	if update.Type == unix.RTM_DELNEIGH {
 		isOnline = false
 	}
@@ -125,25 +126,20 @@ func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
 	}
 }
 
-// IsMulticastOrBroadcast returns true if a MAC or IP address belongs to multicast/broadcast groups.
 func IsMulticastOrBroadcast(mac net.HardwareAddr, ip net.IP) bool {
 	if mac != nil && len(mac) == 6 {
-		// IPv4 Multicast MAC prefix (01:00:5e)
 		if mac[0] == 0x01 && mac[1] == 0x00 && mac[2] == 0x5e {
 			return true
 		}
-		// IPv6 Multicast MAC prefix (33:33)
 		if mac[0] == 0x33 && mac[1] == 0x33 {
 			return true
 		}
-		// Ethernet Broadcast MAC (ff:ff:ff:ff:ff:ff)
 		if mac[0] == 0xff && mac[1] == 0xff && mac[2] == 0xff && mac[3] == 0xff && mac[4] == 0xff && mac[5] == 0xff {
 			return true
 		}
 	}
 
 	if ip != nil {
-		// IPv4 Multicast (224.0.0.0/4) or Broadcast (255.255.255.255)
 		if ip.IsMulticast() || ip.IsLoopback() || ip.IsUnspecified() || ip.Equal(net.IPv4bcast) {
 			return true
 		}
