@@ -1,7 +1,7 @@
 // Package policy implements the rule evaluation engine for LIAS.
 //
 // File:    apps/lias/internal/policy/engine.go
-// Version: 1.7
+// Version: 2.0 (Resolved global_default precedence bug)
 package policy
 
 import (
@@ -82,7 +82,7 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 		}
 	}
 
-	// 2. GLOBAL KILL-SWITCH CHECK
+	// 2. GLOBAL KILL-SWITCH CHECK (ONLY ActionBlock acts as override)
 	globalPol, hasGlobal := e.policies["global_default"]
 	if hasGlobal && globalPol.Action == models.ActionBlock {
 		return models.Policy{
@@ -140,13 +140,14 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 	}
 }
 
-// EvaluateAction resolves final action for a device record.
+// EvaluateAction resolves final action for a device record using strict precedence hierarchy:
+// Infrastructure Immunity > Global Kill-Switch (Block) > Device Policies > Tag Policies > Global Default Fallback
 func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvaluator) models.Action {
 	if d == nil {
 		return models.ActionAllow
 	}
 
-	// Infrastructure immunity
+	// 1. Infrastructure immunity check
 	if d.HasTag("infrastructure") {
 		return models.ActionAllow
 	}
@@ -154,27 +155,31 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// Global switch check
+	// 2. Global Kill-Switch Check: ONLY ActionBlock acts as global override
 	if globalPol, ok := e.policies["global_default"]; ok {
 		if globalPol.Action == models.ActionBlock {
 			return models.ActionBlock
 		}
-		if globalPol.Action == models.ActionAllow {
-			return models.ActionAllow
-		}
 	}
 
-	// Evaluate device policies
+	// 3. Evaluate Device-Specific Policies
+	var bestDevPolicy *models.Policy
 	for _, p := range e.policies {
 		if p.Type == models.PolicyTypeDevice && p.TargetID == d.PDID {
-			if p.Action == models.ActionSchedule && p.ScheduleID != nil && schedEval != nil {
-				return schedEval.EvaluateNow(*p.ScheduleID)
+			if bestDevPolicy == nil || p.Priority > bestDevPolicy.Priority {
+				pCopy := p
+				bestDevPolicy = &pCopy
 			}
-			return p.Action
 		}
 	}
+	if bestDevPolicy != nil {
+		if bestDevPolicy.Action == models.ActionSchedule && bestDevPolicy.ScheduleID != nil && schedEval != nil {
+			return schedEval.EvaluateNow(*bestDevPolicy.ScheduleID)
+		}
+		return bestDevPolicy.Action
+	}
 
-	// Evaluate ALL policies attached to device's Tag Groups
+	// 4. Evaluate Tag-Group Policies
 	var tagActions []models.Action
 	for _, tagID := range d.Tags {
 		for _, p := range e.policies {
@@ -198,7 +203,7 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
 		return models.ActionAllow
 	}
 
-	// Fallback to global policy action
+	// 5. Fallback to Global Default Policy
 	if globalPol, ok := e.policies["global_default"]; ok {
 		if globalPol.Action == models.ActionSchedule && globalPol.ScheduleID != nil && schedEval != nil {
 			return schedEval.EvaluateNow(*globalPol.ScheduleID)
