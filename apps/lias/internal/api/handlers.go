@@ -1,13 +1,14 @@
 // Package api implements the HTTP server and REST handlers for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 1.5
+// Version: 1.6
 package api
 
 import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	liasNftables "github.com/user/lias-dis/apps/lias/internal/nftables"
@@ -85,7 +86,7 @@ func (h *Handlers) ListDevices(w http.ResponseWriter, r *http.Request) {
 	devs := make([]models.Device, 0, len(localDevs))
 	for _, ld := range localDevs {
 		dev := ld.Device
-		dev.Tags = ld.Tags // Copy local LIAS assigned tags onto outer device representation!
+		dev.Tags = ld.Tags // Copy local LIAS assigned tags onto outer device representation
 		devs = append(devs, dev)
 	}
 
@@ -128,8 +129,13 @@ func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
 		mac = d.CurrentMAC
 	}
 
+	// FIX: Surface persistence errors to client instead of discarding with `_ =`
 	if h.store != nil {
-		_ = h.store.SaveDeviceTag(pdid, req.TagID, mac)
+		if err := h.store.SaveDeviceTag(pdid, req.TagID, mac); err != nil {
+			slog.Error("Failed to persist device tag assignment to storage", "pdid", pdid, "tag_id", req.TagID, "error", err)
+			http.Error(w, `{"error":"failed to persist device tag assignment"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	h.tryTrigger()
@@ -154,7 +160,11 @@ func (h *Handlers) CreateTag(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.store != nil {
-		_ = h.store.SaveTag(created)
+		if err := h.store.SaveTag(created); err != nil {
+			slog.Error("Failed to persist new tag to storage", "tag_id", created.ID, "error", err)
+			http.Error(w, `{"error":"failed to persist tag to storage"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -177,7 +187,11 @@ func (h *Handlers) UpdateTag(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.store != nil {
-		_ = h.store.SaveTag(updated)
+		if err := h.store.SaveTag(updated); err != nil {
+			slog.Error("Failed to persist updated tag to storage", "tag_id", updated.ID, "error", err)
+			http.Error(w, `{"error":"failed to update tag in storage"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	h.tryTrigger()
@@ -193,7 +207,11 @@ func (h *Handlers) DeleteTag(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.store != nil {
-		_ = h.store.DeleteTag(id)
+		if err := h.store.DeleteTag(id); err != nil {
+			slog.Error("Failed to delete tag from storage", "tag_id", id, "error", err)
+			http.Error(w, `{"error":"failed to delete tag from storage"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	h.tryTrigger()
@@ -217,7 +235,11 @@ func (h *Handlers) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	h.polEng.UpsertPolicy(p)
 
 	if h.store != nil {
-		_ = h.store.SavePolicy(p)
+		if err := h.store.SavePolicy(p); err != nil {
+			slog.Error("Failed to persist policy to storage", "policy_id", p.ID, "error", err)
+			http.Error(w, `{"error":"failed to persist policy to storage"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	h.tryTrigger()
@@ -237,7 +259,11 @@ func (h *Handlers) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 	h.polEng.UpsertPolicy(p)
 
 	if h.store != nil {
-		_ = h.store.SavePolicy(p)
+		if err := h.store.SavePolicy(p); err != nil {
+			slog.Error("Failed to update policy in storage", "policy_id", p.ID, "error", err)
+			http.Error(w, `{"error":"failed to update policy in storage"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	h.tryTrigger()
@@ -250,7 +276,11 @@ func (h *Handlers) DeletePolicy(w http.ResponseWriter, r *http.Request) {
 	h.polEng.DeletePolicy(id)
 
 	if h.store != nil {
-		_ = h.store.DeletePolicy(id)
+		if err := h.store.DeletePolicy(id); err != nil {
+			slog.Error("Failed to delete policy from storage", "policy_id", id, "error", err)
+			http.Error(w, `{"error":"failed to delete policy from storage"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	h.tryTrigger()
@@ -274,7 +304,11 @@ func (h *Handlers) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 	h.schedEng.UpsertSchedule(s)
 
 	if h.store != nil {
-		_ = h.store.SaveSchedule(s)
+		if err := h.store.SaveSchedule(s); err != nil {
+			slog.Error("Failed to persist schedule to storage", "schedule_id", s.ID, "error", err)
+			http.Error(w, `{"error":"failed to persist schedule to storage"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	h.tryTrigger()
@@ -294,7 +328,11 @@ func (h *Handlers) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 	h.schedEng.UpsertSchedule(s)
 
 	if h.store != nil {
-		_ = h.store.SaveSchedule(s)
+		if err := h.store.SaveSchedule(s); err != nil {
+			slog.Error("Failed to update schedule in storage", "schedule_id", s.ID, "error", err)
+			http.Error(w, `{"error":"failed to update schedule in storage"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	h.tryTrigger()
@@ -307,7 +345,11 @@ func (h *Handlers) DeleteSchedule(w http.ResponseWriter, r *http.Request) {
 	h.schedEng.DeleteSchedule(id)
 
 	if h.store != nil {
-		_ = h.store.DeleteSchedule(id)
+		if err := h.store.DeleteSchedule(id); err != nil {
+			slog.Error("Failed to delete schedule from storage", "schedule_id", id, "error", err)
+			http.Error(w, `{"error":"failed to delete schedule from storage"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	h.tryTrigger()
