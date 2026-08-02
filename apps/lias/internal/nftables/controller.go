@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 1.3
+// Version: 1.4
 package nftables
 
 import (
@@ -52,14 +52,13 @@ func (c *Controller) Init() error {
 		Name:   c.cfg.TableName,
 	})
 
-	// 2. Create the ingress chain with MANDATORY interface binding (Device: eth0)
+	// 2. Create the ingress chain on netdev table
 	c.chain = c.conn.AddChain(&nftables.Chain{
 		Name:     "ingress",
 		Table:    c.table,
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookIngress,
 		Priority: nftables.ChainPriorityRef(0),
-		Device:   c.cfg.Interface, // Restored: Netdev ingress hook REQUIRES interface binding
 	})
 
 	// Flush existing chain rules to prevent duplicate rule accumulation on re-initialization
@@ -112,18 +111,22 @@ func (c *Controller) Init() error {
 	}
 	c.sets["blocked_macs"] = blockedMACsSet
 
-	// 4. Create filtering rules using CORRECT header payload offsets
-	// Rule 1: Allow MACs
-	// Ethernet Header: Dest MAC (0..5), Source MAC (6..11) -> Offset: 6, Len: 6
+	// Interface match bytes (null-terminated interface string)
+	ifaceBytes := []byte(c.cfg.Interface + "\x00")
+
+	// 4. Create filtering rules using iifname interface matching and correct payload offsets
+	// Rule 1: Allow MACs on c.cfg.Interface
 	c.conn.AddRule(&nftables.Rule{
 		Table: c.table,
 		Chain: c.chain,
 		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
 			&expr.Payload{
 				OperationType: expr.PayloadLoad,
 				DestRegister:  1,
 				Base:          expr.PayloadBaseLLHeader,
-				Offset:        6, // Corrected: Source MAC starts at byte 6 in Ethernet header
+				Offset:        6, // Source MAC starts at byte 6 in Ethernet header
 				Len:           6,
 			},
 			&expr.Lookup{
@@ -135,17 +138,18 @@ func (c *Controller) Init() error {
 		},
 	})
 
-	// Rule 2: Allow IPs
-	// IPv4 Header: Source IP starts at byte 12 -> Offset: 12, Len: 4
+	// Rule 2: Allow IPs on c.cfg.Interface
 	c.conn.AddRule(&nftables.Rule{
 		Table: c.table,
 		Chain: c.chain,
 		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
 			&expr.Payload{
 				OperationType: expr.PayloadLoad,
 				DestRegister:  1,
 				Base:          expr.PayloadBaseNetworkHeader,
-				Offset:        12,
+				Offset:        12, // Source IPv4 starts at byte 12
 				Len:           4,
 			},
 			&expr.Lookup{
@@ -157,16 +161,18 @@ func (c *Controller) Init() error {
 		},
 	})
 
-	// Rule 3: Block MACs
+	// Rule 3: Block MACs on c.cfg.Interface
 	c.conn.AddRule(&nftables.Rule{
 		Table: c.table,
 		Chain: c.chain,
 		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
 			&expr.Payload{
 				OperationType: expr.PayloadLoad,
 				DestRegister:  1,
 				Base:          expr.PayloadBaseLLHeader,
-				Offset:        6, // Corrected: Source MAC starts at byte 6
+				Offset:        6, // Source MAC starts at byte 6
 				Len:           6,
 			},
 			&expr.Lookup{
@@ -178,16 +184,18 @@ func (c *Controller) Init() error {
 		},
 	})
 
-	// Rule 4: Block IPs
+	// Rule 4: Block IPs on c.cfg.Interface
 	c.conn.AddRule(&nftables.Rule{
 		Table: c.table,
 		Chain: c.chain,
 		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
 			&expr.Payload{
 				OperationType: expr.PayloadLoad,
 				DestRegister:  1,
 				Base:          expr.PayloadBaseNetworkHeader,
-				Offset:        12,
+				Offset:        12, // Source IPv4 starts at byte 12
 				Len:           4,
 			},
 			&expr.Lookup{
