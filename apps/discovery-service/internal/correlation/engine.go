@@ -2,12 +2,15 @@
 // from multiple providers into canonical device records.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 1.5
+// Version: 1.6
 package correlation
 
 import (
 	"context"
 	"log/slog"
+	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,16 +24,14 @@ type EnrichmentOrchestrator interface {
 	TriggerEnrichment(pdid string, force bool)
 }
 
-// Engine consumes observations and merges them into canonical device records.
 type Engine struct {
 	cache       *inventory.Cache
 	broker      *api.Broker
 	orch        EnrichmentOrchestrator
 	dedupMu     sync.Mutex
-	lastSeenObs map[string]time.Time // Sliding window deduplication map
+	lastSeenObs map[string]time.Time
 }
 
-// NewEngine initializes the correlation engine.
 func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
 	return &Engine{
 		cache:       cache,
@@ -63,7 +64,6 @@ func (e *Engine) consume(ctx context.Context, ch <-chan discovery.Observation) {
 	}
 }
 
-// isDuplicateObservation checks if an identical observation arrived within the last 2 seconds.
 func (e *Engine) isDuplicateObservation(macStr, ipStr string, online bool) bool {
 	key := macStr + "|" + ipStr
 	now := time.Now()
@@ -73,13 +73,12 @@ func (e *Engine) isDuplicateObservation(macStr, ipStr string, online bool) bool 
 
 	if last, found := e.lastSeenObs[key]; found {
 		if now.Sub(last) < 2*time.Second {
-			return true // Throttled
+			return true
 		}
 	}
 
 	e.lastSeenObs[key] = now
 
-	// Periodic cleanup of dedup map to prevent memory leak
 	if len(e.lastSeenObs) > 1000 {
 		for k, t := range e.lastSeenObs {
 			if now.Sub(t) > 10*time.Second {
@@ -92,6 +91,11 @@ func (e *Engine) isDuplicateObservation(macStr, ipStr string, online bool) bool 
 }
 
 func (e *Engine) processObservation(obs discovery.Observation) {
+	// Filter Multicast and Loopback targets
+	if discovery.IsMulticastOrBroadcast(obs.MAC, obs.IP) {
+		return
+	}
+
 	macStr := ""
 	if obs.MAC != nil {
 		macStr = inventory.NormalizeMAC(obs.MAC.String())
@@ -105,12 +109,13 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// 1. Throttle redundant Netlink ARP updates to conserve CPU
 	if e.isDuplicateObservation(macStr, ipStr, obs.Online) {
 		return
 	}
 
-	// 2. Handle offline event
+	cleanHost := UnescapeHostname(obs.Hostname)
+
+	// Handle offline event
 	if !obs.Online {
 		d := e.cache.GetByMACOrIP(macStr, ipStr)
 		if d != nil && d.Online {
@@ -128,14 +133,13 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// 3. Fast O(1) Cache Lookup
+	// Handle online observation
 	d := e.cache.GetByMACOrIP(macStr, ipStr)
 	if d == nil {
-		// Create new device record
-		pdid := inventory.GeneratePDID(macStr, obs.Hostname, obs.Vendor)
+		pdid := inventory.GeneratePDID(macStr, cleanHost, obs.Vendor)
 		d = &models.Device{
 			PDID:       pdid,
-			Hostname:   obs.Hostname,
+			Hostname:   cleanHost,
 			Vendor:     obs.Vendor,
 			Model:      obs.Model,
 			Online:     true,
@@ -149,8 +153,11 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		}
 		d.Touch(time.Now())
 
+		// Auto-classify Gateway Routers and Amazon Alexa devices
+		ApplySmartClassifications(d)
+
 		e.cache.Upsert(d)
-		slog.Info("New device correlated", "pdid", pdid, "mac", macStr, "ip", ipStr, "vendor", obs.Vendor)
+		slog.Info("New device correlated", "pdid", pdid, "mac", macStr, "ip", ipStr, "vendor", d.Vendor, "type", d.DeviceType)
 		e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
 
 		if e.orch != nil {
@@ -159,7 +166,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// 4. Update existing device record
+	// Update existing device
 	changed := false
 	var eventTypes []models.EventType
 	payload := models.DeviceEventPayload{
@@ -189,10 +196,10 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		eventTypes = append(eventTypes, models.EventIPChanged)
 	}
 
-	if obs.Hostname != "" && d.Hostname != obs.Hostname {
+	if cleanHost != "" && d.Hostname != cleanHost {
 		payload.OldHost = d.Hostname
-		d.Hostname = obs.Hostname
-		payload.Hostname = obs.Hostname
+		d.Hostname = cleanHost
+		payload.Hostname = cleanHost
 		changed = true
 		eventTypes = append(eventTypes, models.EventHostnameChanged)
 	}
@@ -205,13 +212,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		}
 	}
 
-	if obs.Model != "" && (d.Model == "" || obs.Confidence >= d.Confidence) {
-		if d.Model != obs.Model {
-			d.Model = obs.Model
-			changed = true
-			eventTypes = append(eventTypes, models.EventFingerprintUpdated)
-		}
-	}
+	ApplySmartClassifications(d)
 
 	d.Touch(time.Now())
 	if changed {
@@ -223,5 +224,60 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
 	if (d.Vendor == "" || d.DeviceType == "") && e.orch != nil {
 		go e.orch.TriggerEnrichment(d.PDID, false)
+	}
+}
+
+// UnescapeHostname converts raw octal escape sequences (\058 -> :) and cleans mDNS hostnames.
+func UnescapeHostname(raw string) string {
+	if raw == "" {
+		return ""
+	}
+
+	s := raw
+	for {
+		idx := strings.Index(s, "\\0")
+		if idx == -1 || idx+4 > len(s) {
+			break
+		}
+		octalCode := s[idx+2 : idx+4]
+		if val, err := strconv.ParseInt(octalCode, 8, 64); err == nil {
+			s = s[:idx] + string(rune(val)) + s[idx+4:]
+		} else {
+			break
+		}
+	}
+
+	s = strings.ReplaceAll(s, "\\.", ".")
+	s = strings.ReplaceAll(s, "\\", "")
+	return strings.TrimSpace(s)
+}
+
+// ApplySmartClassifications automatically categorizes routers and Amazon Echo devices.
+func ApplySmartClassifications(d *models.Device) {
+	if d == nil {
+		return
+	}
+
+	// 1. Gateway Router Detection (192.168.x.1 or .254)
+	if d.CurrentIP != "" {
+		ip := net.ParseIP(d.CurrentIP)
+		if ip != nil && ip.To4() != nil {
+			ip4 := ip.To4()
+			if ip4[3] == 1 || ip4[3] == 254 {
+				d.DeviceType = "infrastructure"
+				if d.FriendlyName == "" {
+					d.FriendlyName = "Network Gateway Router"
+				}
+			}
+		}
+	}
+
+	// 2. Amazon Echo / Alexa Device Detection
+	if strings.HasPrefix(d.Hostname, "amzn.") || strings.Contains(d.Hostname, "amzn.dmgr") {
+		d.Vendor = "Amazon Technologies Inc."
+		d.DeviceType = "iot"
+		if d.FriendlyName == "" {
+			d.FriendlyName = "Amazon Alexa Device"
+		}
 	}
 }
