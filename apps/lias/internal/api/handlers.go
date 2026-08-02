@@ -1,7 +1,7 @@
 // Package api implements the HTTP server and REST handlers for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 1.6
+// Version: 1.7
 package api
 
 import (
@@ -86,7 +86,7 @@ func (h *Handlers) ListDevices(w http.ResponseWriter, r *http.Request) {
 	devs := make([]models.Device, 0, len(localDevs))
 	for _, ld := range localDevs {
 		dev := ld.Device
-		dev.Tags = ld.Tags // Copy local LIAS assigned tags onto outer device representation
+		dev.Tags = ld.Tags
 		devs = append(devs, dev)
 	}
 
@@ -105,7 +105,7 @@ func (h *Handlers) GetDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dev := d.Device
-	dev.Tags = d.Tags // Synchronize tags on single device query
+	dev.Tags = d.Tags
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(dev)
@@ -129,7 +129,6 @@ func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
 		mac = d.CurrentMAC
 	}
 
-	// FIX: Surface persistence errors to client instead of discarding with `_ =`
 	if h.store != nil {
 		if err := h.store.SaveDeviceTag(pdid, req.TagID, mac); err != nil {
 			slog.Error("Failed to persist device tag assignment to storage", "pdid", pdid, "tag_id", req.TagID, "error", err)
