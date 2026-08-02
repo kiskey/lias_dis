@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/pihole_provider.go
-// Version: 1.2
+// Version: 1.3
 package discovery
 
 import (
@@ -19,7 +19,6 @@ import (
 	"github.com/user/lias-dis/apps/discovery-service/internal/config"
 )
 
-// PiholeProvider polls the Pi-hole v6 REST API for active client activity.
 type PiholeProvider struct {
 	cfg      config.PiholeConfig
 	ctx      context.Context
@@ -31,7 +30,6 @@ type PiholeProvider struct {
 	sidValid bool
 }
 
-// NewPiholeProvider initializes the Pi-hole polling provider.
 func NewPiholeProvider(cfg config.PiholeConfig) *PiholeProvider {
 	return &PiholeProvider{
 		cfg:    cfg,
@@ -41,17 +39,14 @@ func NewPiholeProvider(cfg config.PiholeConfig) *PiholeProvider {
 	}
 }
 
-// Name returns the provider's identifier.
 func (p *PiholeProvider) Name() string { return "pihole" }
 
-// Start begins the 60-second polling loop.
 func (p *PiholeProvider) Start(ctx context.Context) error {
 	p.ctx, p.cancel = context.WithCancel(ctx)
 	go p.run()
 	return nil
 }
 
-// Stop terminates the polling loop.
 func (p *PiholeProvider) Stop() error {
 	if p.cancel != nil {
 		p.cancel()
@@ -60,7 +55,6 @@ func (p *PiholeProvider) Stop() error {
 	return nil
 }
 
-// Events returns the read-only channel for observations.
 func (p *PiholeProvider) Events() <-chan Observation {
 	return p.events
 }
@@ -83,10 +77,44 @@ func (p *PiholeProvider) run() {
 	}
 }
 
+func (p *PiholeProvider) isSessionValid() bool {
+	if !p.sidValid || p.sid == "" {
+		return false
+	}
+
+	baseURL := strings.TrimRight(p.cfg.URL, "/")
+	req, err := http.NewRequestWithContext(p.ctx, "GET", baseURL+"/api/auth?sid="+p.sid, nil)
+	if err != nil {
+		return false
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+
+	var checkResp struct {
+		Session struct {
+			Valid bool `json:"valid"`
+		} `json:"session"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&checkResp); err == nil {
+		return checkResp.Session.Valid
+	}
+
+	return false
+}
+
 func (p *PiholeProvider) poll() {
-	if !p.sidValid {
+	if !p.isSessionValid() {
 		if err := p.authenticate(); err != nil {
-			slog.Error("Pi-hole authentication failed", "error", err)
+			slog.Error("Pi-hole v6 authentication failed", "error", err)
 			return
 		}
 	}
@@ -97,9 +125,10 @@ func (p *PiholeProvider) poll() {
 		return
 	}
 
-	// Set both standard Pi-hole v6 headers for compatibility
+	// Send triple-header fallback (sid header, X-FTL-SID header, and SID Cookie)
 	req.Header.Set("sid", p.sid)
 	req.Header.Set("X-FTL-SID", p.sid)
+	req.Header.Set("Cookie", "SID="+p.sid)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -110,7 +139,7 @@ func (p *PiholeProvider) poll() {
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		p.sidValid = false
-		slog.Warn("Pi-hole SID expired or invalid, re-authenticating on next interval")
+		slog.Warn("Pi-hole SID token rejected, will re-authenticate on next interval")
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -118,7 +147,6 @@ func (p *PiholeProvider) poll() {
 		return
 	}
 
-	// Pi-hole v6 client response structure wrapper supporting both array and object representations
 	var raw struct {
 		Clients json.RawMessage `json:"clients"`
 	}
@@ -136,9 +164,7 @@ func (p *PiholeProvider) poll() {
 
 	var clientList []clientItem
 
-	// Try unmarshalling as JSON array first
 	if err := json.Unmarshal(raw.Clients, &clientList); err != nil {
-		// Fallback: Try unmarshalling as JSON map keyed by IP
 		var clientMap map[string]clientItem
 		if mapErr := json.Unmarshal(raw.Clients, &clientMap); mapErr == nil {
 			for ipKey, item := range clientMap {
@@ -158,19 +184,25 @@ func (p *PiholeProvider) poll() {
 			continue
 		}
 
-		obs := Observation{
-			Source:     p.Name(),
-			IP:         net.ParseIP(c.IP),
-			Hostname:   c.Name,
-			Online:     true,
-			Confidence: 0.3, // Low confidence activity signal per §3.2
-			Timestamp:  time.Now(),
+		ipObj := net.ParseIP(c.IP)
+		var macObj net.HardwareAddr
+		if c.Mac != "" && c.Mac != "00:00:00:00:00:00" {
+			macObj, _ = net.ParseMAC(c.Mac)
 		}
 
-		if c.Mac != "" && c.Mac != "00:00:00:00:00:00" {
-			if hw, err := net.ParseMAC(c.Mac); err == nil {
-				obs.MAC = hw
-			}
+		// Filter Multicast and Loopback targets
+		if IsMulticastOrBroadcast(macObj, ipObj) {
+			continue
+		}
+
+		obs := Observation{
+			Source:     p.Name(),
+			IP:         ipObj,
+			MAC:        macObj,
+			Hostname:   UnescapeHostname(c.Name),
+			Online:     true,
+			Confidence: 0.3,
+			Timestamp:  time.Now(),
 		}
 
 		select {
@@ -218,6 +250,6 @@ func (p *PiholeProvider) authenticate() error {
 
 	p.sid = authResp.Session.SID
 	p.sidValid = true
-	slog.Info("Successfully authenticated with Pi-hole v6 REST API", "sid", p.sid[:6]+"...")
+	slog.Info("Successfully authenticated with Pi-hole v6 REST API")
 	return nil
 }
