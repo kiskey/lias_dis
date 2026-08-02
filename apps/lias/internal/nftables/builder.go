@@ -1,7 +1,7 @@
 // Package nftables implements the isolated firewall controller for LIAS.
 //
 // File:    apps/lias/internal/nftables/builder.go
-// Version: 1.3
+// Version: 1.4
 package nftables
 
 import (
