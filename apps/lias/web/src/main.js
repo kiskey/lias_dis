@@ -1,7 +1,7 @@
 /*
  * LIAS Control Center - Main Dashboard Application
  * File:    apps/lias/web/src/main.js
- * Version: 1.4 (Multiple Tag Policies & Sticky Tag Support)
+ * Version: 1.5 (Multi-Policy Tag Group UI & Sticky Tag Support)
  */
 
 import { API } from './api.js';
@@ -116,8 +116,6 @@ class LiasDashboard {
     }
   }
 
-  // --- Views ---
-
   renderDashboardView() {
     const onlineCount = this.devices.filter((d) => d.online).length;
     const globalPol = this.policies.find((p) => p.id === 'global_default') || { action: 'allow' };
@@ -195,7 +193,6 @@ class LiasDashboard {
         return matchesGroup && matchesQuery;
       });
 
-      // Find ALL policies attached to this tag group
       const tagPolicies = this.policies.filter((p) => p.type === 'tag' && p.target_id === tag.id);
       
       let tagPolicyBadges = '';
@@ -243,7 +240,7 @@ class LiasDashboard {
           html += `
             <div style="display: flex; align-items: center; justify-content: space-between; background: var(--bg-tertiary); padding: 12px 16px; border-radius: 12px;">
               <div style="display: flex; align-items: center; gap: 14px;">
-                <div style="width: 100%; max-width: 10px; height: 10px; border-radius: 50%; background-color: ${onlineDot}; flex-shrink: 0;"></div>
+                <div style="width: 10px; height: 10px; border-radius: 50%; background-color: ${onlineDot}; flex-shrink: 0;"></div>
                 <div>
                   <h4 style="font-size: 15px; font-weight: 600;">${d.friendly_name || d.hostname || 'Unknown Device'}</h4>
                   <p style="font-size: 12px; color: var(--text-secondary); margin-top: 2px;">
@@ -267,7 +264,6 @@ class LiasDashboard {
     html += `</div>`;
     this.viewContainer.innerHTML = html;
 
-    // Attach Policy Add Button Listeners
     this.viewContainer.querySelectorAll('[data-add-tag-policy]').forEach((btn) => {
       btn.addEventListener('click', (e) => {
         const tagId = e.currentTarget.getAttribute('data-add-tag-policy');
@@ -275,7 +271,6 @@ class LiasDashboard {
       });
     });
 
-    // Attach Policy Delete Button Listeners
     this.viewContainer.querySelectorAll('[data-del-pol]').forEach((btn) => {
       btn.addEventListener('click', async (e) => {
         const polId = e.currentTarget.getAttribute('data-del-pol');
@@ -290,7 +285,6 @@ class LiasDashboard {
       });
     });
 
-    // Attach Move Tag Select Listeners
     this.viewContainer.querySelectorAll('[data-move-pdid]').forEach((select) => {
       select.addEventListener('change', async (e) => {
         const pdid = e.currentTarget.getAttribute('data-move-pdid');
@@ -387,13 +381,11 @@ class LiasDashboard {
       <div class="card">
         <h3>System Settings</h3>
         <p style="color: var(--text-secondary); margin-top: 8px;">
-          LIAS Version: 1.6 &bull; Netfilter Table: <code>netdev lancontrol</code>
+          LIAS Version: 1.7 &bull; Netfilter Table: <code>netdev lancontrol</code>
         </p>
       </div>
     `;
   }
-
-  // --- Modals ---
 
   openAddScheduleModal() {
     let detectedTz = 'UTC';
