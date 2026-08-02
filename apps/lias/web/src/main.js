@@ -1,766 +1,953 @@
-/*
- * LIAS Control Center - Main Dashboard Application
+/**
+ * LIAS Control Center - Production Web Dashboard SPA Controller
  * File:    apps/lias/web/src/main.js
- * Version: 2.2 (Restored renderCurrentView Method, Complete Null Safety, Real-Time SSE)
+ * Version: 1.3
  */
 
 import { API } from './api.js';
 
-class LiasDashboard {
-  constructor() {
-    this.currentView = 'dashboard';
-    this.devices = [];
-    this.tags = [];
-    this.policies = [];
-    this.schedules = [];
-    this.searchQuery = '';
+class AppController {
+    constructor() {
+        this.currentView = 'dashboard';
+        this.devices = [];
+        this.tags = [];
+        this.policies = [];
+        this.schedules = [];
+        this.searchQuery = '';
+        this.sseSubscription = null;
 
-    try {
-      this.collapsedGroups = JSON.parse(localStorage.getItem('lias_collapsed_groups') || '{}');
-    } catch (e) {
-      this.collapsedGroups = {};
+        this.init();
     }
 
-    this.initDOM();
-    this.initEvents();
-    this.loadInitialData();
-    this.initRealtimeEvents();
-  }
-
-  initDOM() {
-    this.viewTitle = document.getElementById('view-title');
-    this.viewContainer = document.getElementById('view-container');
-    this.searchInput = document.querySelector('.search-bar input');
-    this.modalRoot = document.getElementById('modal-root');
-    this.modalTitle = document.getElementById('modal-title');
-    this.modalBody = document.getElementById('modal-body');
-    this.modalFooter = document.getElementById('modal-footer');
-    this.toastRoot = document.getElementById('toast-root');
-  }
-
-  initEvents() {
-    document.querySelectorAll('[data-view]').forEach((btn) => {
-      btn.addEventListener('click', (e) => {
-        const view = e.currentTarget.getAttribute('data-view');
-        this.switchView(view);
-      });
-    });
-
-    if (this.searchInput) {
-      this.searchInput.addEventListener('input', (e) => {
-        this.searchQuery = e.target.value.toLowerCase();
-        if (this.currentView === 'devices') {
-          this.renderDevicesView();
-        }
-      });
+    async init() {
+        this.bindGlobalEvents();
+        await this.loadInitialData();
+        this.initRealtimeEvents();
     }
 
-    const closeBtn = document.querySelector('.modal-close-btn');
-    if (closeBtn) {
-      closeBtn.addEventListener('click', () => this.hideModal());
-    }
-  }
-
-  initRealtimeEvents() {
-    API.subscribeEvents((evt) => {
-      this.loadInitialDataSilently();
-    });
-  }
-
-  async loadInitialDataSilently() {
-    try {
-      const [devRes, tagRes, polRes, schedRes] = await Promise.all([
-        API.getDevices(),
-        API.getTags(),
-        API.getPolicies(),
-        API.getSchedules(),
-      ]);
-
-      this.devices = (devRes && devRes.devices) ? devRes.devices : (Array.isArray(devRes) ? devRes : []);
-      this.tags = Array.isArray(tagRes) ? tagRes : [];
-      this.policies = Array.isArray(polRes) ? polRes : [];
-      this.schedules = Array.isArray(schedRes) ? schedRes : [];
-
-      this.renderCurrentView();
-    } catch (err) {
-      console.error('Silent refresh error:', err);
-      if (this.viewContainer && this.viewContainer.querySelector('.loader')) {
-        this.renderErrorState(err);
-      }
-    }
-  }
-
-  async loadInitialData() {
-    try {
-      await this.loadInitialDataSilently();
-    } catch (err) {
-      this.showToast('Failed to connect to LIAS backend', 'danger');
-      this.renderErrorState(err);
-    }
-  }
-
-  renderErrorState(err) {
-    if (!this.viewContainer) return;
-    this.viewContainer.innerHTML = `
-      <div class="card" style="text-align: center; padding: 40px 24px; margin-top: 20px;">
-        <div style="width: 48px; height: 48px; border-radius: 50%; background: rgba(255, 59, 48, 0.1); color: var(--danger); display: inline-flex; align-items: center; justify-content: center; margin-bottom: 16px;">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
-        </div>
-        <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 8px;">Unable to Connect to LIAS Backend</h3>
-        <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 20px; max-width: 400px; margin-left: auto; margin-right: auto;">
-          ${err && err.message ? err.message : 'Check network connection or ensure the lias service is running on port :8081.'}
-        </p>
-        <button class="btn btn-primary" onclick="window.app.loadInitialData()">Retry Connection</button>
-      </div>
-    `;
-  }
-
-  switchView(view) {
-    this.currentView = view;
-
-    document.querySelectorAll('[data-view]').forEach((btn) => {
-      btn.classList.toggle('active', btn.getAttribute('data-view') === view);
-    });
-
-    const titles = {
-      dashboard: 'Dashboard',
-      devices: 'Device Groups',
-      schedules: 'Schedules',
-      policies: 'Policies',
-      settings: 'Settings',
-    };
-    if (this.viewTitle) this.viewTitle.textContent = titles[view] || 'Dashboard';
-
-    this.renderCurrentView();
-  }
-
-  // RESTORED METHOD: Renders active view based on currentView property
-  renderCurrentView() {
-    switch (this.currentView) {
-      case 'dashboard':
-        this.renderDashboardView();
-        break;
-      case 'devices':
-        this.renderDevicesView();
-        break;
-      case 'schedules':
-        this.renderSchedulesView();
-        break;
-      case 'policies':
-        this.renderPoliciesView();
-        break;
-      case 'settings':
-        this.renderSettingsView();
-        break;
-      default:
-        this.renderDashboardView();
-    }
-  }
-
-  formatLastSeen(isoStr, isOnline) {
-    if (isOnline) return '<span style="color: var(--success); font-weight: 600;">Online Now</span>';
-    if (!isoStr) return '<span style="color: var(--text-secondary);">Offline</span>';
-
-    try {
-      const date = new Date(isoStr);
-      const now = new Date();
-      const diffMs = now - date;
-      const diffMins = Math.floor(diffMs / 60000);
-      const diffHours = Math.floor(diffMins / 60);
-
-      if (diffMins < 1) return 'Offline • Just now';
-      if (diffMins < 60) return `Offline • ${diffMins}m ago`;
-      if (diffHours < 24) return `Offline • ${diffHours}h ago`;
-      return `Offline • ${date.toLocaleDateString()}`;
-    } catch (e) {
-      return 'Offline';
-    }
-  }
-
-  ensure24Hour(timeStr) {
-    if (!timeStr) return "12:00";
-    if (/^\d{2}:\d{2}$/.test(timeStr)) return timeStr;
-    if (/^\d{1}:\d{2}$/.test(timeStr)) return "0" + timeStr;
-
-    const match = timeStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
-    if (match) {
-      let hrs = parseInt(match[1], 10);
-      const mins = match[2];
-      const ampm = match[3] ? match[3].toUpperCase() : '';
-      if (ampm === 'PM' && hrs < 12) hrs += 12;
-      if (ampm === 'AM' && hrs === 12) hrs = 0;
-      return `${hrs.toString().padStart(2, '0')}:${mins}`;
-    }
-    return timeStr;
-  }
-
-  renderDashboardView() {
-    if (!this.viewContainer) return;
-    const onlineCount = (this.devices || []).filter((d) => d && d.online).length;
-    const globalPol = (this.policies || []).find((p) => p && p.id === 'global_default') || { action: 'schedule' };
-
-    this.viewContainer.innerHTML = `
-      <div class="global-switch-banner">
-        <div>
-          <h3 style="font-size: 18px; font-weight: 700;">Global Network Switch</h3>
-          <p style="font-size: 13px; color: var(--text-secondary); margin-top: 4px;">
-            Infrastructure devices (Gateway, Switches) are <strong style="color: var(--success);">IMMUNE</strong> to global block rules.
-          </p>
-        </div>
-        <div class="segmented-control">
-          <button class="segmented-btn ${globalPol.action === 'allow' ? 'active' : ''}" data-global-act="allow">Always Allow</button>
-          <button class="segmented-btn ${globalPol.action === 'schedule' ? 'active' : ''}" data-global-act="schedule">Scheduled</button>
-          <button class="segmented-btn danger ${globalPol.action === 'block' ? 'active' : ''}" data-global-act="block">Block All</button>
-        </div>
-      </div>
-
-      <div class="card-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px;">
-        <div class="card" style="margin: 0;">
-          <h4 style="color: var(--text-secondary); font-size: 12px; text-transform: uppercase;">Total Devices</h4>
-          <p style="font-size: 32px; font-weight: 700; margin-top: 8px;">${this.devices.length}</p>
-        </div>
-        <div class="card" style="margin: 0;">
-          <h4 style="color: var(--text-secondary); font-size: 12px; text-transform: uppercase;">Online Now</h4>
-          <p style="font-size: 32px; font-weight: 700; margin-top: 8px; color: var(--success);">${onlineCount}</p>
-        </div>
-        <div class="card" style="margin: 0;">
-          <h4 style="color: var(--text-secondary); font-size: 12px; text-transform: uppercase;">Tag Groups</h4>
-          <p style="font-size: 32px; font-weight: 700; margin-top: 8px; color: var(--accent);">${this.tags.length}</p>
-        </div>
-      </div>
-    `;
-
-    this.viewContainer.querySelectorAll('[data-global-act]').forEach((btn) => {
-      btn.addEventListener('click', async (e) => {
-        const action = e.currentTarget.getAttribute('data-global-act');
-        try {
-          await API.createPolicy({
-            id: 'global_default',
-            name: 'Global Access Switch',
-            type: 'global',
-            action: action,
-            priority: 0,
-          });
-          const pol = (this.policies || []).find((p) => p && p.id === 'global_default');
-          if (pol) pol.action = action;
-          else this.policies.push({ id: 'global_default', action });
-
-          this.renderDashboardView();
-          this.showToast(`Global switch set to ${action.toUpperCase()} & persisted`, 'success');
-        } catch (err) {
-          this.showToast('Failed to update global switch', 'danger');
-        }
-      });
-    });
-  }
-
-  toggleGroupCollapse(tagId) {
-    this.collapsedGroups[tagId] = !this.collapsedGroups[tagId];
-    try {
-      localStorage.setItem('lias_collapsed_groups', JSON.stringify(this.collapsedGroups));
-    } catch (e) {}
-    this.renderDevicesView();
-  }
-
-  getEffectiveTags() {
-    const tagMap = new Map();
-    if (Array.isArray(this.tags)) {
-      this.tags.forEach((t) => { if (t && t.id) tagMap.set(t.id, t); });
-    }
-
-    if (Array.isArray(this.devices)) {
-      this.devices.forEach((d) => {
-        if (!d) return;
-        const tagId = (d.tags && d.tags[0]) || 'generic';
-        if (!tagMap.has(tagId)) {
-          tagMap.set(tagId, {
-            id: tagId,
-            name: tagId.charAt(0).toUpperCase() + tagId.slice(1).replace(/_/g, ' '),
-            color: '#0071e3',
-            precedence: 50,
-            builtin: false,
-          });
-        }
-      });
-    }
-
-    return Array.from(tagMap.values());
-  }
-
-  renderDevicesView() {
-    if (!this.viewContainer) return;
-    let html = `<div style="display: flex; flex-direction: column; gap: 24px;">`;
-    const effectiveTags = this.getEffectiveTags();
-
-    effectiveTags.forEach((tag) => {
-      const groupDevs = (this.devices || []).filter((d) => {
-        if (!d) return false;
-        const devTag = (d.tags && d.tags[0]) || 'generic';
-        const matchesGroup = devTag === tag.id;
-
-        const q = this.searchQuery;
-        const matchesQuery =
-          !q ||
-          (d.hostname && d.hostname.toLowerCase().includes(q)) ||
-          (d.friendly_name && d.friendly_name.toLowerCase().includes(q)) ||
-          (d.current_ip && d.current_ip.toLowerCase().includes(q)) ||
-          (d.current_mac && d.current_mac.toLowerCase().includes(q));
-
-        return matchesGroup && matchesQuery;
-      });
-
-      const tagPolicies = (this.policies || []).filter((p) => p && p.type === 'tag' && p.target_id === tag.id);
-      const isCollapsed = !!this.collapsedGroups[tag.id];
-
-      let tagPolicyBadges = '';
-      if (tagPolicies.length > 0) {
-        tagPolicyBadges = tagPolicies
-          .map((p) => {
-            const schedObj = p.schedule_id ? (this.schedules || []).find((s) => s && s.id === p.schedule_id) : null;
-            const schedName = schedObj ? schedObj.name : '';
-            const label = p.action === 'schedule' ? `SCHEDULE (${schedName})` : p.action.toUpperCase();
-            return `
-              <span style="display: inline-flex; align-items: center; gap: 6px; font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--bg-tertiary); color: var(--accent); font-weight: 600; margin-right: 6px; margin-top: 4px;">
-                ${p.name || 'Rule'}: ${label}
-                <button data-del-pol="${p.id}" style="border:none; background:none; color:var(--danger); cursor:pointer; font-weight:bold; font-size:14px; line-height:1;">&times;</button>
-              </span>
-            `;
-          })
-          .join('');
-      } else {
-        tagPolicyBadges = `<span style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--bg-tertiary); color: var(--text-secondary);">Default Inherit</span>`;
-      }
-
-      html += `
-        <div class="group-card ${isCollapsed ? 'collapsed' : ''}" style="margin: 0;">
-          <div class="group-header" data-toggle-group="${tag.id}" style="display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid var(--separator); padding: 18px 24px; cursor: pointer; user-select: none;">
-            <div>
-              <div style="display: flex; align-items: center; gap: 10px;">
-                <div style="width: 14px; height: 14px; border-radius: 4px; background-color: ${tag.color};"></div>
-                <h3 style="font-size: 18px; font-weight: 700;">${tag.name} (${groupDevs.length})</h3>
-              </div>
-              <div style="margin-top: 8px;">${tagPolicyBadges}</div>
-            </div>
-            <div style="display: flex; align-items: center; gap: 12px;">
-              ${tag.id !== 'infrastructure' ? `<button class="btn btn-primary" data-add-tag-policy="${tag.id}" style="font-size: 12px;" onclick="event.stopPropagation();">+ Attach Rule / Schedule</button>` : `<span style="font-size: 12px; color: var(--success); font-weight: 600;">Immune to Block Rules</span>`}
-              <svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px; height:20px; color:var(--text-secondary); transition: transform 0.25s ease; ${isCollapsed ? 'transform: rotate(-90deg);' : ''}"><polyline points="6 9 12 15 18 9"></polyline></svg>
-            </div>
-          </div>
-
-          <div class="group-content" style="padding: 20px 24px; display: ${isCollapsed ? 'none' : 'flex'}; flex-direction: column; gap: 10px;">
-      `;
-
-      if (groupDevs.length === 0) {
-        html += `<p style="font-size: 13px; color: var(--text-secondary); padding: 8px 0;">No devices in this group.</p>`;
-      } else {
-        groupDevs.forEach((d) => {
-          const vendorName = d.vendor || d.manufacturer || 'Generic Hardware';
-          const lastSeenHTML = this.formatLastSeen(d.last_seen, d.online);
-
-          const displayName = (d.hostname && d.hostname.trim()) || 
-                              (d.friendly_name && d.friendly_name.trim()) || 
-                              'Unknown Device';
-
-          let servicePills = '';
-          if (d.services && d.services.length > 0) {
-            servicePills = `
-              <div class="service-pill-list">
-                ${d.services.map((svc) => `<span class="service-pill"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle></svg>${svc}</span>`).join('')}
-              </div>
-            `;
-          }
-
-          html += `
-            <div style="display: flex; align-items: center; justify-content: space-between; background: var(--bg-tertiary); padding: 14px 16px; border-radius: 12px; border: 1px solid var(--separator);">
-              <div style="display: flex; align-items: flex-start; gap: 14px;">
-                <div class="status-indicator ${d.online ? 'online' : 'offline'}" style="margin-top: 4px;" title="${d.online ? 'Online' : 'Offline'}"></div>
-                <div>
-                  <h4 style="font-size: 15px; font-weight: 600;">${displayName}</h4>
-                  <p style="font-size: 12px; color: var(--text-secondary); margin-top: 2px;">
-                    ${d.current_ip || 'No IP'} &bull; ${d.current_mac || 'No MAC'} &bull; ${vendorName}
-                  </p>
-                  <div style="margin-top: 4px; font-size: 11px;">${lastSeenHTML}</div>
-                  ${servicePills ? `<div style="margin-top: 8px;">${servicePills}</div>` : ''}
-                </div>
-              </div>
-              <div>
-                <select data-move-pdid="${d.pdid}" style="padding: 6px 10px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-secondary); color: var(--text-primary); font-size: 12px; font-weight: 600;">
-                  ${effectiveTags.map((t) => `<option value="${t.id}" ${t.id === tag.id ? 'selected' : ''}>Move to ${t.name}</option>`).join('')}
-                </select>
-              </div>
-            </div>
-          `;
+    bindGlobalEvents() {
+        // Desktop Sidebar Navigation
+        document.querySelectorAll('.sidebar-nav .nav-item').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const view = e.currentTarget.dataset.view;
+                this.switchView(view);
+            });
         });
-      }
 
-      html += `</div></div>`;
-    });
+        // Mobile Bottom Navigation Tab Bar
+        document.querySelectorAll('#mobile-nav .mob-nav-item').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const view = e.currentTarget.dataset.view;
+                this.switchView(view);
+            });
+        });
 
-    html += `</div>`;
-    this.viewContainer.innerHTML = html;
+        // Search Input Filter
+        const searchInput = document.getElementById('global-search');
+        if (searchInput) {
+            searchInput.addEventListener('input', (e) => {
+                this.searchQuery = e.target.value.toLowerCase().trim();
+                this.render();
+            });
+        }
 
-    this.viewContainer.querySelectorAll('[data-toggle-group]').forEach((header) => {
-      header.addEventListener('click', (e) => {
-        const tagId = e.currentTarget.getAttribute('data-toggle-group');
-        this.toggleGroupCollapse(tagId);
-      });
-    });
+        // Modal Window Close Event Handlers
+        const closeBtn = document.getElementById('modal-close-x');
+        if (closeBtn) {
+            closeBtn.addEventListener('click', () => this.closeModal());
+        }
 
-    this.viewContainer.querySelectorAll('[data-add-tag-policy]').forEach((btn) => {
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        const tagId = e.currentTarget.getAttribute('data-add-tag-policy');
-        this.openTagPolicyModal(tagId);
-      });
-    });
+        const modalBackdrop = document.getElementById('modal-root');
+        if (modalBackdrop) {
+            modalBackdrop.addEventListener('click', (e) => {
+                if (e.target === modalBackdrop) {
+                    this.closeModal();
+                }
+            });
+        }
 
-    this.viewContainer.querySelectorAll('[data-del-pol]').forEach((btn) => {
-      btn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const polId = e.currentTarget.getAttribute('data-del-pol');
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                this.closeModal();
+            }
+        });
+    }
+
+    switchView(view) {
+        this.currentView = view;
+
+        document.querySelectorAll('.nav-item, .mob-nav-item').forEach(el => {
+            el.classList.toggle('active', el.dataset.view === view);
+        });
+
+        const titleMap = {
+            'dashboard': 'Dashboard',
+            'devices': 'Tag Groups',
+            'schedules': 'Schedules',
+            'policies': 'Policies',
+            'settings': 'Settings'
+        };
+
+        const viewTitle = document.getElementById('view-title');
+        if (viewTitle) {
+            viewTitle.textContent = titleMap[view] || 'Dashboard';
+        }
+
+        this.render();
+    }
+
+    async loadInitialData() {
         try {
-          await API.deletePolicy(polId);
-          this.policies = (this.policies || []).filter((p) => p && p.id !== polId);
-          this.renderDevicesView();
-          this.showToast('Policy removed from group', 'success');
-        } catch (err) {
-          this.showToast('Failed to delete policy', 'danger');
-        }
-      });
-    });
+            const [devsRes, tagsRes, polsRes, schedsRes] = await Promise.all([
+                API.getDevices(),
+                API.getTags(),
+                API.getPolicies(),
+                API.getSchedules()
+            ]);
 
-    this.viewContainer.querySelectorAll('[data-move-pdid]').forEach((select) => {
-      select.addEventListener('change', async (e) => {
-        const pdid = e.currentTarget.getAttribute('data-move-pdid');
-        const newTagId = e.currentTarget.value;
+            this.devices = devsRes.devices || [];
+            this.tags = tagsRes || [];
+            this.policies = polsRes || [];
+            this.schedules = schedsRes || [];
+
+            this.render();
+        } catch (err) {
+            this.showToast('Failed to load system state from LIAS server', 'error');
+        }
+    }
+
+    async loadInitialDataSilently() {
         try {
-          await API.assignDeviceTag(pdid, newTagId);
-          const dev = (this.devices || []).find((d) => d && d.pdid === pdid);
-          if (dev) dev.tags = [newTagId];
-          this.renderDevicesView();
-          this.showToast('Device reassigned & saved persistently', 'success');
+            const [devsRes, tagsRes, polsRes, schedsRes] = await Promise.all([
+                API.getDevices(),
+                API.getTags(),
+                API.getPolicies(),
+                API.getSchedules()
+            ]);
+
+            this.devices = devsRes.devices || [];
+            this.tags = tagsRes || [];
+            this.policies = polsRes || [];
+            this.schedules = schedsRes || [];
+
+            this.render();
         } catch (err) {
-          this.showToast('Failed to reassign device', 'danger');
+            // Silently absorb transport errors during background refresh
         }
-      });
-    });
-  }
+    }
 
-  renderSchedulesView() {
-    if (!this.viewContainer) return;
-    let html = `
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-        <h3>Time Schedules</h3>
-        <button class="btn btn-primary" id="add-schedule-btn">+ New Schedule</button>
-      </div>
-      <div style="display: flex; flex-direction: column; gap: 14px;">
-    `;
-
-    if (!this.schedules || this.schedules.length === 0) {
-      html += `<div class="card"><p style="color: var(--text-secondary);">No time schedules configured.</p></div>`;
-    } else {
-      this.schedules.forEach((s) => {
-        if (!s) return;
-        let rulesSummary = '';
-        if (s.rules && s.rules.length > 0) {
-          rulesSummary = s.rules
-            .map(
-              (r) =>
-                `<span style="display: inline-block; padding: 4px 10px; border-radius: 6px; background: var(--bg-tertiary); font-size: 12px; margin-right: 6px; margin-top: 6px; font-weight: 600;">
-                  ${(r.days || []).join(', ').toUpperCase()}: ${r.start_time} - ${r.end_time} (${(r.action || 'block').toUpperCase()})
-                </span>`
-            )
-            .join('');
-        } else {
-          rulesSummary = `<span style="font-size: 12px; color: var(--text-secondary);">No rules added yet</span>`;
+    initRealtimeEvents() {
+        if (this.sseSubscription) {
+            this.sseSubscription.close();
         }
 
+        this.sseSubscription = API.subscribeEvents((evt) => {
+            // Re-fetch state silently to guarantee complete view consistency
+            this.loadInitialDataSilently();
+
+            if (evt.type === 'device.offline') {
+                const mac = (evt.payload && evt.payload.mac) ? ` (${evt.payload.mac})` : '';
+                this.showToast(`Device transitioned offline${mac}`, 'info');
+            } else if (evt.type === 'device.online') {
+                const mac = (evt.payload && evt.payload.mac) ? ` (${evt.payload.mac})` : '';
+                this.showToast(`Device connected online${mac}`, 'info');
+            }
+        });
+
+        // Defense-in-Depth (GAP-12): 20s backstop polling interval ensures the UI
+        // auto-corrects even if SSE connections drop or miss packets.
+        setInterval(() => this.loadInitialDataSilently(), 20000);
+    }
+
+    render() {
+        const container = document.getElementById('view-container');
+        if (!container) return;
+
+        switch (this.currentView) {
+            case 'dashboard':
+            case 'devices':
+                this.renderTagGroupsView(container);
+                break;
+            case 'schedules':
+                this.renderSchedulesView(container);
+                break;
+            case 'policies':
+                this.renderPoliciesView(container);
+                break;
+            case 'settings':
+                this.renderSettingsView(container);
+                break;
+            default:
+                container.innerHTML = '<div class="card"><p>View not found.</p></div>';
+        }
+    }
+
+    // =========================================================================
+    // 1. DASHBOARD & TAG GROUPS VIEW
+    // =========================================================================
+
+    renderTagGroupsView(container) {
+        let html = '';
+
+        const globalPolicy = this.policies.find(p => p.id === 'global_default') || { action: 'schedule' };
         html += `
-          <div class="card" style="margin: 0; display: flex; justify-content: space-between; align-items: flex-start;">
-            <div>
-              <h4 style="font-size: 16px; font-weight: 700;">${s.name}</h4>
-              <p style="font-size: 12px; color: var(--text-secondary); margin-top: 2px;">
-                <span style="display: inline-block; padding: 2px 8px; border-radius: 4px; background: var(--bg-tertiary); color: var(--accent); font-weight: 600;">Timezone: ${s.timezone}</span>
-              </p>
-              <div style="margin-top: 10px;">${rulesSummary}</div>
+            <div class="global-switch-banner">
+                <div>
+                    <h3 style="font-size:16px; font-weight:700; margin-bottom:4px;">Global Network Access</h3>
+                    <p style="font-size:13px; color:var(--text-secondary);">Master internet switch across all network devices</p>
+                </div>
+                <div class="segmented-control">
+                    <button class="segmented-btn ${globalPolicy.action === 'allow' ? 'active' : ''}" data-act="allow">Allow All</button>
+                    <button class="segmented-btn ${globalPolicy.action === 'schedule' ? 'active' : ''}" data-act="schedule">Schedule</button>
+                    <button class="segmented-btn danger ${globalPolicy.action === 'block' ? 'active' : ''}" data-act="block">Block All</button>
+                </div>
             </div>
-            <div style="display: flex; gap: 8px;">
-              <button class="btn btn-secondary" data-edit-sched="${s.id}">Edit</button>
-              <button class="btn btn-danger" data-del-sched="${s.id}">Delete</button>
-            </div>
-          </div>
         `;
-      });
-    }
 
-    html += `</div>`;
-    this.viewContainer.innerHTML = html;
-
-    const addBtn = document.getElementById('add-schedule-btn');
-    if (addBtn) addBtn.addEventListener('click', () => this.openScheduleModal());
-
-    this.viewContainer.querySelectorAll('[data-edit-sched]').forEach((btn) => {
-      btn.addEventListener('click', (e) => {
-        const id = e.currentTarget.getAttribute('data-edit-sched');
-        this.openScheduleModal(id);
-      });
-    });
-
-    this.viewContainer.querySelectorAll('[data-del-sched]').forEach((btn) => {
-      btn.addEventListener('click', async (e) => {
-        const id = e.currentTarget.getAttribute('data-del-sched');
-        try {
-          await API.deleteSchedule(id);
-          this.schedules = (this.schedules || []).filter((s) => s && s.id !== id);
-          this.renderSchedulesView();
-          this.showToast('Schedule removed', 'success');
-        } catch (err) {
-          this.showToast('Failed to delete schedule', 'danger');
+        if (this.currentView === 'devices') {
+            html += `
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+                    <h3 style="font-size:18px; font-weight:700;">Configured Tag Groups</h3>
+                    <button class="btn btn-primary" id="btn-create-tag">+ Create Custom Tag Group</button>
+                </div>
+            `;
         }
-      });
-    });
-  }
 
-  renderPoliciesView() {
-    if (!this.viewContainer) return;
-    this.viewContainer.innerHTML = `
-      <div class="card">
-        <h3>Policy Rules Summary</h3>
-        <p style="color: var(--text-secondary); margin-top: 8px;">
-          Attach schedules directly to Tag Groups under the <strong>Device Groups</strong> tab.
-        </p>
-      </div>
-    `;
-  }
+        const tagMap = new Map();
+        this.tags.forEach(t => tagMap.set(t.id, { ...t, devices: [] }));
 
-  renderSettingsView() {
-    if (!this.viewContainer) return;
-    this.viewContainer.innerHTML = `
-      <div class="card">
-        <h3>System Settings</h3>
-        <p style="color: var(--text-secondary); margin-top: 8px;">
-          LIAS Version: 2.2 &bull; Netfilter Table: <code>netdev lancontrol</code>
-        </p>
-      </div>
-    `;
-  }
+        this.devices.forEach(dev => {
+            if (this.searchQuery) {
+                const match = (dev.hostname || '').toLowerCase().includes(this.searchQuery) ||
+                              (dev.friendly_name || '').toLowerCase().includes(this.searchQuery) ||
+                              (dev.current_mac || '').toLowerCase().includes(this.searchQuery) ||
+                              (dev.current_ip || '').toLowerCase().includes(this.searchQuery) ||
+                              (dev.vendor || '').toLowerCase().includes(this.searchQuery) ||
+                              (dev.pdid || '').toLowerCase().includes(this.searchQuery);
+                if (!match) return;
+            }
 
-  openScheduleModal(scheduleId = null) {
-    const existingSched = scheduleId ? (this.schedules || []).find((s) => s && s.id === scheduleId) : null;
+            const assignedTag = (dev.tags && dev.tags[0]) ? dev.tags[0] : 'generic';
+            if (tagMap.has(assignedTag)) {
+                tagMap.get(assignedTag).devices.push(dev);
+            } else {
+                if (!tagMap.has('generic')) {
+                    tagMap.set('generic', { id: 'generic', name: 'Generic Devices', color: '#636366', precedence: 0, devices: [] });
+                }
+                tagMap.get('generic').devices.push(dev);
+            }
+        });
 
-    let detectedTz = 'UTC';
-    try {
-      detectedTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-    } catch (e) {
-      detectedTz = 'UTC';
+        tagMap.forEach(group => {
+            if (group.devices.length === 0 && this.searchQuery) return;
+
+            html += `
+                <div class="group-card">
+                    <div class="group-header" data-tag-id="${group.id}">
+                        <div class="group-header-title">
+                            <span class="group-tag-badge" style="background-color:${group.color};">${this.escapeHtml(group.name)}</span>
+                            <span class="group-count">(${group.devices.length} ${group.devices.length === 1 ? 'device' : 'devices'})</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:12px;">
+                            ${(this.currentView === 'devices' && !group.builtin) ? `
+                                <button class="btn btn-secondary btn-edit-tag" data-tag-id="${group.id}" style="padding:4px 10px; font-size:12px;">Edit</button>
+                                <button class="btn btn-danger btn-delete-tag" data-tag-id="${group.id}" style="padding:4px 10px; font-size:12px;">Delete</button>
+                            ` : ''}
+                            <svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                        </div>
+                    </div>
+                    <div class="group-content">
+                        ${group.devices.length === 0 ? '<p style="color:var(--text-secondary); font-size:13px;">No devices assigned to this group.</p>' : `
+                            <div class="device-grid">
+                                ${group.devices.map(d => this.renderDeviceCard(d)).join('')}
+                            </div>
+                        `}
+                    </div>
+                </div>
+            `;
+        });
+
+        container.innerHTML = html;
+
+        // Bind Global Access Switch Buttons
+        container.querySelectorAll('.global-switch-banner .segmented-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                const act = e.currentTarget.dataset.act;
+                try {
+                    await API.savePolicy({
+                        id: 'global_default',
+                        name: 'Global Access Switch',
+                        type: 'global',
+                        action: act,
+                        priority: 0
+                    });
+                    this.showToast(`Global access updated to ${act.toUpperCase()}`, 'info');
+                    await this.loadInitialDataSilently();
+                } catch (err) {
+                    this.showToast(`Failed to set global policy: ${err.message}`, 'error');
+                }
+            });
+        });
+
+        // Bind Collapsible Group Headers
+        container.querySelectorAll('.group-header').forEach(header => {
+            header.addEventListener('click', (e) => {
+                if (e.target.closest('button')) return;
+                header.parentElement.classList.toggle('collapsed');
+            });
+        });
+
+        // Bind Tag Reassignment Buttons on Devices
+        container.querySelectorAll('.btn-reassign-tag').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const pdid = e.currentTarget.dataset.pdid;
+                this.openAssignTagModal(pdid);
+            });
+        });
+
+        // Bind Tag Management Action Buttons
+        const createTagBtn = document.getElementById('btn-create-tag');
+        if (createTagBtn) {
+            createTagBtn.addEventListener('click', () => this.openTagModal());
+        }
+
+        container.querySelectorAll('.btn-edit-tag').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const tagId = e.currentTarget.dataset.tagId;
+                const tag = this.tags.find(t => t.id === tagId);
+                if (tag) this.openTagModal(tag);
+            });
+        });
+
+        container.querySelectorAll('.btn-delete-tag').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                const tagId = e.currentTarget.dataset.tagId;
+                if (confirm(`Are you sure you want to delete tag group '${tagId}'?`)) {
+                    try {
+                        await API.deleteTag(tagId);
+                        this.showToast('Tag group deleted', 'info');
+                        await this.loadInitialData();
+                    } catch (err) {
+                        this.showToast(`Failed to delete tag: ${err.message}`, 'error');
+                    }
+                }
+            });
+        });
     }
 
-    const name = existingSched ? existingSched.name : '';
-    const tz = existingSched ? existingSched.timezone : detectedTz;
-    const firstRule = existingSched && existingSched.rules && existingSched.rules[0] ? existingSched.rules[0] : { days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_time: '22:00', end_time: '06:00', action: 'block' };
+    renderDeviceCard(dev) {
+        const isOnline = dev.online;
+        const displayName = dev.friendly_name || dev.hostname || dev.current_mac || dev.pdid;
+        const services = dev.services || [];
+        const currentTag = (dev.tags && dev.tags[0]) ? dev.tags[0] : 'generic';
 
-    const startTime24 = this.ensure24Hour(firstRule.start_time);
-    const endTime24 = this.ensure24Hour(firstRule.end_time);
+        return `
+            <div class="device-item">
+                <div>
+                    <div class="device-item-header">
+                        <span class="device-name" title="${this.escapeHtml(dev.pdid)}">${this.escapeHtml(displayName)}</span>
+                        <div class="status-indicator ${isOnline ? 'online' : 'offline'}" title="${isOnline ? 'Online' : 'Offline'}"></div>
+                    </div>
+                    <div class="device-meta">
+                        <div><strong>IP:</strong> ${dev.current_ip || 'N/A'}</div>
+                        <div><strong>MAC:</strong> ${dev.current_mac || 'N/A'}</div>
+                        <div><strong>Vendor:</strong> ${dev.vendor || 'Unknown'}</div>
+                        ${dev.model ? `<div><strong>Model:</strong> ${this.escapeHtml(dev.model)}</div>` : ''}
+                    </div>
+                    ${services.length > 0 ? `
+                        <div class="service-pill-list">
+                            ${services.map(s => `<span class="service-pill">${this.escapeHtml(s)}</span>`).join('')}
+                        </div>
+                    ` : ''}
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-top:12px; padding-top:10px; border-top:1px solid var(--separator);">
+                    <span class="last-seen-badge">${isOnline ? 'Active now' : (dev.last_seen ? new Date(dev.last_seen).toLocaleTimeString() : 'Offline')}</span>
+                    <button class="btn btn-secondary btn-reassign-tag" data-pdid="${dev.pdid}" style="padding:4px 8px; font-size:11px;">Tag: ${currentTag}</button>
+                </div>
+            </div>
+        `;
+    }
 
-    this.modalTitle.textContent = scheduleId ? 'Edit Schedule Window' : 'Create New Schedule Window';
-    this.modalBody.innerHTML = `
-      <div style="display: flex; flex-direction: column; gap: 16px;">
-        <div>
-          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Schedule Name</label>
-          <input type="text" id="sched-name" value="${name}" placeholder="e.g. Bedtime Lockout" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
-        </div>
+    openAssignTagModal(pdid) {
+        const dev = this.devices.find(d => d.pdid === pdid);
+        if (!dev) return;
 
-        <div>
-          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Timezone</label>
-          <select id="sched-tz" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary); font-weight: 600;">
-            <option value="${tz}" selected>${tz}</option>
-            <option value="UTC">UTC (Coordinated Universal Time)</option>
-            <option value="America/New_York">Eastern Time (America/New_York)</option>
-            <option value="America/Chicago">Central Time (America/Chicago)</option>
-            <option value="America/Denver">Mountain Time (America/Denver)</option>
-            <option value="America/Los_Angeles">Pacific Time (America/Los_Angeles)</option>
-            <option value="Europe/London">London / GMT (Europe/London)</option>
-            <option value="Europe/Paris">Central European (Europe/Paris)</option>
-            <option value="Asia/Tokyo">Japan Standard (Asia/Tokyo)</option>
-            <option value="Australia/Sydney">Australian Eastern (Australia/Sydney)</option>
-          </select>
-        </div>
+        const currentTag = (dev.tags && dev.tags[0]) ? dev.tags[0] : 'generic';
 
-        <div>
-          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Days Active</label>
-          <div class="day-chip-group" id="day-selector">
-            ${['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'].map((d) => {
-              const isSelected = firstRule.days && firstRule.days.includes(d);
-              return `<div class="day-chip ${isSelected ? 'selected' : ''}" data-day="${d}">${d.toUpperCase()}</div>`;
-            }).join('')}
-          </div>
-        </div>
+        let bodyHtml = `
+            <p style="font-size:14px; margin-bottom:16px;">Select tag group assignment for device <strong>${this.escapeHtml(dev.friendly_name || dev.hostname || dev.current_mac)}</strong>:</p>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+                ${this.tags.map(t => `
+                    <label style="display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border:1px solid var(--separator); border-radius:10px; cursor:pointer; background:var(--bg-tertiary);">
+                        <div style="display:flex; align-items:center; gap:10px;">
+                            <span class="group-tag-badge" style="background-color:${t.color};">${this.escapeHtml(t.name)}</span>
+                        </div>
+                        <input type="radio" name="tag_selection" value="${t.id}" ${t.id === currentTag ? 'checked' : ''}>
+                    </label>
+                `).join('')}
+            </div>
+        `;
 
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
-          <div>
-            <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Start Time</label>
-            <input type="time" id="sched-start" value="${startTime24}" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
-          </div>
-          <div>
-            <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">End Time</label>
-            <input type="time" id="sched-end" value="${endTime24}" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
-          </div>
-        </div>
+        this.openModal('Assign Device Tag Group', bodyHtml, `
+            <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+            <button class="btn btn-primary" id="modal-save-tag">Save Assignment</button>
+        `);
 
-        <div>
-          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Action Within Window</label>
-          <select id="sched-act" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
-            <option value="block" ${firstRule.action === 'block' ? 'selected' : ''}>Block Access (Downtime Window)</option>
-            <option value="allow" ${firstRule.action === 'allow' ? 'selected' : ''}>Allow Access (Whitelist Window)</option>
-          </select>
-        </div>
-      </div>
-    `;
+        document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
+        document.getElementById('modal-save-tag').addEventListener('click', async () => {
+            const selected = document.querySelector('input[name="tag_selection"]:checked');
+            if (selected) {
+                try {
+                    await API.assignDeviceTag(pdid, selected.value);
+                    this.showToast('Device tag assigned successfully', 'info');
+                    this.closeModal();
+                    await this.loadInitialDataSilently();
+                } catch (err) {
+                    this.showToast(`Failed to assign tag: ${err.message}`, 'error');
+                }
+            }
+        });
+    }
 
-    this.modalBody.querySelectorAll('.day-chip').forEach((chip) => {
-      chip.addEventListener('click', (e) => {
-        e.currentTarget.classList.toggle('selected');
-      });
-    });
+    openTagModal(tag = null) {
+        const isEdit = !!tag;
+        const bodyHtml = `
+            <form id="form-tag">
+                <div style="margin-bottom:16px;">
+                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:6px;">Tag Name</label>
+                    <input type="text" id="tag-name" value="${isEdit ? this.escapeHtml(tag.name) : ''}" placeholder="e.g. Kids Gaming" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary); font-family:inherit;" required>
+                </div>
+                <div style="margin-bottom:16px;">
+                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:6px;">Badge Color</label>
+                    <input type="color" id="tag-color" value="${isEdit ? tag.color : '#0071e3'}" style="width:100%; height:40px; border:none; border-radius:8px; cursor:pointer; background:transparent;">
+                </div>
+            </form>
+        `;
 
-    this.modalFooter.innerHTML = `<button class="btn btn-primary" id="save-sched-btn">Save Schedule</button>`;
+        this.openModal(isEdit ? 'Edit Custom Tag Group' : 'Create Custom Tag Group', bodyHtml, `
+            <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+            <button class="btn btn-primary" id="modal-save-tag-def">${isEdit ? 'Update' : 'Create'}</button>
+        `);
 
-    document.getElementById('save-sched-btn').onclick = async () => {
-      const schedName = document.getElementById('sched-name').value.trim();
-      const schedTz = document.getElementById('sched-tz').value;
-      const startTime = document.getElementById('sched-start').value;
-      const endTime = document.getElementById('sched-end').value;
-      const action = document.getElementById('sched-act').value;
+        document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
+        document.getElementById('modal-save-tag-def').addEventListener('click', async () => {
+            const name = document.getElementById('tag-name').value.trim();
+            const color = document.getElementById('tag-color').value;
 
-      const selectedDays = [];
-      this.modalBody.querySelectorAll('.day-chip.selected').forEach((chip) => {
-        selectedDays.push(chip.getAttribute('data-day'));
-      });
+            if (!name) {
+                this.showToast('Tag name is required', 'warning');
+                return;
+            }
 
-      if (!schedName || selectedDays.length === 0) {
-        this.showToast('Please enter a schedule name and select days', 'danger');
-        return;
-      }
+            try {
+                if (isEdit) {
+                    await API.updateTag(tag.id, { name, color });
+                    this.showToast('Tag group updated', 'info');
+                } else {
+                    await API.createTag({ name, color });
+                    this.showToast('Tag group created', 'info');
+                }
+                this.closeModal();
+                await this.loadInitialData();
+            } catch (err) {
+                this.showToast(`Failed to save tag: ${err.message}`, 'error');
+            }
+        });
+    }
 
-      const rule = {
-        days: selectedDays,
-        start_time: startTime,
-        end_time: endTime,
-        action: action,
-      };
+    // =========================================================================
+    // 2. SCHEDULES VIEW & RULE BUILDER
+    // =========================================================================
 
-      const payload = {
-        name: schedName,
-        timezone: schedTz,
-        rules: [rule],
-      };
+    renderSchedulesView(container) {
+        container.innerHTML = `
+            <div class="card">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+                    <div>
+                        <h3 style="font-size:18px; font-weight:700;">Time Schedules</h3>
+                        <p style="font-size:13px; color:var(--text-secondary);">Define automatic internet allowance and bedtime block windows</p>
+                    </div>
+                    <button class="btn btn-primary" id="btn-create-schedule">+ Create Schedule</button>
+                </div>
+                <div>
+                    ${this.schedules.length === 0 ? '<p style="color:var(--text-secondary); font-size:14px;">No schedules configured yet.</p>' : ''}
+                    ${this.schedules.map(s => `
+                        <div class="card" style="box-shadow:none; border:1px solid var(--separator); margin-bottom:14px; padding:16px;">
+                            <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">
+                                <div>
+                                    <h4 style="font-size:16px; font-weight:700;">${this.escapeHtml(s.name)}</h4>
+                                    <span style="font-size:12px; color:var(--text-secondary);">Timezone: ${this.escapeHtml(s.timezone || 'UTC')}</span>
+                                </div>
+                                <div style="display:flex; gap:8px;">
+                                    <button class="btn btn-secondary btn-edit-sched" data-sched-id="${s.id}" style="padding:6px 12px; font-size:12px;">Edit</button>
+                                    <button class="btn btn-danger btn-delete-sched" data-sched-id="${s.id}" style="padding:6px 12px; font-size:12px;">Delete</button>
+                                </div>
+                            </div>
+                            <div style="display:flex; flex-direction:column; gap:6px;">
+                                ${(s.rules || []).map(r => `
+                                    <div style="font-size:13px; background:var(--bg-tertiary); padding:8px 12px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;">
+                                        <span><strong>${(r.days || []).join(', ').toUpperCase()}:</strong> ${r.start_time} - ${r.end_time}</span>
+                                        <span class="group-tag-badge" style="background-color:${r.action === 'allow' ? 'var(--success)' : 'var(--danger)'}; padding:2px 8px; font-size:10px;">${r.action.toUpperCase()}</span>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+        `;
 
-      try {
-        if (scheduleId) {
-          payload.id = scheduleId;
-          const updated = await API.updateSchedule(scheduleId, payload);
-          const idx = (this.schedules || []).findIndex((s) => s && s.id === scheduleId);
-          if (idx !== -1) this.schedules[idx] = updated;
-          this.showToast('Schedule updated successfully', 'success');
+        document.getElementById('btn-create-schedule').addEventListener('click', () => this.openScheduleModal());
+
+        container.querySelectorAll('.btn-edit-sched').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const schedId = e.currentTarget.dataset.schedId;
+                const sched = this.schedules.find(s => s.id === schedId);
+                if (sched) this.openScheduleModal(sched);
+            });
+        });
+
+        container.querySelectorAll('.btn-delete-sched').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                const schedId = e.currentTarget.dataset.schedId;
+                if (confirm('Are you sure you want to delete this schedule?')) {
+                    try {
+                        await API.deleteSchedule(schedId);
+                        this.showToast('Schedule deleted', 'info');
+                        await this.loadInitialData();
+                    } catch (err) {
+                        this.showToast(`Failed to delete schedule: ${err.message}`, 'error');
+                    }
+                }
+            });
+        });
+    }
+
+    openScheduleModal(schedule = null) {
+        const isEdit = !!schedule;
+        let rules = isEdit && schedule.rules ? JSON.parse(JSON.stringify(schedule.rules)) : [
+            { days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_time: '22:00', end_time: '06:00', action: 'block' }
+        ];
+
+        const renderRulesEditor = () => {
+            return rules.map((r, idx) => `
+                <div style="background:var(--bg-tertiary); padding:14px; border-radius:12px; border:1px solid var(--separator); margin-bottom:12px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                        <span style="font-size:12px; font-weight:700;">Rule #${idx + 1}</span>
+                        ${rules.length > 1 ? `<button type="button" class="btn btn-danger btn-remove-rule" data-idx="${idx}" style="padding:2px 6px; font-size:11px;">Remove</button>` : ''}
+                    </div>
+                    <div style="margin-bottom:8px;">
+                        <label style="display:block; font-size:11px; font-weight:600; margin-bottom:4px;">Days Active</label>
+                        <div class="day-chip-group">
+                            ${['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].map(day => `
+                                <div class="day-chip ${r.days.includes(day) ? 'selected' : ''}" data-rule-idx="${idx}" data-day="${day}">${day.toUpperCase()}</div>
+                            `).join('')}
+                        </div>
+                    </div>
+                    <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px; align-items:center;">
+                        <div>
+                            <label style="display:block; font-size:11px; font-weight:600; margin-bottom:2px;">Start Time</label>
+                            <input type="time" class="rule-start" data-rule-idx="${idx}" value="${r.start_time}" style="width:100%;">
+                        </div>
+                        <div>
+                            <label style="display:block; font-size:11px; font-weight:600; margin-bottom:2px;">End Time</label>
+                            <input type="time" class="rule-end" data-rule-idx="${idx}" value="${r.end_time}" style="width:100%;">
+                        </div>
+                        <div>
+                            <label style="display:block; font-size:11px; font-weight:600; margin-bottom:2px;">Action</label>
+                            <select class="rule-action" data-rule-idx="${idx}" style="width:100%; padding:9px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-secondary); color:var(--text-primary); font-size:13px;">
+                                <option value="block" ${r.action === 'block' ? 'selected' : ''}>BLOCK</option>
+                                <option value="allow" ${r.action === 'allow' ? 'selected' : ''}>ALLOW</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        };
+
+        const updateModalBody = () => {
+            const bodyHtml = `
+                <form id="form-schedule">
+                    <div style="margin-bottom:14px;">
+                        <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Schedule Name</label>
+                        <input type="text" id="sched-name" value="${isEdit ? this.escapeHtml(schedule.name) : ''}" placeholder="e.g. Bedtime Curfew" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);" required>
+                    </div>
+                    <div style="margin-bottom:14px;">
+                        <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Timezone</label>
+                        <select id="sched-tz" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
+                            <option value="UTC" ${isEdit && schedule.timezone === 'UTC' ? 'selected' : ''}>UTC</option>
+                            <option value="America/Los_Angeles" ${isEdit && schedule.timezone === 'America/Los_Angeles' ? 'selected' : ''}>America/Los_Angeles (PT)</option>
+                            <option value="America/New_York" ${isEdit && schedule.timezone === 'America/New_York' ? 'selected' : ''}>America/New_York (ET)</option>
+                            <option value="Europe/London" ${isEdit && schedule.timezone === 'Europe/London' ? 'selected' : ''}>Europe/London (GMT/BST)</option>
+                            <option value="Asia/Tokyo" ${isEdit && schedule.timezone === 'Asia/Tokyo' ? 'selected' : ''}>Asia/Tokyo (JST)</option>
+                        </select>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                        <label style="font-size:13px; font-weight:600;">Time Windows</label>
+                        <button type="button" class="btn btn-secondary" id="btn-add-rule-window" style="padding:4px 10px; font-size:11px;">+ Add Window</button>
+                    </div>
+                    <div id="rules-container">${renderRulesEditor()}</div>
+                </form>
+            `;
+
+            document.getElementById('modal-body').innerHTML = bodyHtml;
+            bindRuleEvents();
+        };
+
+        const bindRuleEvents = () => {
+            document.querySelectorAll('.day-chip').forEach(chip => {
+                chip.addEventListener('click', (e) => {
+                    const ruleIdx = parseInt(e.currentTarget.dataset.ruleIdx, 10);
+                    const day = e.currentTarget.dataset.day;
+
+                    if (rules[ruleIdx].days.includes(day)) {
+                        rules[ruleIdx].days = rules[ruleIdx].days.filter(d => d !== day);
+                    } else {
+                        rules[ruleIdx].days.push(day);
+                    }
+                    updateModalBody();
+                });
+            });
+
+            document.querySelectorAll('.rule-start').forEach(input => {
+                input.addEventListener('change', (e) => {
+                    const idx = parseInt(e.target.dataset.ruleIdx, 10);
+                    rules[idx].start_time = e.target.value;
+                });
+            });
+
+            document.querySelectorAll('.rule-end').forEach(input => {
+                input.addEventListener('change', (e) => {
+                    const idx = parseInt(e.target.dataset.ruleIdx, 10);
+                    rules[idx].end_time = e.target.value;
+                });
+            });
+
+            document.querySelectorAll('.rule-action').forEach(select => {
+                select.addEventListener('change', (e) => {
+                    const idx = parseInt(e.target.dataset.ruleIdx, 10);
+                    rules[idx].action = e.target.value;
+                });
+            });
+
+            document.querySelectorAll('.btn-remove-rule').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const idx = parseInt(e.currentTarget.dataset.idx, 10);
+                    rules.splice(idx, 1);
+                    updateModalBody();
+                });
+            });
+
+            const addWindowBtn = document.getElementById('btn-add-rule-window');
+            if (addWindowBtn) {
+                addWindowBtn.addEventListener('click', () => {
+                    rules.push({ days: ['sat', 'sun'], start_time: '12:00', end_time: '18:00', action: 'allow' });
+                    updateModalBody();
+                });
+            }
+        };
+
+        this.openModal(isEdit ? 'Edit Schedule' : 'Create Schedule', '', `
+            <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+            <button class="btn btn-primary" id="modal-save-sched">${isEdit ? 'Update' : 'Create'}</button>
+        `);
+
+        updateModalBody();
+
+        document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
+        document.getElementById('modal-save-sched').addEventListener('click', async () => {
+            const name = document.getElementById('sched-name').value.trim();
+            const timezone = document.getElementById('sched-tz').value;
+
+            if (!name) {
+                this.showToast('Schedule name is required', 'warning');
+                return;
+            }
+
+            try {
+                const payload = {
+                    id: isEdit ? schedule.id : undefined,
+                    name,
+                    timezone,
+                    rules
+                };
+                await API.saveSchedule(payload);
+                this.showToast('Schedule saved successfully', 'info');
+                this.closeModal();
+                await this.loadInitialData();
+            } catch (err) {
+                this.showToast(`Failed to save schedule: ${err.message}`, 'error');
+            }
+        });
+    }
+
+    // =========================================================================
+    // 3. POLICIES VIEW
+    // =========================================================================
+
+    renderPoliciesView(container) {
+        container.innerHTML = `
+            <div class="card">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+                    <div>
+                        <h3 style="font-size:18px; font-weight:700;">Firewall Rule Policies</h3>
+                        <p style="font-size:13px; color:var(--text-secondary);">Manage Precedence Hierarchy (Infrastructure > Global > Device > Tag)</p>
+                    </div>
+                    <button class="btn btn-primary" id="btn-create-policy">+ Create Policy Rule</button>
+                </div>
+                <div>
+                    ${this.policies.length === 0 ? '<p style="color:var(--text-secondary); font-size:14px;">No custom policies configured.</p>' : ''}
+                    ${this.policies.map(p => `
+                        <div class="card" style="box-shadow:none; border:1px solid var(--separator); margin-bottom:12px; padding:16px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <div>
+                                    <h4 style="font-size:15px; font-weight:700;">${this.escapeHtml(p.name)}</h4>
+                                    <div style="font-size:12px; color:var(--text-secondary); margin-top:2px;">
+                                        Type: <strong>${p.type.toUpperCase()}</strong> | Target: ${p.target_id || 'Global'} | Priority: ${p.priority}
+                                    </div>
+                                </div>
+                                <div style="display:flex; align-items:center; gap:10px;">
+                                    <span class="group-tag-badge" style="background-color:${p.action === 'allow' ? 'var(--success)' : (p.action === 'block' ? 'var(--danger)' : 'var(--accent)')};">
+                                        ${p.action.toUpperCase()} ${p.schedule_id ? `(${p.schedule_id})` : ''}
+                                    </span>
+                                    ${p.id !== 'global_default' ? `
+                                        <button class="btn btn-danger btn-delete-policy" data-policy-id="${p.id}" style="padding:4px 8px; font-size:11px;">Delete</button>
+                                    ` : ''}
+                                </div>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+        `;
+
+        document.getElementById('btn-create-policy').addEventListener('click', () => this.openPolicyModal());
+
+        container.querySelectorAll('.btn-delete-policy').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                const polId = e.currentTarget.dataset.policyId;
+                if (confirm('Are you sure you want to delete this policy rule?')) {
+                    try {
+                        await API.deletePolicy(polId);
+                        this.showToast('Policy deleted', 'info');
+                        await this.loadInitialData();
+                    } catch (err) {
+                        this.showToast(`Failed to delete policy: ${err.message}`, 'error');
+                    }
+                }
+            });
+        });
+    }
+
+    openPolicyModal() {
+        const bodyHtml = `
+            <form id="form-policy">
+                <div style="margin-bottom:14px;">
+                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Policy Name</label>
+                    <input type="text" id="pol-name" placeholder="e.g. Block Kids Gaming Bedtime" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);" required>
+                </div>
+                <div style="margin-bottom:14px;">
+                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Policy Type Scope</label>
+                    <select id="pol-type" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
+                        <option value="tag">Tag Group Policy</option>
+                        <option value="device">Single Device Policy</option>
+                    </select>
+                </div>
+                <div style="margin-bottom:14px;" id="target-container">
+                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Target Tag Group</label>
+                    <select id="pol-target" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
+                        ${this.tags.map(t => `<option value="${t.id}">${this.escapeHtml(t.name)}</option>`).join('')}
+                    </select>
+                </div>
+                <div style="margin-bottom:14px;">
+                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Enforcement Action</label>
+                    <select id="pol-action" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
+                        <option value="schedule">Schedule Driven</option>
+                        <option value="block">BLOCK Always</option>
+                        <option value="allow">ALLOW Always</option>
+                    </select>
+                </div>
+                <div style="margin-bottom:14px;" id="sched-select-container">
+                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Select Schedule</label>
+                    <select id="pol-sched-id" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
+                        ${this.schedules.map(s => `<option value="${s.id}">${this.escapeHtml(s.name)}</option>`).join('')}
+                    </select>
+                </div>
+            </form>
+        `;
+
+        this.openModal('Create Policy Rule', bodyHtml, `
+            <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+            <button class="btn btn-primary" id="modal-save-pol">Create Policy</button>
+        `);
+
+        const typeSelect = document.getElementById('pol-type');
+        const targetContainer = document.getElementById('target-container');
+
+        typeSelect.addEventListener('change', (e) => {
+            if (e.target.value === 'device') {
+                targetContainer.innerHTML = `
+                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Target Device</label>
+                    <select id="pol-target" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
+                        ${this.devices.map(d => `<option value="${d.pdid}">${this.escapeHtml(d.friendly_name || d.hostname || d.current_mac)}</option>`).join('')}
+                    </select>
+                `;
+            } else {
+                targetContainer.innerHTML = `
+                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Target Tag Group</label>
+                    <select id="pol-target" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
+                        ${this.tags.map(t => `<option value="${t.id}">${this.escapeHtml(t.name)}</option>`).join('')}
+                    </select>
+                `;
+            }
+        });
+
+        const actionSelect = document.getElementById('pol-action');
+        const schedContainer = document.getElementById('sched-select-container');
+
+        actionSelect.addEventListener('change', (e) => {
+            schedContainer.style.display = e.target.value === 'schedule' ? 'block' : 'none';
+        });
+
+        document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
+        document.getElementById('modal-save-pol').addEventListener('click', async () => {
+            const name = document.getElementById('pol-name').value.trim();
+            const type = document.getElementById('pol-type').value;
+            const target_id = document.getElementById('pol-target').value;
+            const action = document.getElementById('pol-action').value;
+            const schedule_id = action === 'schedule' ? document.getElementById('pol-sched-id').value : undefined;
+
+            if (!name) {
+                this.showToast('Policy name is required', 'warning');
+                return;
+            }
+
+            try {
+                await API.savePolicy({
+                    name,
+                    type,
+                    target_id,
+                    action,
+                    schedule_id,
+                    priority: type === 'device' ? 80 : 50
+                });
+                this.showToast('Policy created', 'info');
+                this.closeModal();
+                await this.loadInitialData();
+            } catch (err) {
+                this.showToast(`Failed to create policy: ${err.message}`, 'error');
+            }
+        });
+    }
+
+    // =========================================================================
+    // 4. SETTINGS & MAINTENANCE VIEW
+    // =========================================================================
+
+    renderSettingsView(container) {
+        container.innerHTML = `
+            <div class="card">
+                <h3 style="font-size:18px; font-weight:700; margin-bottom:12px;">System Architecture & Status</h3>
+                <p style="font-size:13px; color:var(--text-secondary); margin-bottom:20px;">
+                    LIAS is operating in isolated Netdev Ingress mode on <strong>eth0</strong>. All firewall filtering is executed directly in kernel space without altering routing tables or system sing-box rules.
+                </p>
+
+                <div style="display:flex; flex-direction:column; gap:12px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; padding:12px; background:var(--bg-tertiary); border-radius:10px;">
+                        <div>
+                            <strong>Flush Nftables Kernel Sets</strong>
+                            <p style="font-size:12px; color:var(--text-secondary);">Removes all active allowed and blocked IP/MAC sets from netdev lancontrol table.</p>
+                        </div>
+                        <button class="btn btn-danger" id="btn-flush-nftables">Flush Table</button>
+                    </div>
+
+                    <div style="display:flex; justify-content:space-between; align-items:center; padding:12px; background:var(--bg-tertiary); border-radius:10px;">
+                        <div>
+                            <strong>Resync DIS Inventory</strong>
+                            <p style="font-size:12px; color:var(--text-secondary);">Force an immediate REST polling resync from Discovery Intelligence Service (:8080).</p>
+                        </div>
+                        <button class="btn btn-secondary" id="btn-force-resync">Force Resync</button>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.getElementById('btn-flush-nftables').addEventListener('click', async () => {
+            if (confirm('Are you sure you want to flush the netdev lancontrol nftables table?')) {
+                try {
+                    await API.flushNftables();
+                    this.showToast('nftables table flushed successfully', 'info');
+                } catch (err) {
+                    this.showToast(`Failed to flush nftables: ${err.message}`, 'error');
+                }
+            }
+        });
+
+        document.getElementById('btn-force-resync').addEventListener('click', async () => {
+            this.showToast('Triggering DIS inventory resync...', 'info');
+            await this.loadInitialData();
+            this.showToast('Inventory resync complete', 'info');
+        });
+    }
+
+    // =========================================================================
+    // 5. MODAL & TOAST HELPERS
+    // =========================================================================
+
+    openModal(title, bodyHtml, footerHtml) {
+        const root = document.getElementById('modal-root');
+        const titleEl = document.getElementById('modal-title');
+        const bodyEl = document.getElementById('modal-body');
+        const footerEl = document.getElementById('modal-footer');
+
+        if (!root || !titleEl || !bodyEl || !footerEl) return;
+
+        titleEl.textContent = title;
+        bodyEl.innerHTML = bodyHtml;
+        footerEl.innerHTML = footerHtml;
+
+        root.classList.remove('hidden');
+    }
+
+    closeModal() {
+        const root = document.getElementById('modal-root');
+        if (root) {
+            root.classList.add('hidden');
+        }
+    }
+
+    showToast(message, type = 'info') {
+        const root = document.getElementById('toast-root');
+        if (!root) return;
+
+        const toast = document.createElement('div');
+        toast.className = 'toast';
+        if (type === 'error') {
+            toast.style.borderLeft = '4px solid var(--danger)';
+        } else if (type === 'warning') {
+            toast.style.borderLeft = '4px solid var(--warning)';
         } else {
-          const created = await API.createSchedule(payload);
-          this.schedules.push(created);
-          this.showToast(`Schedule created (${schedTz})`, 'success');
+            toast.style.borderLeft = '4px solid var(--accent)';
         }
 
-        this.hideModal();
-        this.renderSchedulesView();
-      } catch (err) {
-        this.showToast('Failed to save schedule', 'danger');
-      }
-    };
+        toast.textContent = message;
+        root.appendChild(toast);
 
-    this.showModal();
-  }
+        setTimeout(() => {
+            toast.remove();
+        }, 3500);
+    }
 
-  openTagPolicyModal(tagId) {
-    const tag = (this.tags || []).find((t) => t && t.id === tagId);
-    if (!tag) return;
-
-    this.modalTitle.textContent = `Attach Policy / Schedule to ${tag.name}`;
-    this.modalBody.innerHTML = `
-      <div style="display: flex; flex-direction: column; gap: 16px;">
-        <div>
-          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Rule Name</label>
-          <input type="text" id="tag-pol-name" value="${tag.name} Access Rule" placeholder="Rule Name" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
-        </div>
-
-        <div>
-          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Access Action</label>
-          <select id="tag-act-select" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
-            <option value="allow">Always Allow Group Devices</option>
-            <option value="block">Always Block Group Devices</option>
-            <option value="schedule">Apply Time Schedule to Group</option>
-          </select>
-        </div>
-
-        <div id="tag-sched-container" style="display: none;">
-          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Select Time Schedule</label>
-          <select id="tag-sched-select" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
-            ${(this.schedules || []).map((s) => `<option value="${s.id}">${s.name} (${s.timezone})</option>`).join('')}
-          </select>
-        </div>
-      </div>
-    `;
-
-    const actSelect = document.getElementById('tag-act-select');
-    const schedContainer = document.getElementById('tag-sched-container');
-
-    actSelect.addEventListener('change', (e) => {
-      schedContainer.style.display = e.target.value === 'schedule' ? 'block' : 'none';
-    });
-
-    this.modalFooter.innerHTML = `<button class="btn btn-primary" id="save-tag-pol-btn">Attach Policy</button>`;
-
-    document.getElementById('save-tag-pol-btn').onclick = async () => {
-      const polName = document.getElementById('tag-pol-name').value;
-      const action = actSelect.value;
-      const schedId = document.getElementById('tag-sched-select').value;
-
-      const policyPayload = {
-        name: polName || `${tag.name} Access Rule`,
-        type: 'tag',
-        target_id: tagId,
-        action: action,
-        priority: 50,
-      };
-
-      if (action === 'schedule') {
-        policyPayload.schedule_id = schedId;
-      }
-
-      try {
-        const created = await API.createPolicy(policyPayload);
-        this.policies.push(created);
-        this.showToast(`Policy attached to ${tag.name}`, 'success');
-        this.hideModal();
-        this.renderDevicesView();
-      } catch (err) {
-        this.showToast('Failed to attach policy', 'danger');
-      }
-    };
-
-    this.showModal();
-  }
-
-  showModal() { if (this.modalRoot) this.modalRoot.classList.remove('hidden'); }
-  hideModal() { if (this.modalRoot) this.modalRoot.classList.add('hidden'); }
-
-  showToast(message, type = 'info') {
-    if (!this.toastRoot) return;
-    const toast = document.createElement('div');
-    toast.className = `toast ${type}`;
-    toast.textContent = message;
-    this.toastRoot.appendChild(toast);
-    setTimeout(() => { toast.remove(); }, 3000);
-  }
+    escapeHtml(str) {
+        if (!str) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  window.app = new LiasDashboard();
+    window.app = new AppController();
 });
