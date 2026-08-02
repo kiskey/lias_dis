@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/pihole_provider.go
-// Version: 1.3
+// Version: 1.4
 package discovery
 
 import (
@@ -125,7 +125,6 @@ func (p *PiholeProvider) poll() {
 		return
 	}
 
-	// Send triple-header fallback (sid header, X-FTL-SID header, and SID Cookie)
 	req.Header.Set("sid", p.sid)
 	req.Header.Set("X-FTL-SID", p.sid)
 	req.Header.Set("Cookie", "SID="+p.sid)
@@ -190,7 +189,6 @@ func (p *PiholeProvider) poll() {
 			macObj, _ = net.ParseMAC(c.Mac)
 		}
 
-		// Filter Multicast and Loopback targets
 		if IsMulticastOrBroadcast(macObj, ipObj) {
 			continue
 		}
@@ -199,7 +197,7 @@ func (p *PiholeProvider) poll() {
 			Source:     p.Name(),
 			IP:         ipObj,
 			MAC:        macObj,
-			Hostname:   UnescapeHostname(c.Name),
+			Hostname:   UnescapeHostname(c.Name), // Calls UnescapeHostname in package discovery
 			Online:     true,
 			Confidence: 0.3,
 			Timestamp:  time.Now(),
