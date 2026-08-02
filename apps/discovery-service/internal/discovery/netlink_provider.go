@@ -2,13 +2,14 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 1.5
+// Version: 1.6
 package discovery
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -17,19 +18,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// NetlinkProvider subscribes to the Linux kernel neighbor table (ARP/NDP)
-// to provide real-time, authoritative device presence data with minimal CPU impact.
 type NetlinkProvider struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	events    chan Observation
 	done      chan struct{}
 	iface     string
-	targetIdx int // Cached interface index to avoid per-event syscall churn
+	targetIdx int
 	mu        sync.RWMutex
 }
 
-// NewNetlinkProvider initializes the netlink subscriber for a specific interface.
 func NewNetlinkProvider(iface string) *NetlinkProvider {
 	return &NetlinkProvider{
 		events: make(chan Observation, 256),
@@ -38,19 +36,15 @@ func NewNetlinkProvider(iface string) *NetlinkProvider {
 	}
 }
 
-// Name returns the provider's identifier.
 func (p *NetlinkProvider) Name() string { return "netlink" }
 
-// Start begins listening for neighbor updates. It resolves the interface index
-// once at startup and uses ListExisting: true to seed the device inventory atomically.
 func (p *NetlinkProvider) Start(ctx context.Context) error {
 	p.ctx, p.cancel = context.WithCancel(ctx)
 
-	// Resolve and cache target interface index
 	if p.iface != "" {
 		link, err := netlink.LinkByName(p.iface)
 		if err != nil {
-			slog.Warn("Target interface not found immediately, will process all netlink events", "iface", p.iface, "error", err)
+			slog.Warn("Target interface not found immediately", "iface", p.iface, "error", err)
 			p.targetIdx = 0
 		} else {
 			p.targetIdx = link.Attrs().Index
@@ -89,31 +83,29 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
 	return nil
 }
 
-// handleNeighUpdate inspects kernel neighbor states and dispatches observations.
 func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
 	n := update.Neigh
 
-	// 1. Interface index filtering using cached index (Zero syscall overhead)
 	if p.targetIdx > 0 && n.LinkIndex != p.targetIdx {
 		return
 	}
 
-	// 2. Hardware address sanity check
 	if n.HardwareAddr == nil || len(n.HardwareAddr) != 6 {
 		return
 	}
 
-	// 3. Filter by Netlink state and type
-	// Explicitly evaluate kernel NUD (Neighbor Unreachability Detection) flags
+	// Filter out Broadcast and Multicast MAC/IP addresses
+	if IsMulticastOrBroadcast(n.HardwareAddr, n.IP) {
+		return
+	}
+
 	isFailed := (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0
 	isOnline := !isFailed && (n.State&(unix.NUD_REACHABLE|unix.NUD_PERMANENT|unix.NUD_STALE|unix.NUD_DELAY|unix.NUD_NOARP)) != 0
 
-	// Handle explicit deletion events (RTM_DELNEIGH = 29)
 	if update.Type == unix.RTM_DELNEIGH {
 		isOnline = false
 	}
 
-	// Perform fast OUI vendor lookup
 	vendor := oui.Lookup(n.HardwareAddr.String())
 
 	obs := Observation{
@@ -122,7 +114,7 @@ func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
 		IP:         n.IP,
 		Vendor:     vendor,
 		Online:     isOnline,
-		Confidence: 0.95, // High confidence for Netlink
+		Confidence: 0.95,
 		Timestamp:  time.Now(),
 	}
 
@@ -133,7 +125,33 @@ func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
 	}
 }
 
-// Stop terminates the netlink subscription and closes channels.
+// IsMulticastOrBroadcast returns true if a MAC or IP address belongs to multicast/broadcast groups.
+func IsMulticastOrBroadcast(mac net.HardwareAddr, ip net.IP) bool {
+	if mac != nil && len(mac) == 6 {
+		// IPv4 Multicast MAC prefix (01:00:5e)
+		if mac[0] == 0x01 && mac[1] == 0x00 && mac[2] == 0x5e {
+			return true
+		}
+		// IPv6 Multicast MAC prefix (33:33)
+		if mac[0] == 0x33 && mac[1] == 0x33 {
+			return true
+		}
+		// Ethernet Broadcast MAC (ff:ff:ff:ff:ff:ff)
+		if mac[0] == 0xff && mac[1] == 0xff && mac[2] == 0xff && mac[3] == 0xff && mac[4] == 0xff && mac[5] == 0xff {
+			return true
+		}
+	}
+
+	if ip != nil {
+		// IPv4 Multicast (224.0.0.0/4) or Broadcast (255.255.255.255)
+		if ip.IsMulticast() || ip.IsLoopback() || ip.IsUnspecified() || ip.Equal(net.IPv4bcast) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (p *NetlinkProvider) Stop() error {
 	if p.cancel != nil {
 		p.cancel()
@@ -142,7 +160,6 @@ func (p *NetlinkProvider) Stop() error {
 	return nil
 }
 
-// Events returns the read-only channel for observations.
 func (p *NetlinkProvider) Events() <-chan Observation {
 	return p.events
 }
