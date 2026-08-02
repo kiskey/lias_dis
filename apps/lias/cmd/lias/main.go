@@ -1,7 +1,7 @@
 // Binary lias implements the LAN Internet Access Scheduler.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 1.4
+// Version: 1.5
 package main
 
 import (
@@ -53,12 +53,14 @@ func main() {
 	schedEng := schedule.NewEngine(cache)
 
 	// SQLite Storage Engine
-	store, err := storage.NewStorage(cfg.Storage.Path)
+	var store *storage.Storage
+	st, err := storage.NewStorage(cfg.Storage.Path)
 	if err != nil {
 		slog.Warn("Storage initialization failed, running in memory-only mode", "error", err)
 	} else {
-		defer store.Close()
-		_ = store.LoadHydrate(tagMgr, polEng, schedEng)
+		defer st.Close()
+		_ = st.LoadHydrate(tagMgr, polEng, schedEng)
+		store = st
 	}
 
 	// DIS Client
@@ -82,9 +84,9 @@ func main() {
 	go schedEng.Run(ctx)
 	go nftSync.Run(ctx)
 
-	// API Handlers
+	// API Handlers (Passing all 7 required dependencies including store)
 	mux := http.NewServeMux()
-	handlers := liasAPI.NewHandlers(cache, tagMgr, polEng, schedEng, nftCtrl, trigger)
+	handlers := liasAPI.NewHandlers(cache, tagMgr, polEng, schedEng, nftCtrl, store, trigger)
 	handlers.RegisterRoutes(mux)
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
