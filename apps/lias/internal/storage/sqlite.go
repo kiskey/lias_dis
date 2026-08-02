@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 1.3
+// Version: 1.4
 package storage
 
 import (
@@ -40,7 +40,7 @@ func NewStorage(dbPath string) (*Storage, error) {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
 
-	// FIX: Enable WAL mode and busy timeout to prevent write lock contention
+	// Enable WAL mode and busy timeout to eliminate write lock contention
 	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
 		slog.Warn("Failed to set PRAGMAs on LIAS database", "error", err)
 	}
@@ -113,7 +113,7 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 	deviceTags := make(map[string]string)
 	macTags := make(map[string]string)
 
-	// 1. Hydrate Tags - FIX: Preserve restored tag ID and Precedence
+	// 1. Hydrate Tags - Preserves original restored tag ID and Precedence
 	rows, err := s.db.Query("SELECT id, name, color, precedence, builtin FROM tags")
 	if err == nil {
 		defer rows.Close()
