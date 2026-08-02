@@ -1,7 +1,7 @@
 /*
  * LIAS Control Center - Main Dashboard Application
  * File:    apps/lias/web/src/main.js
- * Version: 1.6 (Collapsible Groups, In-Place Schedule Editing, Persistent Global Switch)
+ * Version: 1.7 (Complete Device Math Resolution, Service Pills, Relative Timestamps & Real-time SSE)
  */
 
 import { API } from './api.js';
@@ -19,6 +19,7 @@ class LiasDashboard {
     this.initDOM();
     this.initEvents();
     this.loadInitialData();
+    this.initRealtimeEvents();
   }
 
   initDOM() {
@@ -55,7 +56,14 @@ class LiasDashboard {
     }
   }
 
-  async loadInitialData() {
+  initRealtimeEvents() {
+    API.subscribeEvents((evt) => {
+      // Re-fetch data upon real-time DIS/LIAS network events
+      this.loadInitialDataSilently();
+    });
+  }
+
+  async loadInitialDataSilently() {
     try {
       const [devRes, tagRes, polRes, schedRes] = await Promise.all([
         API.getDevices(),
@@ -71,8 +79,15 @@ class LiasDashboard {
 
       this.renderCurrentView();
     } catch (err) {
+      console.error('Silent refresh failed:', err);
+    }
+  }
+
+  async loadInitialData() {
+    try {
+      await this.loadInitialDataSilently();
+    } catch (err) {
       this.showToast('Failed to load system data', 'danger');
-      console.error(err);
     }
   }
 
@@ -117,9 +132,28 @@ class LiasDashboard {
     }
   }
 
+  formatLastSeen(isoStr, isOnline) {
+    if (isOnline) return '<span style="color: var(--success); font-weight: 600;">Online Now</span>';
+    if (!isoStr) return '<span style="color: var(--text-secondary);">Offline</span>';
+
+    try {
+      const date = new Date(isoStr);
+      const now = new Date();
+      const diffMs = now - date;
+      const diffMins = Math.floor(diffMs / 60000);
+      const diffHours = Math.floor(diffMins / 60);
+
+      if (diffMins < 1) return 'Offline • Just now';
+      if (diffMins < 60) return `Offline • ${diffMins}m ago`;
+      if (diffHours < 24) return `Offline • ${diffHours}h ago`;
+      return `Offline • ${date.toLocaleDateString()}`;
+    } catch (e) {
+      return 'Offline';
+    }
+  }
+
   renderDashboardView() {
     const onlineCount = this.devices.filter((d) => d.online).length;
-    // Default global state if unpersisted is "schedule"
     const globalPol = this.policies.find((p) => p.id === 'global_default') || { action: 'schedule' };
 
     this.viewContainer.innerHTML = `
@@ -183,10 +217,33 @@ class LiasDashboard {
     this.renderDevicesView();
   }
 
+  getEffectiveTags() {
+    // FIX: Guarantees 100% of devices render by dynamically building active tag groups
+    const tagMap = new Map();
+    this.tags.forEach((t) => tagMap.set(t.id, t));
+
+    // Fallback registration for any tag referenced by an active device
+    this.devices.forEach((d) => {
+      const tagId = (d.tags && d.tags[0]) || 'generic';
+      if (!tagMap.has(tagId)) {
+        tagMap.set(tagId, {
+          id: tagId,
+          name: tagId.charAt(0).toUpperCase() + tagId.slice(1).replace(/_/g, ' '),
+          color: '#0071e3',
+          precedence: 50,
+          builtin: false,
+        });
+      }
+    });
+
+    return Array.from(tagMap.values());
+  }
+
   renderDevicesView() {
     let html = `<div style="display: flex; flex-direction: column; gap: 24px;">`;
+    const effectiveTags = this.getEffectiveTags();
 
-    this.tags.forEach((tag) => {
+    effectiveTags.forEach((tag) => {
       const groupDevs = this.devices.filter((d) => {
         const devTag = (d.tags && d.tags[0]) || 'generic';
         const matchesGroup = devTag === tag.id;
@@ -247,18 +304,29 @@ class LiasDashboard {
         html += `<p style="font-size: 13px; color: var(--text-secondary); padding: 8px 0;">No devices in this group.</p>`;
       } else {
         groupDevs.forEach((d) => {
-          const onlineDot = d.online ? '#34c759' : '#8e8e93';
           const vendorName = d.vendor || d.manufacturer || 'Generic Hardware';
+          const lastSeenHTML = this.formatLastSeen(d.last_seen, d.online);
+
+          let servicePills = '';
+          if (d.services && d.services.length > 0) {
+            servicePills = `
+              <div class="service-pill-list">
+                ${d.services.map((svc) => `<span class="service-pill"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle></svg>${svc}</span>`).join('')}
+              </div>
+            `;
+          }
 
           html += `
-            <div style="display: flex; align-items: center; justify-content: space-between; background: var(--bg-tertiary); padding: 12px 16px; border-radius: 12px;">
-              <div style="display: flex; align-items: center; gap: 14px;">
-                <div style="width: 10px; height: 10px; border-radius: 50%; background-color: ${onlineDot}; flex-shrink: 0;"></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; background: var(--bg-tertiary); padding: 14px 16px; border-radius: 12px; border: 1px solid var(--separator);">
+              <div style="display: flex; align-items: flex-start; gap: 14px;">
+                <div class="status-indicator ${d.online ? 'online' : 'offline'}" style="margin-top: 4px;" title="${d.online ? 'Online' : 'Offline'}"></div>
                 <div>
                   <h4 style="font-size: 15px; font-weight: 600;">${d.friendly_name || d.hostname || 'Unknown Device'}</h4>
                   <p style="font-size: 12px; color: var(--text-secondary); margin-top: 2px;">
                     ${d.current_ip || 'No IP'} &bull; ${d.current_mac || 'No MAC'} &bull; ${vendorName}
                   </p>
+                  <div style="margin-top: 4px; font-size: 11px;">${lastSeenHTML}</div>
+                  ${servicePills ? `<div style="margin-top: 8px;">${servicePills}</div>` : ''}
                 </div>
               </div>
               <div>
@@ -277,7 +345,6 @@ class LiasDashboard {
     html += `</div>`;
     this.viewContainer.innerHTML = html;
 
-    // Expand / Collapse Group Trigger
     this.viewContainer.querySelectorAll('[data-toggle-group]').forEach((header) => {
       header.addEventListener('click', (e) => {
         const tagId = e.currentTarget.getAttribute('data-toggle-group');
