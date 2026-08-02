@@ -1,161 +1,132 @@
 // Package tags manages the built-in and custom device tags for LIAS.
-// It enforces the one-tag-per-device rule and handles tag precedence.
 //
 // File:    apps/lias/internal/tags/manager.go
-// Version: 1.1
+// Version: 1.2
 package tags
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"strings"
+	"sync"
 )
 
 // Tag represents a classification label applied to devices.
 type Tag struct {
-    ID         string `json:"id"`
-    Name       string `json:"name"`
-    Color      string `json:"color"`
-    Precedence int    `json:"precedence"`
-    Builtin    bool   `json:"builtin"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Color      string `json:"color"`
+	Precedence int    `json:"precedence"`
+	Builtin    bool   `json:"builtin"`
 }
 
-// Manager handles the collection of available tags and their precedence.
+// Manager handles available tags and their evaluation precedence.
 type Manager struct {
-    mu   sync.RWMutex
-    tags []Tag
+	mu   sync.RWMutex
+	tags []Tag
 }
 
-// NewManager initializes the tag manager with built-in tags.
+// NewManager initializes the tag manager with standard built-in tag presets.
 func NewManager() *Manager {
-    return &Manager{
-        tags: []Tag{
-            {ID: "infrastructure", Name: "Infrastructure", Color: "#8e8e93", Precedence: 100, Builtin: true},
-            {ID: "generic", Name: "Generic", Color: "#d1d1d6", Precedence: 0, Builtin: true},
-        },
-    }
+	return &Manager{
+		tags: []Tag{
+			{ID: "infrastructure", Name: "Infrastructure", Color: "#8e8e93", Precedence: 100, Builtin: true},
+			{ID: "kids", Name: "Kids Devices", Color: "#ff9500", Precedence: 80, Builtin: true},
+			{ID: "mobile", Name: "Mobile Devices", Color: "#0a84ff", Precedence: 60, Builtin: true},
+			{ID: "iot", Name: "IoT Devices", Color: "#30d158", Precedence: 40, Builtin: true},
+			{ID: "generic", Name: "Generic Devices", Color: "#636366", Precedence: 0, Builtin: true},
+		},
+	}
 }
 
-// List returns all available tags.
+// List returns all available tag groups ordered by precedence.
 func (m *Manager) List() []Tag {
-    m.mu.RLock()
-    defer m.mu.RUnlock()
-    out := make([]Tag, len(m.tags))
-    copy(out, m.tags)
-    return out
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]Tag, len(m.tags))
+	copy(out, m.tags)
+	return out
 }
 
-// Create adds a new custom tag.
+// Create adds a new custom tag group.
 func (m *Manager) Create(name, color string) (Tag, error) {
-    m.mu.Lock()
-    defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-    if name == "" {
-        return Tag{}, fmt.Errorf("tag name cannot be empty")
-    }
+	cleanName := strings.TrimSpace(name)
+	if cleanName == "" {
+		return Tag{}, fmt.Errorf("tag name cannot be empty")
+	}
 
-    for _, t := range m.tags {
-        if t.Name == name {
-            return Tag{}, fmt.Errorf("tag with name '%s' already exists", name)
-        }
-    }
+	tagID := strings.ToLower(strings.ReplaceAll(cleanName, " ", "_"))
 
-    t := Tag{
-        ID:         name, // Using name as ID for simplicity in v1.0
-        Name:       name,
-        Color:      color,
-        Precedence: 50, // Default precedence for custom tags
-        Builtin:    false,
-    }
-    m.tags = append(m.tags, t)
-    return t, nil
+	for _, t := range m.tags {
+		if t.ID == tagID || strings.EqualFold(t.Name, cleanName) {
+			return Tag{}, fmt.Errorf("tag group '%s' already exists", cleanName)
+		}
+	}
+
+	t := Tag{
+		ID:         tagID,
+		Name:       cleanName,
+		Color:      color,
+		Precedence: 50,
+		Builtin:    false,
+	}
+	m.tags = append(m.tags, t)
+	return t, nil
 }
 
-// Update modifies an existing custom tag's name and color.
-// Built-in tags cannot be modified.
+// Update modifies an existing custom tag group's name and color.
 func (m *Manager) Update(id, name, color string) (Tag, error) {
-    m.mu.Lock()
-    defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-    for i, t := range m.tags {
-        if t.ID == id {
-            if t.Builtin {
-                return Tag{}, fmt.Errorf("cannot modify built-in tag")
-            }
-            
-            if name != "" && name != t.Name {
-                // Check for name conflicts
-                for _, other := range m.tags {
-                    if other.ID != id && other.Name == name {
-                        return Tag{}, fmt.Errorf("tag name '%s' already exists", name)
-                    }
-                }
-                m.tags[i].Name = name
-            }
-            
-            if color != "" {
-                m.tags[i].Color = color
-            }
-            return m.tags[i], nil
-        }
-    }
-    return Tag{}, fmt.Errorf("tag not found")
+	for i, t := range m.tags {
+		if t.ID == id {
+			if t.Builtin {
+				return Tag{}, fmt.Errorf("cannot modify built-in system tag '%s'", t.Name)
+			}
+
+			if name != "" && name != t.Name {
+				m.tags[i].Name = name
+			}
+			if color != "" {
+				m.tags[i].Color = color
+			}
+			return m.tags[i], nil
+		}
+	}
+	return Tag{}, fmt.Errorf("tag not found")
 }
 
-// Delete removes a custom tag. Built-in tags cannot be deleted.
+// Delete removes a custom tag. Built-in tags are protected from deletion.
 func (m *Manager) Delete(id string) error {
-    m.mu.Lock()
-    defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-    for i, t := range m.tags {
-        if t.ID == id {
-            if t.Builtin {
-                return fmt.Errorf("cannot delete built-in tag")
-            }
-            m.tags = append(m.tags[:i], m.tags[i+1:]...)
-            return nil
-        }
-    }
-    return fmt.Errorf("tag not found")
+	for i, t := range m.tags {
+		if t.ID == id {
+			if t.Builtin {
+				return fmt.Errorf("cannot delete built-in system tag '%s'", t.Name)
+			}
+			m.tags = append(m.tags[:i], m.tags[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("tag not found")
 }
 
-// SetPrecedence updates the precedence of tags based on an ordered list of IDs.
-// The earlier the ID appears in the slice, the higher its precedence.
-func (m *Manager) SetPrecedence(orderedIDs []string) error {
-    m.mu.Lock()
-    defer m.mu.Unlock()
-
-    tagMap := make(map[string]Tag)
-    for _, t := range m.tags {
-        tagMap[t.ID] = t
-    }
-
-    for i, id := range orderedIDs {
-        if t, ok := tagMap[id]; ok {
-            t.Precedence = len(orderedIDs) - i
-            tagMap[id] = t
-        }
-    }
-
-    m.tags = make([]Tag, 0, len(tagMap))
-    for _, t := range tagMap {
-        m.tags = append(m.tags, t)
-    }
-    return nil
-}
-
-// GetDeviceTag retrieves the active tag for a device.
-// Enforces the one-tag-per-device rule by returning the first tag in the list,
-// or "generic" if the list is empty or the tag is unknown.
+// GetDeviceTag retrieves the active tag for a device, falling back to "generic".
 func (m *Manager) GetDeviceTag(tags []string) string {
-    if len(tags) > 0 {
-        tagID := tags[0]
-        m.mu.RLock()
-        defer m.mu.RUnlock()
-        for _, t := range m.tags {
-            if t.ID == tagID {
-                return tagID
-            }
-        }
-    }
-    return "generic"
+	if len(tags) > 0 {
+		tagID := tags[0]
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		for _, t := range m.tags {
+			if t.ID == tagID {
+				return tagID
+			}
+		}
+	}
+	return "generic"
 }
