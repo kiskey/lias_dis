@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store and persistent identity helpers for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/pdid.go
-// Version: 1.2
+// Version: 1.3
 package inventory
 
 import (
@@ -14,18 +14,6 @@ import (
 )
 
 // GeneratePDID creates a deterministic Persistent Device Identity (PDID).
-//
-// Standard BIA Guarantee:
-// Given a non-empty, static hardware MAC address (Burned-In Address), the returned PDID will ALWAYS
-// be identical across service restarts and network observations.
-//
-// LAA Private MAC Guarantee:
-// If a randomized/private MAC address is detected (Apple Private Wi-Fi / Android Private MAC)
-// AND a valid hostname is present, PDID is anchored to the normalized hostname and vendor attributes,
-// ensuring the device retains its PDID across MAC rotations.
-//
-// Tentative Fallback:
-// If MAC is empty, a tentative identity seed is derived from hostname and vendor attributes.
 func GeneratePDID(mac string, hostname string, vendor string) string {
 	cleanMAC := NormalizeMAC(mac)
 	cleanHost := strings.ToLower(strings.TrimSpace(hostname))
@@ -58,8 +46,7 @@ func GeneratePDID(mac string, hostname string, vendor string) string {
 	return "pdid_" + hex.EncodeToString(h.Sum(nil))[:16]
 }
 
-// NormalizeMAC cleans and formats hardware addresses to colon-separated lowercase form (e.g. "aa:bb:cc:dd:ee:ff").
-// Returns an empty string if the input is nil or invalid.
+// NormalizeMAC cleans and formats hardware addresses to colon-separated lowercase form.
 func NormalizeMAC(macStr string) string {
 	if macStr == "" {
 		return ""
