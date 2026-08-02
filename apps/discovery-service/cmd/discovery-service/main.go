@@ -1,7 +1,7 @@
 // Binary discovery-service implements the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 1.4
+// Version: 1.5
 package main
 
 import (
@@ -30,7 +30,6 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	// Pre-load embedded IEEE OUI vendor database
 	_ = oui.Get()
 
 	cfgPath := "/etc/dis/config.yaml"
@@ -53,7 +52,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Initialize Providers
 	var providers []discovery.DiscoveryProvider
 	if cfg.Discovery.Netlink.Enabled {
 		providers = append(providers, discovery.NewNetlinkProvider(cfg.Discovery.Interface))
@@ -73,7 +71,6 @@ func main() {
 		}
 	}
 
-	// Initialize Enrichers
 	var primaries []discovery.Enricher
 	if cfg.Discovery.Enrichment.AvahiEnabled {
 		e := discovery.NewAvahiEnricher()
@@ -101,7 +98,6 @@ func main() {
 	orch := discovery.NewOrchestrator(cache, broker, primaries, fallback)
 	eng.SetOrchestrator(orch)
 
-	// Start correlation loop
 	eng.Run(ctx, providers)
 
 	mux := http.NewServeMux()
@@ -121,7 +117,7 @@ func main() {
 		Addr:         cfg.HTTP.Listen,
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: 0, // Set WriteTimeout to 0 (unlimited) for long-lived SSE streams
 		IdleTimeout:  120 * time.Second,
 	}
 
