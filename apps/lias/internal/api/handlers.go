@@ -1,7 +1,7 @@
-// Package api implements the HTTP server and REST handlers for LIAS.
+// Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 1.7
+// Version: 1.8
 package api
 
 import (
@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	liasNftables "github.com/user/lias-dis/apps/lias/internal/nftables"
 	"github.com/user/lias-dis/apps/lias/internal/policy"
@@ -29,6 +30,7 @@ type Handlers struct {
 	nftCtrl  *liasNftables.Controller
 	store    *storage.Storage
 	trigger  chan struct{}
+	broker   *Broker
 }
 
 func NewHandlers(
@@ -39,6 +41,7 @@ func NewHandlers(
 	nftCtrl *liasNftables.Controller,
 	store *storage.Storage,
 	trigger chan struct{},
+	broker *Broker,
 ) *Handlers {
 	return &Handlers{
 		cache:    cache,
@@ -48,6 +51,7 @@ func NewHandlers(
 		nftCtrl:  nftCtrl,
 		store:    store,
 		trigger:  trigger,
+		broker:   broker,
 	}
 }
 
@@ -72,6 +76,51 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/v1/schedules/{id}", h.DeleteSchedule)
 
 	mux.HandleFunc("POST /api/v1/nftables/flush", h.FlushNftables)
+
+	// FIX: Register SSE event stream on LIAS port :8081 for browser dashboard clients
+	mux.HandleFunc("GET /api/v1/events", h.StreamEvents)
+}
+
+// StreamEvents handles real-time SSE stream connections on LIAS port :8081.
+func (h *Handlers) StreamEvents(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	var lastEventID int64
+	if lastIDStr := r.Header.Get("Last-Event-ID"); lastIDStr != "" {
+		lastEventID, _ = strconv.ParseInt(lastIDStr, 10, 64)
+	}
+
+	clientID := generateID()
+	client := h.broker.Subscribe(clientID, lastEventID)
+	defer h.broker.Unsubscribe(clientID)
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-client.Events:
+			if !ok {
+				return
+			}
+
+			frame := event.SSEFrame()
+			if _, err := w.Write([]byte(frame)); err != nil {
+				slog.Debug("LIAS SSE client socket write error, closing stream", "client_id", clientID, "error", err)
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 func (h *Handlers) tryTrigger() {
