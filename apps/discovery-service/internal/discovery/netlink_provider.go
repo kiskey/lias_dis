@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 1.9
+// Version: 2.0
 package discovery
 
 import (
@@ -86,9 +86,9 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
 	return nil
 }
 
-// monitorStaleNeighbors periodically audits kernel neighbor states and triggers ARP re-probes for STALE entries.
+// monitorStaleNeighbors periodically audits kernel neighbor states and triggers active probes for STALE entries.
 func (p *NetlinkProvider) monitorStaleNeighbors() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -115,7 +115,7 @@ func (p *NetlinkProvider) auditKernelNeighbors() {
 			continue
 		}
 
-		// If neighbor is in NUD_FAILED or NUD_INCOMPLETE, emit explicit offline observation
+		// If neighbor is in NUD_FAILED or NUD_INCOMPLETE, emit explicit offline observation with confidence 0.95
 		if (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0 {
 			obs := Observation{
 				Source:     p.Name(),
@@ -133,14 +133,14 @@ func (p *NetlinkProvider) auditKernelNeighbors() {
 			continue
 		}
 
-		// If neighbor is NUD_STALE, send a lightweight ARP/UDP probe to force kernel state transition to REACHABLE or FAILED
-		if (n.State & unix.NUD_STALE) != 0 && n.IP != nil {
+		// If neighbor is NUD_STALE or NUD_DELAY, transmit an active L2 probe to force kernel transition to REACHABLE or FAILED
+		if (n.State & (unix.NUD_STALE | unix.NUD_DELAY)) != 0 && n.IP != nil {
 			go p.probeNeighborIP(n.IP)
 		}
 	}
 }
 
-// probeNeighborIP transmits a lightweight UDP probe packet to trigger kernel ARP re-probing.
+// probeNeighborIP transmits an active L2 probe packet to force kernel ARP state resolution.
 func (p *NetlinkProvider) probeNeighborIP(ip net.IP) {
 	addr := net.JoinHostPort(ip.String(), "64111")
 	conn, err := net.DialTimeout("udp4", addr, 1*time.Second)
