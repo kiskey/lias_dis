@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/cache.go
-// Version: 1.5
+// Version: 1.6
 package sync
 
 import (
@@ -62,7 +62,7 @@ func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
 	if tag, found := c.stickyTags[d.PDID]; found && tag != "" {
 		assignedTag = tag
 	} else {
-		// 2. Multi-MAC fallback: Check ALL MAC addresses on the device record
+		// 2. Multi-MAC fallback: Check ALL accumulated MAC addresses on the device record
 		for _, mac := range d.MACs {
 			cleanMAC := strings.ToLower(strings.TrimSpace(mac))
 			if macTag, found := c.stickyMACs[cleanMAC]; found && macTag != "" {
@@ -85,7 +85,7 @@ func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
 	d.Tags = []string{assignedTag}
 	d.Device.Tags = []string{assignedTag}
 
-	// 4. Backfill stickyMACs for all known MAC addresses on tagged device
+	// 4. Backfill stickyMACs for all known MAC addresses (including rotated Private MACs)
 	if assignedTag != "generic" {
 		for _, mac := range d.MACs {
 			cleanMAC := strings.ToLower(strings.TrimSpace(mac))
