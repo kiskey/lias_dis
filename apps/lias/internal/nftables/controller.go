@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 1.5
+// Version: 1.6
 package nftables
 
 import (
@@ -52,14 +52,15 @@ func (c *Controller) Init() error {
 		Name:   c.cfg.TableName,
 	})
 
-	// 2. Create the ingress chain with HIGHEST priority (-500)
-	// Priority -500 ensures lancontrol executes BEFORE sing-box (-150) and inet filter (0)
+	// 2. Create the ingress chain with HIGHEST priority (-500) and MANDATORY interface binding (Dev: c.cfg.Interface)
+	// Passing Dev: c.cfg.Interface binds the netdev ingress hook directly to eth0 in the Linux kernel!
 	c.chain = c.conn.AddChain(&nftables.Chain{
 		Name:     "ingress",
 		Table:    c.table,
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookIngress,
 		Priority: nftables.ChainPriorityRef(-500),
+		Dev:      c.cfg.Interface, // <-- CRITICAL FIX: Binds ingress hook to network interface "eth0"!
 	})
 
 	// Flush existing chain rules to prevent duplicate rule accumulation
@@ -212,7 +213,7 @@ func (c *Controller) Init() error {
 		return fmt.Errorf("failed to initialize netdev lancontrol table: %w", err)
 	}
 
-	slog.Info("nftables netdev table initialized successfully with priority -500 and drop-first rules",
+	slog.Info("nftables netdev table initialized successfully with interface binding, priority -500, and drop-first rules",
 		"table", c.cfg.TableName, "iface", c.cfg.Interface)
 	return nil
 }
