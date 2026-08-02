@@ -1,7 +1,7 @@
 /*
  * LIAS Control Center - Main Dashboard Application
  * File:    apps/lias/web/src/main.js
- * Version: 1.5 (Multi-Policy Tag Group UI & Sticky Tag Support)
+ * Version: 1.6 (Collapsible Groups, In-Place Schedule Editing, Persistent Global Switch)
  */
 
 import { API } from './api.js';
@@ -14,6 +14,7 @@ class LiasDashboard {
     this.policies = [];
     this.schedules = [];
     this.searchQuery = '';
+    this.collapsedGroups = JSON.parse(localStorage.getItem('lias_collapsed_groups') || '{}');
 
     this.initDOM();
     this.initEvents();
@@ -118,7 +119,8 @@ class LiasDashboard {
 
   renderDashboardView() {
     const onlineCount = this.devices.filter((d) => d.online).length;
-    const globalPol = this.policies.find((p) => p.id === 'global_default') || { action: 'allow' };
+    // Default global state if unpersisted is "schedule"
+    const globalPol = this.policies.find((p) => p.id === 'global_default') || { action: 'schedule' };
 
     this.viewContainer.innerHTML = `
       <div class="global-switch-banner">
@@ -167,12 +169,18 @@ class LiasDashboard {
           else this.policies.push({ id: 'global_default', action });
 
           this.renderDashboardView();
-          this.showToast(`Global switch set to ${action.toUpperCase()}`, 'success');
+          this.showToast(`Global switch set to ${action.toUpperCase()} & persisted`, 'success');
         } catch (err) {
           this.showToast('Failed to update global switch', 'danger');
         }
       });
     });
+  }
+
+  toggleGroupCollapse(tagId) {
+    this.collapsedGroups[tagId] = !this.collapsedGroups[tagId];
+    localStorage.setItem('lias_collapsed_groups', JSON.stringify(this.collapsedGroups));
+    this.renderDevicesView();
   }
 
   renderDevicesView() {
@@ -187,6 +195,7 @@ class LiasDashboard {
         const matchesQuery =
           !q ||
           (d.hostname && d.hostname.toLowerCase().includes(q)) ||
+          (d.friendly_name && d.friendly_name.toLowerCase().includes(q)) ||
           (d.current_ip && d.current_ip.toLowerCase().includes(q)) ||
           (d.current_mac && d.current_mac.toLowerCase().includes(q));
 
@@ -194,7 +203,8 @@ class LiasDashboard {
       });
 
       const tagPolicies = this.policies.filter((p) => p.type === 'tag' && p.target_id === tag.id);
-      
+      const isCollapsed = !!this.collapsedGroups[tag.id];
+
       let tagPolicyBadges = '';
       if (tagPolicies.length > 0) {
         tagPolicyBadges = tagPolicies
@@ -215,8 +225,8 @@ class LiasDashboard {
       }
 
       html += `
-        <div class="card" style="margin: 0;">
-          <div style="display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid var(--separator); padding-bottom: 14px; margin-bottom: 16px;">
+        <div class="group-card ${isCollapsed ? 'collapsed' : ''}" style="margin: 0;">
+          <div class="group-header" data-toggle-group="${tag.id}" style="display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid var(--separator); padding: 18px 24px; cursor: pointer; user-select: none;">
             <div>
               <div style="display: flex; align-items: center; gap: 10px;">
                 <div style="width: 14px; height: 14px; border-radius: 4px; background-color: ${tag.color};"></div>
@@ -224,10 +234,13 @@ class LiasDashboard {
               </div>
               <div style="margin-top: 8px;">${tagPolicyBadges}</div>
             </div>
-            ${tag.id !== 'infrastructure' ? `<button class="btn btn-primary" data-add-tag-policy="${tag.id}" style="font-size: 12px;">+ Attach Rule / Schedule</button>` : `<span style="font-size: 12px; color: var(--success); font-weight: 600;">Immune to Block Rules</span>`}
+            <div style="display: flex; align-items: center; gap: 12px;">
+              ${tag.id !== 'infrastructure' ? `<button class="btn btn-primary" data-add-tag-policy="${tag.id}" style="font-size: 12px;" onclick="event.stopPropagation();">+ Attach Rule / Schedule</button>` : `<span style="font-size: 12px; color: var(--success); font-weight: 600;">Immune to Block Rules</span>`}
+              <svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px; height:20px; color:var(--text-secondary); transition: transform 0.25s ease; ${isCollapsed ? 'transform: rotate(-90deg);' : ''}"><polyline points="6 9 12 15 18 9"></polyline></svg>
+            </div>
           </div>
 
-          <div style="display: flex; flex-direction: column; gap: 10px;">
+          <div class="group-content" style="padding: 20px 24px; display: ${isCollapsed ? 'none' : 'flex'}; flex-direction: column; gap: 10px;">
       `;
 
       if (groupDevs.length === 0) {
@@ -264,8 +277,17 @@ class LiasDashboard {
     html += `</div>`;
     this.viewContainer.innerHTML = html;
 
+    // Expand / Collapse Group Trigger
+    this.viewContainer.querySelectorAll('[data-toggle-group]').forEach((header) => {
+      header.addEventListener('click', (e) => {
+        const tagId = e.currentTarget.getAttribute('data-toggle-group');
+        this.toggleGroupCollapse(tagId);
+      });
+    });
+
     this.viewContainer.querySelectorAll('[data-add-tag-policy]').forEach((btn) => {
       btn.addEventListener('click', (e) => {
+        e.stopPropagation();
         const tagId = e.currentTarget.getAttribute('data-add-tag-policy');
         this.openTagPolicyModal(tagId);
       });
@@ -273,6 +295,7 @@ class LiasDashboard {
 
     this.viewContainer.querySelectorAll('[data-del-pol]').forEach((btn) => {
       btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
         const polId = e.currentTarget.getAttribute('data-del-pol');
         try {
           await API.deletePolicy(polId);
@@ -338,7 +361,10 @@ class LiasDashboard {
               </p>
               <div style="margin-top: 10px;">${rulesSummary}</div>
             </div>
-            <button class="btn btn-danger" data-del-sched="${s.id}">Delete</button>
+            <div style="display: flex; gap: 8px;">
+              <button class="btn btn-secondary" data-edit-sched="${s.id}">Edit</button>
+              <button class="btn btn-danger" data-del-sched="${s.id}">Delete</button>
+            </div>
           </div>
         `;
       });
@@ -348,7 +374,14 @@ class LiasDashboard {
     this.viewContainer.innerHTML = html;
 
     const addBtn = document.getElementById('add-schedule-btn');
-    if (addBtn) addBtn.addEventListener('click', () => this.openAddScheduleModal());
+    if (addBtn) addBtn.addEventListener('click', () => this.openScheduleModal());
+
+    this.viewContainer.querySelectorAll('[data-edit-sched]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        const id = e.currentTarget.getAttribute('data-edit-sched');
+        this.openScheduleModal(id);
+      });
+    });
 
     this.viewContainer.querySelectorAll('[data-del-sched]').forEach((btn) => {
       btn.addEventListener('click', async (e) => {
@@ -381,13 +414,15 @@ class LiasDashboard {
       <div class="card">
         <h3>System Settings</h3>
         <p style="color: var(--text-secondary); margin-top: 8px;">
-          LIAS Version: 1.7 &bull; Netfilter Table: <code>netdev lancontrol</code>
+          LIAS Version: 1.8 &bull; Netfilter Table: <code>netdev lancontrol</code>
         </p>
       </div>
     `;
   }
 
-  openAddScheduleModal() {
+  openScheduleModal(scheduleId = null) {
+    const existingSched = scheduleId ? this.schedules.find((s) => s.id === scheduleId) : null;
+
     let detectedTz = 'UTC';
     try {
       detectedTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
@@ -395,18 +430,22 @@ class LiasDashboard {
       detectedTz = 'UTC';
     }
 
-    this.modalTitle.textContent = 'Create New Schedule Window';
+    const name = existingSched ? existingSched.name : '';
+    const tz = existingSched ? existingSched.timezone : detectedTz;
+    const firstRule = existingSched && existingSched.rules && existingSched.rules[0] ? existingSched.rules[0] : { days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_time: '22:00', end_time: '06:00', action: 'block' };
+
+    this.modalTitle.textContent = scheduleId ? 'Edit Schedule Window' : 'Create New Schedule Window';
     this.modalBody.innerHTML = `
       <div style="display: flex; flex-direction: column; gap: 16px;">
         <div>
           <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Schedule Name</label>
-          <input type="text" id="sched-name" placeholder="e.g. Weekend Gaming Whitelist" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
+          <input type="text" id="sched-name" value="${name}" placeholder="e.g. Bedtime Lockout" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
         </div>
 
         <div>
-          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Timezone (Auto-Detected)</label>
+          <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Timezone</label>
           <select id="sched-tz" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary); font-weight: 600;">
-            <option value="${detectedTz}" selected>Local Browser (${detectedTz})</option>
+            <option value="${tz}" selected>${tz}</option>
             <option value="UTC">UTC (Coordinated Universal Time)</option>
             <option value="America/New_York">Eastern Time (America/New_York)</option>
             <option value="America/Chicago">Central Time (America/Chicago)</option>
@@ -422,32 +461,29 @@ class LiasDashboard {
         <div>
           <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Days Active</label>
           <div class="day-chip-group" id="day-selector">
-            <div class="day-chip selected" data-day="mon">Mon</div>
-            <div class="day-chip selected" data-day="tue">Tue</div>
-            <div class="day-chip selected" data-day="wed">Wed</div>
-            <div class="day-chip selected" data-day="thu">Thu</div>
-            <div class="day-chip selected" data-day="fri">Fri</div>
-            <div class="day-chip" data-day="sat">Sat</div>
-            <div class="day-chip" data-day="sun">Sun</div>
+            ${['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'].map((d) => {
+              const isSelected = firstRule.days && firstRule.days.includes(d);
+              return `<div class="day-chip ${isSelected ? 'selected' : ''}" data-day="${d}">${d.toUpperCase()}</div>`;
+            }).join('')}
           </div>
         </div>
 
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
           <div>
             <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Start Time</label>
-            <input type="time" id="sched-start" value="12:00" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
+            <input type="time" id="sched-start" value="${firstRule.start_time || '22:00'}" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
           </div>
           <div>
             <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">End Time</label>
-            <input type="time" id="sched-end" value="18:00" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
+            <input type="time" id="sched-end" value="${firstRule.end_time || '06:00'}" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
           </div>
         </div>
 
         <div>
           <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Action Within Window</label>
           <select id="sched-act" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
-            <option value="allow">Allow Access (Whitelist Window)</option>
-            <option value="block">Block Access (Downtime Window)</option>
+            <option value="block" ${firstRule.action === 'block' ? 'selected' : ''}>Block Access (Downtime Window)</option>
+            <option value="allow" ${firstRule.action === 'allow' ? 'selected' : ''}>Allow Access (Whitelist Window)</option>
           </select>
         </div>
       </div>
@@ -462,8 +498,8 @@ class LiasDashboard {
     this.modalFooter.innerHTML = `<button class="btn btn-primary" id="save-sched-btn">Save Schedule</button>`;
 
     document.getElementById('save-sched-btn').onclick = async () => {
-      const name = document.getElementById('sched-name').value;
-      const tz = document.getElementById('sched-tz').value;
+      const schedName = document.getElementById('sched-name').value.trim();
+      const schedTz = document.getElementById('sched-tz').value;
       const startTime = document.getElementById('sched-start').value;
       const endTime = document.getElementById('sched-end').value;
       const action = document.getElementById('sched-act').value;
@@ -473,7 +509,7 @@ class LiasDashboard {
         selectedDays.push(chip.getAttribute('data-day'));
       });
 
-      if (!name || selectedDays.length === 0) {
+      if (!schedName || selectedDays.length === 0) {
         this.showToast('Please enter a schedule name and select days', 'danger');
         return;
       }
@@ -485,18 +521,29 @@ class LiasDashboard {
         action: action,
       };
 
+      const payload = {
+        name: schedName,
+        timezone: schedTz,
+        rules: [rule],
+      };
+
       try {
-        const created = await API.createSchedule({
-          name: name,
-          timezone: tz,
-          rules: [rule],
-        });
-        this.schedules.push(created);
+        if (scheduleId) {
+          payload.id = scheduleId;
+          const updated = await API.updateSchedule(scheduleId, payload);
+          const idx = this.schedules.findIndex((s) => s.id === scheduleId);
+          if (idx !== -1) this.schedules[idx] = updated;
+          this.showToast('Schedule updated successfully', 'success');
+        } else {
+          const created = await API.createSchedule(payload);
+          this.schedules.push(created);
+          this.showToast(`Schedule created (${schedTz})`, 'success');
+        }
+
         this.hideModal();
         this.renderSchedulesView();
-        this.showToast(`Schedule created (${tz})`, 'success');
       } catch (err) {
-        this.showToast('Failed to create schedule', 'danger');
+        this.showToast('Failed to save schedule', 'danger');
       }
     };
 
