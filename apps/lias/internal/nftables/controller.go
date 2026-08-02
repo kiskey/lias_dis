@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 1.8
+// Version: 2.0 (GAP-1 / GAP-04 Resolved: Added mandatory Device hook binding)
 package nftables
 
 import (
@@ -52,14 +52,17 @@ func (c *Controller) Init() error {
 		Name:   c.cfg.TableName,
 	})
 
-	// 2. Create the ingress chain with HIGHEST priority (-500)
-	// Priority -500 ensures lancontrol executes BEFORE sing-box (-150) and inet filter (0)
+	// 2. Create the ingress chain with HIGHEST priority (-500) bound to the physical network interface
+	// Priority -500 ensures lancontrol executes BEFORE sing-box (-150) and inet filter (0).
+	// Crucial GAP-1 / GAP-04 Fix: Explicit Device string field MUST be set so google/nftables
+	// emits NFTA_HOOK_DEV, attaching this chain to eth0's RX path in the kernel driver.
 	c.chain = c.conn.AddChain(&nftables.Chain{
 		Name:     "ingress",
 		Table:    c.table,
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookIngress,
 		Priority: nftables.ChainPriorityRef(-500),
+		Device:   c.cfg.Interface, // <-- MANDATORY KERNEL HOOK INTERFACE BINDING
 	})
 
 	// Flush existing chain rules to prevent duplicate rule accumulation
