@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/orchestrator.go
-// Version: 1.1
+// Version: 1.2
 package discovery
 
 import (
@@ -16,13 +16,19 @@ import (
 	"github.com/user/lias-dis/shared/models"
 )
 
-// Orchestrator manages on-demand enrichment with concurrency locking per PDID.
+const (
+	// Minimum cool-down interval before re-attempting enrichment on an unidentified device
+	enrichmentCooldown = 1 * time.Hour
+)
+
+// Orchestrator manages on-demand enrichment with concurrency locking and failure backoff per PDID.
 type Orchestrator struct {
-	cache       *inventory.Cache
-	broker      *disAPI.Broker
-	primaries   []Enricher // Avahi, SSDP, NetBIOS
-	fallback    Enricher   // Nmap
-	activeLocks sync.Map   // Prevents duplicate concurrent enrichments for the same PDID
+	cache          *inventory.Cache
+	broker         *disAPI.Broker
+	primaries      []Enricher // Avahi, SSDP, NetBIOS
+	fallback       Enricher   // Nmap
+	activeLocks    sync.Map   // Prevents duplicate concurrent enrichments for the same PDID
+	lastAttemptMap sync.Map   // Maps PDID -> time.Time to enforce 1-hour backoff on stubborn unknown devices
 }
 
 // NewOrchestrator initializes the enrichment orchestrator.
@@ -36,32 +42,45 @@ func NewOrchestrator(cache *inventory.Cache, broker *disAPI.Broker, primaries []
 }
 
 // TriggerEnrichment executes the enrichment pipeline for a target device.
-// Deduplicates concurrent executions for the same PDID automatically.
+// Enforces a 1-hour cool-down period for stubborn unknown devices to avoid continuous network probing.
 func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
 	if pdid == "" {
 		return
 	}
-
-	// Deduplicate: Check if enrichment is already in-flight for this PDID
-	if _, loaded := o.activeLocks.LoadOrStore(pdid, struct{}{}); loaded {
-		slog.Debug("Enrichment already in progress, skipping duplicate trigger", "pdid", pdid)
-		return
-	}
-	defer o.activeLocks.Delete(pdid)
 
 	dev := o.cache.Get(pdid)
 	if dev == nil {
 		return
 	}
 
-	// Skip if already categorized and force flag is false
+	// 1. Skip immediately if device is ALREADY fully classified (Vendor + DeviceType known)
 	if !force && dev.Vendor != "" && dev.DeviceType != "" {
 		return
 	}
 
+	// 2. Cool-Down Safeguard: If enrichment failed previously, do NOT probe again within 1 hour
+	if !force {
+		if lastAttempt, found := o.lastAttemptMap.Load(pdid); found {
+			if time.Since(lastAttempt.(time.Time)) < enrichmentCooldown {
+				slog.Debug("Device in 1-hour enrichment cool-down, skipping scan", "pdid", pdid)
+				return
+			}
+		}
+	}
+
+	// 3. Deduplicate in-flight concurrent triggers for the same PDID
+	if _, loaded := o.activeLocks.LoadOrStore(pdid, struct{}{}); loaded {
+		slog.Debug("Enrichment already in progress, skipping duplicate trigger", "pdid", pdid)
+		return
+	}
+	defer o.activeLocks.Delete(pdid)
+
+	// Record attempt timestamp for cool-down tracking
+	o.lastAttemptMap.Store(pdid, time.Now())
+
 	slog.Info("Executing enrichment pipeline", "pdid", pdid, "force", force, "ip", dev.CurrentIP)
 
-	// 1. Run primary enrichers (Avahi, SSDP, NetBIOS) concurrently
+	// 4. Run primary enrichers (Avahi, SSDP, NetBIOS) concurrently
 	var wg sync.WaitGroup
 	primaryResults := make(chan *models.Enrichment, len(o.primaries))
 
@@ -93,7 +112,7 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
 		}
 	}
 
-	// 2. Fall back to Nmap if still unclassified (missing Vendor or DeviceType)
+	// 5. Fall back to Nmap if device remains unclassified
 	if (!changed || dev.Vendor == "" || dev.DeviceType == "") && o.fallback != nil {
 		slog.Info("Primary enrichment incomplete, executing Nmap fallback", "pdid", pdid)
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -107,14 +126,14 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
 		}
 	}
 
-	// 3. Persist modifications and broadcast event
+	// 6. Persist modifications and broadcast event
 	if changed {
 		dev.Touch(time.Now())
 		o.cache.Upsert(dev)
 		o.broker.Broadcast(models.NewEvent(models.EventFingerprintUpdated, dev.PDID, dev))
 		slog.Info("Enrichment pipeline completed with device updates", "pdid", pdid, "type", dev.DeviceType, "vendor", dev.Vendor)
 	} else {
-		slog.Debug("Enrichment pipeline completed, no changes detected", "pdid", pdid)
+		slog.Debug("Enrichment pipeline completed without new findings", "pdid", pdid)
 	}
 }
 
