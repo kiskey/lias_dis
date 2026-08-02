@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/pihole_provider.go
-// Version: 1.4
+// Version: 1.5
 package discovery
 
 import (
@@ -62,16 +62,37 @@ func (p *PiholeProvider) Events() <-chan Observation {
 func (p *PiholeProvider) run() {
 	defer close(p.done)
 
-	ticker := time.NewTicker(60 * time.Second)
-	defer ticker.Stop()
+	backoff := 10 * time.Second
+	maxBackoff := 5 * time.Minute
 
 	p.poll()
+
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
 		case <-ticker.C:
+			if !p.isSessionValid() {
+				if err := p.authenticate(); err != nil {
+					slog.Error("Pi-hole v6 authentication failed, applying exponential backoff",
+						"error", err, "next_retry_in", backoff)
+
+					select {
+					case <-p.ctx.Done():
+						return
+					case <-time.After(backoff):
+						backoff *= 2
+						if backoff > maxBackoff {
+							backoff = maxBackoff
+						}
+					}
+					continue
+				}
+				backoff = 10 * time.Second // Reset backoff on success
+			}
 			p.poll()
 		}
 	}
@@ -138,7 +159,7 @@ func (p *PiholeProvider) poll() {
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		p.sidValid = false
-		slog.Warn("Pi-hole SID token rejected, will re-authenticate on next interval")
+		slog.Warn("Pi-hole SID token rejected, will re-authenticate on next cycle")
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -197,7 +218,7 @@ func (p *PiholeProvider) poll() {
 			Source:     p.Name(),
 			IP:         ipObj,
 			MAC:        macObj,
-			Hostname:   UnescapeHostname(c.Name), // Calls UnescapeHostname in package discovery
+			Hostname:   UnescapeHostname(c.Name),
 			Online:     true,
 			Confidence: 0.3,
 			Timestamp:  time.Now(),
@@ -236,6 +257,10 @@ func (p *PiholeProvider) authenticate() error {
 			SID   string `json:"sid"`
 			Valid bool   `json:"valid"`
 		} `json:"session"`
+		Error struct {
+			Key     string `json:"key"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&authResp); err != nil {
@@ -243,7 +268,8 @@ func (p *PiholeProvider) authenticate() error {
 	}
 
 	if !authResp.Session.Valid || authResp.Session.SID == "" {
-		return fmt.Errorf("pihole auth returned invalid session state")
+		return fmt.Errorf("pihole auth returned invalid session state: key=%q message=%q",
+			authResp.Error.Key, authResp.Error.Message)
 	}
 
 	p.sid = authResp.Session.SID
