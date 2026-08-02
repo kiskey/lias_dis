@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 1.5
+// Version: 1.6
 package sync
 
 import (
@@ -22,7 +22,6 @@ import (
 )
 
 // EventBroadcaster defines the interface for broadcasting real-time events to connected clients.
-// Defining this interface breaks the circular dependency between package sync and package api.
 type EventBroadcaster interface {
 	Broadcast(event models.Event)
 }
@@ -49,14 +48,10 @@ func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, bro
 
 // Run starts the initial sync, polling fallback, and real-time SSE stream.
 func (c *DISClient) Run(ctx context.Context) {
-	// 1. Initial blocking sync to populate cache before activating firewall rules
 	c.pollDevices()
 	c.tryTrigger()
 
-	// 2. Start background REST polling loop (fallback)
 	go c.pollerLoop(ctx)
-
-	// 3. Start SSE consumer (primary real-time event pipeline)
 	go c.sseLoop(ctx)
 }
 
@@ -87,7 +82,6 @@ func (c *DISClient) pollerLoop(ctx context.Context) {
 	}
 }
 
-// getEndpointURL safely constructs a DIS endpoint URL, ensuring explicit ports are not duplicated.
 func (c *DISClient) getEndpointURL(path string) string {
 	rawURL := strings.TrimSpace(c.cfg.URL)
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
@@ -137,7 +131,21 @@ func (c *DISClient) pollDevices() {
 	}
 
 	for _, d := range listResp.Devices {
+		prev := c.cache.Get(d.PDID)
 		c.cache.UpsertDevice(d)
+
+		if c.broker != nil && (prev == nil || prev.Online != d.Online) {
+			evtType := models.EventDeviceOnline
+			if !d.Online {
+				evtType = models.EventDeviceOffline
+			}
+			c.broker.Broadcast(models.NewEvent(evtType, d.PDID, models.DeviceEventPayload{
+				PDID:      d.PDID,
+				MAC:       d.CurrentMAC,
+				IP:        d.CurrentIP,
+				Timestamp: time.Now(),
+			}))
+		}
 	}
 	slog.Info("Synced device inventory from DIS", "count", len(listResp.Devices))
 }
@@ -248,25 +256,26 @@ func (c *DISClient) handleEvent(e models.Event) {
 
 	slog.Debug("Received real-time event from DIS", "type", e.Type, "device_id", e.DeviceID)
 
-	// Proxy real-time DIS events to LIAS SSE broker interface for browser clients on :8081
-	if c.broker != nil {
-		c.broker.Broadcast(e)
-	}
-
 	switch e.Type {
 	case models.EventDeviceRemoved:
 		c.cache.RemoveDevice(e.DeviceID)
 		slog.Info("Device removed from local cache via SSE", "pdid", e.DeviceID)
 		c.tryTrigger()
+		if c.broker != nil {
+			c.broker.Broadcast(e)
+		}
 
 	case models.EventDeviceAdded, models.EventDeviceOnline, models.EventDeviceOffline,
 		models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged, models.EventFingerprintUpdated:
 
-		go func(pdid string) {
+		go func(pdid string, evt models.Event) {
 			if c.fetchSingleDevice(pdid) {
 				c.tryTrigger()
 			}
-		}(e.DeviceID)
+			if c.broker != nil {
+				c.broker.Broadcast(evt)
+			}
+		}(e.DeviceID, e)
 	}
 }
 
