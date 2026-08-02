@@ -2,7 +2,7 @@
 // from multiple providers into canonical device records.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 1.9
+// Version: 2.0
 package correlation
 
 import (
@@ -97,7 +97,6 @@ func (e *Engine) isDuplicateObservation(macStr, ipStr string, online bool) bool 
 }
 
 func (e *Engine) processObservation(obs discovery.Observation) {
-	// Filter Multicast and Loopback targets
 	if discovery.IsMulticastOrBroadcast(obs.MAC, obs.IP) {
 		return
 	}
@@ -142,17 +141,32 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// 1. DHCP IP-REUSE GUARD
+	// 1. SMART DHCP IP-REUSE GUARD & PRIVATE-MAC CONTINUITY
 	if ipStr != "" && macStr != "" {
 		if ipMatch := e.cache.GetByIP(ipStr); ipMatch != nil {
-			hasMAC := false
-			for _, m := range ipMatch.MACs {
-				if inventory.NormalizeMAC(m) == macStr {
-					hasMAC = true
-					break
+			if !ipMatch.HasMAC(macStr) {
+				// If incoming MAC is a randomized MAC on the exact same IP and old MAC is silent,
+				// merge MAC rotation into existing record rather than evicting the IP index.
+				if oui.IsRandomizedMAC(macStr) && !ipMatch.Online {
+					slog.Info("Observed Private MAC rotation on same IP",
+						"pdid", ipMatch.PDID, "ip", ipStr, "new_mac", macStr)
+					ipMatch.AddMAC(macStr)
+					ipMatch.Online = true
+					ipMatch.Touch(time.Now())
+					e.cache.Upsert(ipMatch)
+					if e.store != nil {
+						_ = e.store.SaveDevice(ipMatch)
+					}
+					e.broker.Broadcast(models.NewEvent(models.EventMACChanged, ipMatch.PDID, models.DeviceEventPayload{
+						PDID:      ipMatch.PDID,
+						MAC:       macStr,
+						IP:        ipStr,
+						Timestamp: time.Now(),
+					}))
+					return
 				}
-			}
-			if !hasMAC {
+
+				// Otherwise, treat as genuine DHCP IP reassignment by a different device
 				slog.Info("DHCP IP reassignment detected, invalidating stale IP binding",
 					"ip", ipStr, "old_pdid", ipMatch.PDID, "new_mac", macStr)
 				e.cache.RemoveIPIndex(ipStr)
@@ -163,9 +177,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	// 2. QUERY CACHE (With LAA Private MAC Hostname Match Fallback)
 	d := e.cache.GetByMACOrIP(macStr, ipStr)
 
-	// Apple / Android Private MAC Rotation Fallback:
-	// If direct MAC/IP lookup misses, but the MAC is randomized (LAA) AND we have a valid hostname,
-	// query the cache by normalized hostname to link the rotated MAC to the device's canonical record.
 	if d == nil && macStr != "" && oui.IsRandomizedMAC(macStr) && cleanHost != "" {
 		if hostMatch := e.cache.GetByHostname(cleanHost); hostMatch != nil {
 			slog.Info("Linked rotated Private MAC address to existing device record by L7 Hostname",
@@ -177,14 +188,16 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	// Handle new device discovery
 	if d == nil {
 		pdid := inventory.GeneratePDID(macStr, cleanHost, obs.Vendor)
+		isTentative := macStr == ""
 		d = &models.Device{
-			PDID:       pdid,
-			Hostname:   cleanHost,
-			Vendor:     obs.Vendor,
-			Model:      obs.Model,
-			Online:     true,
-			Confidence: obs.Confidence,
-			SourceInfo: make(map[string]models.SourceMeta),
+			PDID:        pdid,
+			Hostname:    cleanHost,
+			Vendor:      obs.Vendor,
+			Model:       obs.Model,
+			Online:      true,
+			IsTentative: isTentative,
+			Confidence:  obs.Confidence,
+			SourceInfo:  make(map[string]models.SourceMeta),
 		}
 		d.AddMAC(macStr)
 		d.AddIP(ipStr)
@@ -211,8 +224,8 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// 3. TENTATIVE PDID PROMOTION
-	if macStr != "" && strings.HasPrefix(d.PDID, "pdid_tentative_") {
+	// 3. TENTATIVE PDID PROMOTION (Fixed: Uses d.IsTentative)
+	if d.IsTentative && macStr != "" {
 		oldPDID := d.PDID
 		newPDID := inventory.GeneratePDID(macStr, cleanHost, d.Vendor)
 
@@ -225,6 +238,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		}
 
 		d.PDID = newPDID
+		d.IsTentative = false
 		d.AddMAC(macStr)
 		d.AddIP(ipStr)
 		d.Touch(time.Now())
@@ -256,7 +270,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
 	if macStr != "" && d.CurrentMAC != macStr {
 		payload.OldMAC = d.CurrentMAC
-		d.AddMAC(macStr) // Accumulates rotated MACs into d.MACs slice
+		d.AddMAC(macStr)
 		payload.MAC = macStr
 		changed = true
 		eventTypes = append(eventTypes, models.EventMACChanged)
