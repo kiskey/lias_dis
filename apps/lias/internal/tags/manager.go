@@ -1,7 +1,7 @@
 // Package tags manages the built-in and custom device tags for LIAS.
 //
 // File:    apps/lias/internal/tags/manager.go
-// Version: 1.4
+// Version: 1.5
 package tags
 
 import (
@@ -38,12 +38,40 @@ func NewManager() *Manager {
 			{ID: "audio", Name: "Audio Devices", Color: "#00c7be", Precedence: 55, Builtin: true},
 			{ID: "computers", Name: "Desktops & Laptops", Color: "#32ade6", Precedence: 50, Builtin: true},
 			{ID: "smart_home", Name: "Smart Home & Appliances", Color: "#30d158", Precedence: 40, Builtin: true},
+			{ID: "iot", Name: "IoT Devices", Color: "#30d158", Precedence: 40, Builtin: true},
 			{ID: "printers", Name: "Printers & Scanners", Color: "#a28b55", Precedence: 35, Builtin: true},
 			{ID: "servers", Name: "Servers & NAS", Color: "#ffcc00", Precedence: 30, Builtin: true},
 			{ID: "guests", Name: "Guest Devices", Color: "#ff3b30", Precedence: 20, Builtin: true},
 			{ID: "generic", Name: "Generic Devices", Color: "#636366", Precedence: 0, Builtin: true},
 		},
 	}
+}
+
+// EnsureTagExists checks if a tag ID exists in the manager, dynamically creating it if missing.
+func (m *Manager) EnsureTagExists(tagID string) {
+	if tagID == "" {
+		return
+	}
+
+	cleanID := strings.ToLower(strings.TrimSpace(tagID))
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, t := range m.tags {
+		if t.ID == cleanID {
+			return
+		}
+	}
+
+	displayName := strings.Title(strings.ReplaceAll(cleanID, "_", " "))
+	m.tags = append(m.tags, Tag{
+		ID:         cleanID,
+		Name:       displayName,
+		Color:      "#0071e3",
+		Precedence: 50,
+		Builtin:    false,
+	})
 }
 
 // RestoreTag restores a stored tag from persistent storage without mutating its ID or Precedence.
