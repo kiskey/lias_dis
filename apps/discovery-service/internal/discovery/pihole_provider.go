@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/pihole_provider.go
-// Version: 1.6
+// Version: 1.7
 package discovery
 
 import (
@@ -29,6 +29,7 @@ type PiholeProvider struct {
 	client   *http.Client
 	sid      string
 	sidValid bool
+	noAuth   bool // Set to true when Pi-hole v6 has no password set (unauthenticated mode)
 }
 
 func NewPiholeProvider(cfg config.PiholeConfig) *PiholeProvider {
@@ -100,6 +101,11 @@ func (p *PiholeProvider) run() {
 }
 
 func (p *PiholeProvider) isSessionValid() bool {
+	// If Pi-hole has no password configured, unauthenticated requests are always valid
+	if p.noAuth {
+		return true
+	}
+
 	if !p.sidValid || p.sid == "" {
 		return false
 	}
@@ -147,9 +153,12 @@ func (p *PiholeProvider) poll() {
 		return
 	}
 
-	req.Header.Set("sid", p.sid)
-	req.Header.Set("X-FTL-SID", p.sid)
-	req.Header.Set("Cookie", "SID="+p.sid)
+	// Attach authentication headers ONLY if authentication is enabled
+	if !p.noAuth && p.sid != "" {
+		req.Header.Set("sid", p.sid)
+		req.Header.Set("X-FTL-SID", p.sid)
+		req.Header.Set("Cookie", "sid="+p.sid) // Lowercase cookie key per Pi-hole v6 spec
+	}
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -251,12 +260,11 @@ func (p *PiholeProvider) authenticate() error {
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 
-	// Decode Pi-hole v6 authentication response payload
 	var authResp struct {
 		Session struct {
 			SID      string `json:"sid"`
 			Valid    bool   `json:"valid"`
-			Message  string `json:"message"`  // Pi-hole v6 session rejection message (e.g. "password incorrect")
+			Message  string `json:"message"`  // "no password set", "password incorrect", "app-password correct"
 			Validity int    `json:"validity"`
 		} `json:"session"`
 		Error struct {
@@ -279,8 +287,20 @@ func (p *PiholeProvider) authenticate() error {
 		return fmt.Errorf("pihole auth endpoint returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(reason))
 	}
 
-	// Validate Session Payload
+	// 1. DETECT UNAUTHENTICATED OPEN LAN MODE ("no password set")
+	if authResp.Session.Message == "no password set" || (authResp.Session.Valid && authResp.Session.SID == "" && authResp.Session.Validity == -1) {
+		p.noAuth = true
+		p.sidValid = true
+		p.sid = ""
+		slog.Info("Pi-hole v6 has no password configured. Operating in unauthenticated open LAN mode")
+		return nil
+	}
+
+	// 2. VALIDATE AUTHENTICATED SESSION
 	if !authResp.Session.Valid || authResp.Session.SID == "" || authResp.Session.SID == "null" {
+		p.noAuth = false
+		p.sidValid = false
+
 		reason := authResp.Session.Message
 		if reason == "" {
 			reason = authResp.Error.Message
@@ -294,6 +314,8 @@ func (p *PiholeProvider) authenticate() error {
 		return fmt.Errorf("pihole auth returned invalid session state: %s", reason)
 	}
 
+	// 3. SUCCESSFUL AUTHENTICATION WITH SID
+	p.noAuth = false
 	p.sid = authResp.Session.SID
 	p.sidValid = true
 	slog.Info("Successfully authenticated with Pi-hole v6 REST API")
