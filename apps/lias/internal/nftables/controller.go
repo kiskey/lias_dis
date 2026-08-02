@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 1.6
+// Version: 1.7
 package nftables
 
 import (
@@ -52,15 +52,15 @@ func (c *Controller) Init() error {
 		Name:   c.cfg.TableName,
 	})
 
-	// 2. Create the ingress chain with HIGHEST priority (-500) and MANDATORY interface binding (Dev: c.cfg.Interface)
-	// Passing Dev: c.cfg.Interface binds the netdev ingress hook directly to eth0 in the Linux kernel!
+	// 2. Create the ingress chain with HIGHEST priority (-500) and MANDATORY interface binding (Device: c.cfg.Interface)
+	// Passing Device: c.cfg.Interface binds the netdev ingress hook directly to eth0 in the Linux kernel!
 	c.chain = c.conn.AddChain(&nftables.Chain{
 		Name:     "ingress",
 		Table:    c.table,
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookIngress,
 		Priority: nftables.ChainPriorityRef(-500),
-		Dev:      c.cfg.Interface, // <-- CRITICAL FIX: Binds ingress hook to network interface "eth0"!
+		Device:   c.cfg.Interface, // <-- FIXED: Uses "Device" string field per github.com/google/nftables v0.2.0 API
 	})
 
 	// Flush existing chain rules to prevent duplicate rule accumulation
