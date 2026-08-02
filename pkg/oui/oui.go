@@ -1,11 +1,12 @@
 // Package oui provides instant, zero-allocation hardware vendor lookups
-// from IEEE Organizationally Unique Identifiers (OUI).
+// from IEEE Organizationally Unique Identifiers (OUI) and MAC type inspection.
 //
 // File:    pkg/oui/oui.go
-// Version: 1.2
+// Version: 1.3
 package oui
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 )
@@ -36,6 +37,24 @@ func Get() *Database {
 // Returns an empty string if the MAC is invalid or unassigned in the database.
 func Lookup(macStr string) string {
 	return Get().Lookup(macStr)
+}
+
+// IsRandomizedMAC reports whether a MAC address is a Locally Administered Address (LAA).
+// IEEE 802 specifies that if Bit 1 of the first octet is set to 1, the address is randomized/private
+// (e.g. Apple Private Wi-Fi Addresses, Android Private MACs, Windows Random MACs).
+func IsRandomizedMAC(macStr string) bool {
+	clean := normalizeHex(macStr)
+	if len(clean) < 2 {
+		return false
+	}
+
+	var firstByte byte
+	if _, err := fmt.Sscanf(clean[:2], "%02x", &firstByte); err != nil {
+		return false
+	}
+
+	// Bit 1 (0x02) set = Locally Administered Address (Private MAC)
+	return (firstByte & 0x02) != 0
 }
 
 // Lookup queries the database for a normalized 24-bit OUI prefix (6 hex characters).
