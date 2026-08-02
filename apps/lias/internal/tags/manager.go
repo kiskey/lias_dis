@@ -1,7 +1,7 @@
 // Package tags manages the built-in and custom device tags for LIAS.
 //
 // File:    apps/lias/internal/tags/manager.go
-// Version: 1.2
+// Version: 1.3
 package tags
 
 import (
@@ -36,6 +36,22 @@ func NewManager() *Manager {
 			{ID: "generic", Name: "Generic Devices", Color: "#636366", Precedence: 0, Builtin: true},
 		},
 	}
+}
+
+// RestoreTag restores a stored tag from persistent storage without mutating its ID or Precedence.
+func (m *Manager) RestoreTag(t Tag) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i, existing := range m.tags {
+		if existing.ID == t.ID {
+			m.tags[i] = t
+			return nil
+		}
+	}
+
+	m.tags = append(m.tags, t)
+	return nil
 }
 
 // List returns all available tag groups ordered by precedence.
