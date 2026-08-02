@@ -2,11 +2,12 @@
 // from multiple providers into canonical device records.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 2.2
+// Version: 2.3 (Fixed offline deduplication & service propagation)
 package correlation
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -102,7 +103,9 @@ func (e *Engine) consume(ctx context.Context, ch <-chan discovery.Observation) {
 }
 
 func (e *Engine) isDuplicateObservation(macStr, ipStr string, online bool) bool {
-	key := macStr + "|" + ipStr
+	// Crucial Fix: Include online status boolean in dedup key so rapid offline transitions
+	// are never dropped as duplicates of preceding online observations.
+	key := fmt.Sprintf("%s|%s|%t", macStr, ipStr, online)
 	now := time.Now()
 
 	e.dedupMu.Lock()
@@ -154,7 +157,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	// 1. QUERY EXISTING DEVICE
 	d := e.cache.GetByMACOrIP(macStr, ipStr)
 
-	// Handle offline observation (Must originate from high-confidence L2 netlink provider or active probe)
+	// Handle offline observation
 	if !obs.Online {
 		if d != nil && d.Online {
 			d.Online = false
@@ -174,7 +177,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// 2. PROVIDER CONFIDENCE & L2 REACHABILITY PRIMACY GUARD
+	// 2. PROVIDER CONFIDENCE GUARD
 	if d != nil && !d.Online && obs.Confidence < 0.8 {
 		slog.Debug("Ignoring Online: true from low-confidence background provider for L2-offline device",
 			"pdid", d.PDID, "source", obs.Source, "confidence", obs.Confidence)
@@ -189,7 +192,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// 3. SMART DHCP IP-REUSE GUARD & PRIVATE-MAC CONTINUITY
+	// 3. DHCP IP-REUSE GUARD & PRIVATE-MAC CONTINUITY
 	if ipStr != "" && macStr != "" {
 		if ipMatch := e.cache.GetByIP(ipStr); ipMatch != nil {
 			if !ipMatch.HasMAC(macStr) {
@@ -284,6 +287,9 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		d.IsTentative = false
 		d.AddMAC(macStr)
 		d.AddIP(ipStr)
+		for _, svc := range obs.Services {
+			d.AddService(svc)
+		}
 		d.Touch(time.Now())
 		ApplySmartClassifications(d)
 
@@ -341,6 +347,10 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 			changed = true
 			eventTypes = append(eventTypes, models.EventFingerprintUpdated)
 		}
+	}
+
+	for _, svc := range obs.Services {
+		d.AddService(svc)
 	}
 
 	ApplySmartClassifications(d)
