@@ -1,7 +1,7 @@
 // Package api implements the HTTP server and REST handlers for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 1.4
+// Version: 1.5
 package api
 
 import (
@@ -84,7 +84,9 @@ func (h *Handlers) ListDevices(w http.ResponseWriter, r *http.Request) {
 	localDevs := h.cache.List()
 	devs := make([]models.Device, 0, len(localDevs))
 	for _, ld := range localDevs {
-		devs = append(devs, ld.Device)
+		dev := ld.Device
+		dev.Tags = ld.Tags // Copy local LIAS assigned tags onto outer device representation!
+		devs = append(devs, dev)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -101,8 +103,11 @@ func (h *Handlers) GetDevice(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"device not found"}`, http.StatusNotFound)
 		return
 	}
+	dev := d.Device
+	dev.Tags = d.Tags // Synchronize tags on single device query
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(d.Device)
+	_ = json.NewEncoder(w).Encode(dev)
 }
 
 func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
@@ -117,8 +122,14 @@ func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
 
 	h.cache.SetTags(pdid, []string{req.TagID})
 
+	d := h.cache.Get(pdid)
+	mac := ""
+	if d != nil {
+		mac = d.CurrentMAC
+	}
+
 	if h.store != nil {
-		_ = h.store.SaveDeviceTag(pdid, req.TagID)
+		_ = h.store.SaveDeviceTag(pdid, req.TagID, mac)
 	}
 
 	h.tryTrigger()
