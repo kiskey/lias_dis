@@ -1,7 +1,7 @@
 /*
  * LIAS Control Center - Main Dashboard Application
  * File:    apps/lias/web/src/main.js
- * Version: 2.0 (24-Hour Time Pickers, Desktop Segmented Day Tiles, Hostname Priority)
+ * Version: 2.1 (Resilient Boot Lifecycle, Error State Cards, HIG Segmented Day Tiles)
  */
 
 import { API } from './api.js';
@@ -14,7 +14,12 @@ class LiasDashboard {
     this.policies = [];
     this.schedules = [];
     this.searchQuery = '';
-    this.collapsedGroups = JSON.parse(localStorage.getItem('lias_collapsed_groups') || '{}');
+
+    try {
+      this.collapsedGroups = JSON.parse(localStorage.getItem('lias_collapsed_groups') || '{}');
+    } catch (e) {
+      this.collapsedGroups = {};
+    }
 
     this.initDOM();
     this.initEvents();
@@ -71,14 +76,18 @@ class LiasDashboard {
         API.getSchedules(),
       ]);
 
-      this.devices = devRes.devices || [];
-      this.tags = tagRes || [];
-      this.policies = polRes || [];
-      this.schedules = schedRes || [];
+      this.devices = (devRes && devRes.devices) ? devRes.devices : (Array.isArray(devRes) ? devRes : []);
+      this.tags = Array.isArray(tagRes) ? tagRes : [];
+      this.policies = Array.isArray(polRes) ? polRes : [];
+      this.schedules = Array.isArray(schedRes) ? schedRes : [];
 
       this.renderCurrentView();
     } catch (err) {
-      console.error('Silent refresh failed:', err);
+      console.error('Silent refresh error:', err);
+      // If view is still showing the loader, replace with error state UI
+      if (this.viewContainer && this.viewContainer.querySelector('.loader')) {
+        this.renderErrorState(err);
+      }
     }
   }
 
@@ -86,8 +95,25 @@ class LiasDashboard {
     try {
       await this.loadInitialDataSilently();
     } catch (err) {
-      this.showToast('Failed to load system data', 'danger');
+      this.showToast('Failed to connect to LIAS backend', 'danger');
+      this.renderErrorState(err);
     }
+  }
+
+  renderErrorState(err) {
+    if (!this.viewContainer) return;
+    this.viewContainer.innerHTML = `
+      <div class="card" style="text-align: center; padding: 40px 24px; margin-top: 20px;">
+        <div style="width: 48px; height: 48px; border-radius: 50%; background: rgba(255, 59, 48, 0.1); color: var(--danger); display: inline-flex; align-items: center; justify-content: center; margin-bottom: 16px;">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+        </div>
+        <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 8px;">Unable to Connect to LIAS Backend</h3>
+        <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 20px; max-width: 400px; margin-left: auto; margin-right: auto;">
+          ${err && err.message ? err.message : 'Check network connection or ensure the lias service is running on port :8081.'}
+        </p>
+        <button class="btn btn-primary" onclick="window.app.loadInitialData()">Retry Connection</button>
+      </div>
+    `;
   }
 
   switchView(view) {
@@ -129,7 +155,6 @@ class LiasDashboard {
     }
   }
 
-  // Normalizes time strings to strict 24-hour "HH:MM" format expected by <input type="time">
   ensure24Hour(timeStr) {
     if (!timeStr) return "12:00";
     if (/^\d{2}:\d{2}$/.test(timeStr)) return timeStr;
@@ -148,8 +173,9 @@ class LiasDashboard {
   }
 
   renderDashboardView() {
-    const onlineCount = this.devices.filter((d) => d.online).length;
-    const globalPol = this.policies.find((p) => p.id === 'global_default') || { action: 'schedule' };
+    if (!this.viewContainer) return;
+    const onlineCount = (this.devices || []).filter((d) => d && d.online).length;
+    const globalPol = (this.policies || []).find((p) => p && p.id === 'global_default') || { action: 'schedule' };
 
     this.viewContainer.innerHTML = `
       <div class="global-switch-banner">
@@ -193,7 +219,7 @@ class LiasDashboard {
             action: action,
             priority: 0,
           });
-          const pol = this.policies.find((p) => p.id === 'global_default');
+          const pol = (this.policies || []).find((p) => p && p.id === 'global_default');
           if (pol) pol.action = action;
           else this.policies.push({ id: 'global_default', action });
 
@@ -208,36 +234,45 @@ class LiasDashboard {
 
   toggleGroupCollapse(tagId) {
     this.collapsedGroups[tagId] = !this.collapsedGroups[tagId];
-    localStorage.setItem('lias_collapsed_groups', JSON.stringify(this.collapsedGroups));
+    try {
+      localStorage.setItem('lias_collapsed_groups', JSON.stringify(this.collapsedGroups));
+    } catch (e) {}
     this.renderDevicesView();
   }
 
   getEffectiveTags() {
     const tagMap = new Map();
-    this.tags.forEach((t) => tagMap.set(t.id, t));
+    if (Array.isArray(this.tags)) {
+      this.tags.forEach((t) => { if (t && t.id) tagMap.set(t.id, t); });
+    }
 
-    this.devices.forEach((d) => {
-      const tagId = (d.tags && d.tags[0]) || 'generic';
-      if (!tagMap.has(tagId)) {
-        tagMap.set(tagId, {
-          id: tagId,
-          name: tagId.charAt(0).toUpperCase() + tagId.slice(1).replace(/_/g, ' '),
-          color: '#0071e3',
-          precedence: 50,
-          builtin: false,
-        });
-      }
-    });
+    if (Array.isArray(this.devices)) {
+      this.devices.forEach((d) => {
+        if (!d) return;
+        const tagId = (d.tags && d.tags[0]) || 'generic';
+        if (!tagMap.has(tagId)) {
+          tagMap.set(tagId, {
+            id: tagId,
+            name: tagId.charAt(0).toUpperCase() + tagId.slice(1).replace(/_/g, ' '),
+            color: '#0071e3',
+            precedence: 50,
+            builtin: false,
+          });
+        }
+      });
+    }
 
     return Array.from(tagMap.values());
   }
 
   renderDevicesView() {
+    if (!this.viewContainer) return;
     let html = `<div style="display: flex; flex-direction: column; gap: 24px;">`;
     const effectiveTags = this.getEffectiveTags();
 
     effectiveTags.forEach((tag) => {
-      const groupDevs = this.devices.filter((d) => {
+      const groupDevs = (this.devices || []).filter((d) => {
+        if (!d) return false;
         const devTag = (d.tags && d.tags[0]) || 'generic';
         const matchesGroup = devTag === tag.id;
 
@@ -252,14 +287,14 @@ class LiasDashboard {
         return matchesGroup && matchesQuery;
       });
 
-      const tagPolicies = this.policies.filter((p) => p.type === 'tag' && p.target_id === tag.id);
+      const tagPolicies = (this.policies || []).filter((p) => p && p.type === 'tag' && p.target_id === tag.id);
       const isCollapsed = !!this.collapsedGroups[tag.id];
 
       let tagPolicyBadges = '';
       if (tagPolicies.length > 0) {
         tagPolicyBadges = tagPolicies
           .map((p) => {
-            const schedObj = p.schedule_id ? this.schedules.find((s) => s.id === p.schedule_id) : null;
+            const schedObj = p.schedule_id ? (this.schedules || []).find((s) => s && s.id === p.schedule_id) : null;
             const schedName = schedObj ? schedObj.name : '';
             const label = p.action === 'schedule' ? `SCHEDULE (${schedName})` : p.action.toUpperCase();
             return `
@@ -300,7 +335,6 @@ class LiasDashboard {
           const vendorName = d.vendor || d.manufacturer || 'Generic Hardware';
           const lastSeenHTML = this.formatLastSeen(d.last_seen, d.online);
 
-          // Priority: d.hostname -> d.friendly_name -> 'Unknown Device'
           const displayName = (d.hostname && d.hostname.trim()) || 
                               (d.friendly_name && d.friendly_name.trim()) || 
                               'Unknown Device';
@@ -364,7 +398,7 @@ class LiasDashboard {
         const polId = e.currentTarget.getAttribute('data-del-pol');
         try {
           await API.deletePolicy(polId);
-          this.policies = this.policies.filter((p) => p.id !== polId);
+          this.policies = (this.policies || []).filter((p) => p && p.id !== polId);
           this.renderDevicesView();
           this.showToast('Policy removed from group', 'success');
         } catch (err) {
@@ -379,7 +413,7 @@ class LiasDashboard {
         const newTagId = e.currentTarget.value;
         try {
           await API.assignDeviceTag(pdid, newTagId);
-          const dev = this.devices.find((d) => d.pdid === pdid);
+          const dev = (this.devices || []).find((d) => d && d.pdid === pdid);
           if (dev) dev.tags = [newTagId];
           this.renderDevicesView();
           this.showToast('Device reassigned & saved persistently', 'success');
@@ -391,6 +425,7 @@ class LiasDashboard {
   }
 
   renderSchedulesView() {
+    if (!this.viewContainer) return;
     let html = `
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
         <h3>Time Schedules</h3>
@@ -399,17 +434,18 @@ class LiasDashboard {
       <div style="display: flex; flex-direction: column; gap: 14px;">
     `;
 
-    if (this.schedules.length === 0) {
+    if (!this.schedules || this.schedules.length === 0) {
       html += `<div class="card"><p style="color: var(--text-secondary);">No time schedules configured.</p></div>`;
     } else {
       this.schedules.forEach((s) => {
+        if (!s) return;
         let rulesSummary = '';
         if (s.rules && s.rules.length > 0) {
           rulesSummary = s.rules
             .map(
               (r) =>
                 `<span style="display: inline-block; padding: 4px 10px; border-radius: 6px; background: var(--bg-tertiary); font-size: 12px; margin-right: 6px; margin-top: 6px; font-weight: 600;">
-                  ${r.days.join(', ').toUpperCase()}: ${r.start_time} - ${r.end_time} (${r.action.toUpperCase()})
+                  ${(r.days || []).join(', ').toUpperCase()}: ${r.start_time} - ${r.end_time} (${(r.action || 'block').toUpperCase()})
                 </span>`
             )
             .join('');
@@ -453,7 +489,7 @@ class LiasDashboard {
         const id = e.currentTarget.getAttribute('data-del-sched');
         try {
           await API.deleteSchedule(id);
-          this.schedules = this.schedules.filter((s) => s.id !== id);
+          this.schedules = (this.schedules || []).filter((s) => s && s.id !== id);
           this.renderSchedulesView();
           this.showToast('Schedule removed', 'success');
         } catch (err) {
@@ -464,6 +500,7 @@ class LiasDashboard {
   }
 
   renderPoliciesView() {
+    if (!this.viewContainer) return;
     this.viewContainer.innerHTML = `
       <div class="card">
         <h3>Policy Rules Summary</h3>
@@ -475,18 +512,19 @@ class LiasDashboard {
   }
 
   renderSettingsView() {
+    if (!this.viewContainer) return;
     this.viewContainer.innerHTML = `
       <div class="card">
         <h3>System Settings</h3>
         <p style="color: var(--text-secondary); margin-top: 8px;">
-          LIAS Version: 2.0 &bull; Netfilter Table: <code>netdev lancontrol</code>
+          LIAS Version: 2.1 &bull; Netfilter Table: <code>netdev lancontrol</code>
         </p>
       </div>
     `;
   }
 
   openScheduleModal(scheduleId = null) {
-    const existingSched = scheduleId ? this.schedules.find((s) => s.id === scheduleId) : null;
+    const existingSched = scheduleId ? (this.schedules || []).find((s) => s && s.id === scheduleId) : null;
 
     let detectedTz = 'UTC';
     try {
@@ -499,7 +537,6 @@ class LiasDashboard {
     const tz = existingSched ? existingSched.timezone : detectedTz;
     const firstRule = existingSched && existingSched.rules && existingSched.rules[0] ? existingSched.rules[0] : { days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_time: '22:00', end_time: '06:00', action: 'block' };
 
-    // Format start and end times to strict 24-hour "HH:MM" for HTML5 <input type="time">
     const startTime24 = this.ensure24Hour(firstRule.start_time);
     const endTime24 = this.ensure24Hour(firstRule.end_time);
 
@@ -600,7 +637,7 @@ class LiasDashboard {
         if (scheduleId) {
           payload.id = scheduleId;
           const updated = await API.updateSchedule(scheduleId, payload);
-          const idx = this.schedules.findIndex((s) => s.id === scheduleId);
+          const idx = (this.schedules || []).findIndex((s) => s && s.id === scheduleId);
           if (idx !== -1) this.schedules[idx] = updated;
           this.showToast('Schedule updated successfully', 'success');
         } else {
@@ -620,7 +657,7 @@ class LiasDashboard {
   }
 
   openTagPolicyModal(tagId) {
-    const tag = this.tags.find((t) => t.id === tagId);
+    const tag = (this.tags || []).find((t) => t && t.id === tagId);
     if (!tag) return;
 
     this.modalTitle.textContent = `Attach Policy / Schedule to ${tag.name}`;
@@ -643,7 +680,7 @@ class LiasDashboard {
         <div id="tag-sched-container" style="display: none;">
           <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Select Time Schedule</label>
           <select id="tag-sched-select" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
-            ${this.schedules.map((s) => `<option value="${s.id}">${s.name} (${s.timezone})</option>`).join('')}
+            ${(this.schedules || []).map((s) => `<option value="${s.id}">${s.name} (${s.timezone})</option>`).join('')}
           </select>
         </div>
       </div>
@@ -689,10 +726,11 @@ class LiasDashboard {
     this.showModal();
   }
 
-  showModal() { this.modalRoot.classList.remove('hidden'); }
-  hideModal() { this.modalRoot.classList.add('hidden'); }
+  showModal() { if (this.modalRoot) this.modalRoot.classList.remove('hidden'); }
+  hideModal() { if (this.modalRoot) this.modalRoot.classList.add('hidden'); }
 
   showToast(message, type = 'info') {
+    if (!this.toastRoot) return;
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
     toast.textContent = message;
