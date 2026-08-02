@@ -2,7 +2,7 @@
 // from multiple providers into canonical device records.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 1.7
+// Version: 1.8
 package correlation
 
 import (
@@ -16,6 +16,7 @@ import (
 	"github.com/user/lias-dis/apps/discovery-service/internal/api"
 	"github.com/user/lias-dis/apps/discovery-service/internal/discovery"
 	"github.com/user/lias-dis/apps/discovery-service/internal/inventory"
+	"github.com/user/lias-dis/apps/discovery-service/internal/storage"
 	"github.com/user/lias-dis/shared/models"
 )
 
@@ -26,6 +27,7 @@ type EnrichmentOrchestrator interface {
 type Engine struct {
 	cache       *inventory.Cache
 	broker      *api.Broker
+	store       *storage.Storage
 	orch        EnrichmentOrchestrator
 	dedupMu     sync.Mutex
 	lastSeenObs map[string]time.Time
@@ -41,6 +43,10 @@ func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
 
 func (e *Engine) SetOrchestrator(orch EnrichmentOrchestrator) {
 	e.orch = orch
+}
+
+func (e *Engine) SetStorage(store *storage.Storage) {
+	e.store = store
 }
 
 func (e *Engine) Run(ctx context.Context, providers []discovery.DiscoveryProvider) {
@@ -101,7 +107,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	}
 	ipStr := ""
 	if obs.IP != nil {
-		ipStr = obs.IP.String()
+		ipStr = strings.TrimSpace(obs.IP.String())
 	}
 
 	if macStr == "" && ipStr == "" {
@@ -114,13 +120,16 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
 	cleanHost := discovery.UnescapeHostname(obs.Hostname)
 
-	// Handle offline event
+	// Handle offline observation
 	if !obs.Online {
 		d := e.cache.GetByMACOrIP(macStr, ipStr)
 		if d != nil && d.Online {
 			d.Online = false
 			d.LastSeen = time.Now()
 			e.cache.Upsert(d)
+			if e.store != nil {
+				_ = e.store.SaveDevice(d)
+			}
 			e.broker.Broadcast(models.NewEvent(models.EventDeviceOffline, d.PDID, models.DeviceEventPayload{
 				PDID:      d.PDID,
 				MAC:       macStr,
@@ -132,8 +141,29 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// Handle online observation
+	// 1. DHCP IP-REUSE GUARD
+	// Check if IP matches an existing device record whose known MACs do NOT include the incoming MAC
+	if ipStr != "" && macStr != "" {
+		if ipMatch := e.cache.GetByIP(ipStr); ipMatch != nil {
+			hasMAC := false
+			for _, m := range ipMatch.MACs {
+				if inventory.NormalizeMAC(m) == macStr {
+					hasMAC = true
+					break
+				}
+			}
+			if !hasMAC {
+				slog.Info("DHCP IP reassignment detected, invalidating stale IP binding",
+					"ip", ipStr, "old_pdid", ipMatch.PDID, "new_mac", macStr)
+				e.cache.RemoveIPIndex(ipStr)
+			}
+		}
+	}
+
+	// 2. QUERY CACHE
 	d := e.cache.GetByMACOrIP(macStr, ipStr)
+
+	// Handle new device discovery
 	if d == nil {
 		pdid := inventory.GeneratePDID(macStr, cleanHost, obs.Vendor)
 		d = &models.Device{
@@ -152,10 +182,15 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		}
 		d.Touch(time.Now())
 
-		// Auto-classify Gateway Routers and Amazon Alexa devices
 		ApplySmartClassifications(d)
 
 		e.cache.Upsert(d)
+		if e.store != nil {
+			if err := e.store.SaveDevice(d); err != nil {
+				slog.Error("Failed to persist new device record to SQLite", "pdid", d.PDID, "error", err)
+			}
+		}
+
 		slog.Info("New device correlated", "pdid", pdid, "mac", macStr, "ip", ipStr, "vendor", d.Vendor, "type", d.DeviceType)
 		e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
 
@@ -165,7 +200,38 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// Update existing device
+	// 3. TENTATIVE PDID PROMOTION
+	// Upgrade pdid_tentative_... to deterministic pdid_mac_v1_... when MAC is learned
+	if macStr != "" && strings.HasPrefix(d.PDID, "pdid_tentative_") {
+		oldPDID := d.PDID
+		newPDID := inventory.GeneratePDID(macStr, cleanHost, d.Vendor)
+
+		slog.Info("Promoting tentative PDID to deterministic MAC-seeded PDID",
+			"old_pdid", oldPDID, "new_pdid", newPDID, "mac", macStr)
+
+		e.cache.Delete(oldPDID)
+		if e.store != nil {
+			_ = e.store.DeleteDevice(oldPDID)
+		}
+
+		d.PDID = newPDID
+		d.AddMAC(macStr)
+		d.AddIP(ipStr)
+		d.Touch(time.Now())
+		ApplySmartClassifications(d)
+
+		e.cache.Upsert(d)
+		if e.store != nil {
+			_ = e.store.SaveDevice(d)
+		}
+
+		// Broadcast lifecycle migration events to downstream consumers (LIAS)
+		e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
+		e.broker.Broadcast(models.NewEvent(models.EventDeviceRemoved, oldPDID, nil))
+		return
+	}
+
+	// 4. UPDATE EXISTING DEVICE RECORD
 	changed := false
 	var eventTypes []models.EventType
 	payload := models.DeviceEventPayload{
@@ -216,6 +282,9 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	d.Touch(time.Now())
 	if changed {
 		e.cache.Upsert(d)
+		if e.store != nil {
+			_ = e.store.SaveDevice(d)
+		}
 		for _, et := range eventTypes {
 			e.broker.Broadcast(models.NewEvent(et, d.PDID, payload))
 		}
