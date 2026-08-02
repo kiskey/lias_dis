@@ -1,0 +1,272 @@
+// Package storage provides CGO-free SQLite persistence for DIS device state.
+//
+// File:    apps/discovery-service/internal/storage/sqlite.go
+// Version: 1.0
+package storage
+
+import (
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/user/lias-dis/shared/models"
+	_ "modernc.org/sqlite"
+)
+
+// Storage handles persistent SQLite storage for DIS correlated devices.
+type Storage struct {
+	mu     sync.Mutex
+	dbPath string
+	db     *sql.DB
+}
+
+// NewStorage initializes the DIS SQLite persistence engine.
+func NewStorage(dbPath string) (*Storage, error) {
+	if dbPath == "" {
+		dbPath = "/var/lib/dis/state.db"
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create database directory: %w", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
+	}
+
+	// Enable WAL mode and busy timeout for concurrent safety
+	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
+		slog.Warn("Failed to set PRAGMAs on DIS database", "error", err)
+	}
+
+	s := &Storage{
+		dbPath: dbPath,
+		db:     db,
+	}
+
+	if err := s.initSchema(); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	slog.Info("DIS SQLite storage engine initialized", "path", dbPath)
+	return s, nil
+}
+
+func (s *Storage) initSchema() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+	CREATE TABLE IF NOT EXISTS devices (
+		pdid TEXT PRIMARY KEY,
+		hostname TEXT NOT NULL DEFAULT '',
+		friendly_name TEXT NOT NULL DEFAULT '',
+		manufacturer TEXT NOT NULL DEFAULT '',
+		vendor TEXT NOT NULL DEFAULT '',
+		model TEXT NOT NULL DEFAULT '',
+		device_type TEXT NOT NULL DEFAULT '',
+		confidence REAL NOT NULL DEFAULT 0.0,
+		first_seen DATETIME NOT NULL,
+		last_seen DATETIME NOT NULL,
+		online INTEGER NOT NULL DEFAULT 1
+	);
+
+	CREATE TABLE IF NOT EXISTS device_macs (
+		pdid TEXT NOT NULL,
+		mac TEXT PRIMARY KEY,
+		FOREIGN KEY(pdid) REFERENCES devices(pdid) ON DELETE CASCADE
+	);
+
+	CREATE TABLE IF NOT EXISTS device_ips (
+		pdid TEXT NOT NULL,
+		ip TEXT PRIMARY KEY,
+		FOREIGN KEY(pdid) REFERENCES devices(pdid) ON DELETE CASCADE
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_mac_pdid ON device_macs(pdid);
+	CREATE INDEX IF NOT EXISTS idx_ip_pdid ON device_ips(pdid);
+	`
+
+	_, err := s.db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to execute DIS schema initialization: %w", err)
+	}
+	return nil
+}
+
+// LoadHydrate restores all correlated device records from disk on service startup.
+func (s *Storage) LoadHydrate() ([]models.Device, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(`
+		SELECT pdid, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online
+		FROM devices
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query devices from DB: %w", err)
+	}
+	defer rows.Close()
+
+	deviceMap := make(map[string]*models.Device)
+
+	for rows.Next() {
+		var d models.Device
+		var onlineInt int
+		var firstSeen, lastSeen time.Time
+
+		err := rows.Scan(
+			&d.PDID, &d.Hostname, &d.FriendlyName, &d.Manufacturer, &d.Vendor,
+			&d.Model, &d.DeviceType, &d.Confidence, &firstSeen, &lastSeen, &onlineInt,
+		)
+		if err != nil {
+			continue
+		}
+
+		d.FirstSeen = firstSeen
+		d.LastSeen = lastSeen
+		d.Online = onlineInt == 1
+		d.MACs = []string{}
+		d.IPs = []string{}
+		d.SourceInfo = make(map[string]models.SourceMeta)
+
+		devCopy := d
+		deviceMap[d.PDID] = &devCopy
+	}
+
+	// Hydrate MAC addresses
+	macRows, err := s.db.Query("SELECT pdid, mac FROM device_macs")
+	if err == nil {
+		defer macRows.Close()
+		for macRows.Next() {
+			var pdid, mac string
+			if err := macRows.Scan(&pdid, &mac); err == nil {
+				if dev, found := deviceMap[pdid]; found {
+					dev.AddMAC(mac)
+				}
+			}
+		}
+	}
+
+	// Hydrate IP addresses
+	ipRows, err := s.db.Query("SELECT pdid, ip FROM device_ips")
+	if err == nil {
+		defer ipRows.Close()
+		for ipRows.Next() {
+			var pdid, ip string
+			if err := ipRows.Scan(&pdid, &ip); err == nil {
+				if dev, found := deviceMap[pdid]; found {
+					dev.AddIP(ip)
+				}
+			}
+		}
+	}
+
+	devices := make([]models.Device, 0, len(deviceMap))
+	for _, dev := range deviceMap {
+		devices = append(devices, *dev)
+	}
+
+	slog.Info("Successfully hydrated DIS device inventory from SQLite", "count", len(devices))
+	return devices, nil
+}
+
+// SaveDevice persists or updates a correlated device record and its secondary MAC/IP indices.
+func (s *Storage) SaveDevice(d *models.Device) error {
+	if d == nil || d.PDID == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	onlineInt := 0
+	if d.Online {
+		onlineInt = 1
+	}
+
+	_, err = tx.Exec(`
+		INSERT INTO devices (pdid, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(pdid) DO UPDATE SET
+			hostname=excluded.hostname,
+			friendly_name=excluded.friendly_name,
+			manufacturer=excluded.manufacturer,
+			vendor=excluded.vendor,
+			model=excluded.model,
+			device_type=excluded.device_type,
+			confidence=excluded.confidence,
+			last_seen=excluded.last_seen,
+			online=excluded.online
+	`, d.PDID, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt)
+
+	if err != nil {
+		return fmt.Errorf("failed to upsert device %s: %w", d.PDID, err)
+	}
+
+	// Upsert MACs
+	for _, mac := range d.MACs {
+		if mac != "" {
+			_, _ = tx.Exec(`
+				INSERT INTO device_macs (pdid, mac) VALUES (?, ?)
+				ON CONFLICT(mac) DO UPDATE SET pdid=excluded.pdid
+			`, d.PDID, mac)
+		}
+	}
+
+	// Upsert IPs
+	for _, ip := range d.IPs {
+		if ip != "" {
+			_, _ = tx.Exec(`
+				INSERT INTO device_ips (pdid, ip) VALUES (?, ?)
+				ON CONFLICT(ip) DO UPDATE SET pdid=excluded.pdid
+			`, d.PDID, ip)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// DeleteDevice removes a device and its secondary index records from SQLite.
+func (s *Storage) DeleteDevice(pdid string) error {
+	if pdid == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, _ = tx.Exec("DELETE FROM device_macs WHERE pdid = ?", pdid)
+	_, _ = tx.Exec("DELETE FROM device_ips WHERE pdid = ?", pdid)
+	_, _ = tx.Exec("DELETE FROM devices WHERE pdid = ?", pdid)
+
+	return tx.Commit()
+}
+
+// Close closes the underlying database handle.
+func (s *Storage) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
+}
