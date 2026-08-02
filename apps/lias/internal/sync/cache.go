@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/cache.go
-// Version: 1.2
+// Version: 1.3
 package sync
 
 import (
@@ -12,8 +12,6 @@ import (
 	"github.com/user/lias-dis/shared/models"
 )
 
-// LocalDevice represents the LIAS view of a network device, combining base DIS attributes
-// with local access management overlays.
 type LocalDevice struct {
 	models.Device
 	Tags            []string       `json:"tags"`
@@ -21,20 +19,31 @@ type LocalDevice struct {
 	NextStateChange *time.Time     `json:"next_state_change,omitempty"`
 }
 
-// Cache is a thread-safe in-memory store for LIAS local device mirrors.
 type Cache struct {
-	mu      sync.RWMutex
-	devices map[string]*LocalDevice
+	mu         sync.RWMutex
+	devices    map[string]*LocalDevice
+	stickyTags map[string]string // Sticky user-assigned tags: PDID -> TagID
 }
 
-// NewCache initializes a new local device cache.
 func NewCache() *Cache {
 	return &Cache{
-		devices: make(map[string]*LocalDevice),
+		devices:    make(map[string]*LocalDevice),
+		stickyTags: make(map[string]string),
 	}
 }
 
-// Get retrieves a local device record by PDID. Returns nil if not found.
+// LoadStickyTags populates the in-memory sticky tag mapping from storage on boot.
+func (c *Cache) LoadStickyTags(tags map[string]string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for pdid, tagID := range tags {
+		c.stickyTags[pdid] = tagID
+		if d, ok := c.devices[pdid]; ok {
+			d.Tags = []string{tagID}
+		}
+	}
+}
+
 func (c *Cache) Get(pdid string) *LocalDevice {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -43,13 +52,10 @@ func (c *Cache) Get(pdid string) *LocalDevice {
 	if !ok {
 		return nil
 	}
-
-	// Return a deep copy to prevent race conditions during concurrent updates
 	devCopy := *d
 	return &devCopy
 }
 
-// List returns a slice containing all local device records.
 func (c *Cache) List() []LocalDevice {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -61,7 +67,7 @@ func (c *Cache) List() []LocalDevice {
 	return list
 }
 
-// UpsertDevice adds or updates a base device record from DIS while preserving local LIAS overlays.
+// UpsertDevice adds or updates a base device record from DIS while preserving sticky local tags.
 func (c *Cache) UpsertDevice(d models.Device) {
 	if d.PDID == "" {
 		return
@@ -70,31 +76,38 @@ func (c *Cache) UpsertDevice(d models.Device) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Resolve tag assignment: Sticky user tag > existing tag > DIS tag > "generic"
+	assignedTag := "generic"
+	if sticky, found := c.stickyTags[d.PDID]; found && sticky != "" {
+		assignedTag = sticky
+	} else if existing, ok := c.devices[d.PDID]; ok && len(existing.Tags) > 0 {
+		assignedTag = existing.Tags[0]
+	} else if len(d.Tags) > 0 && d.Tags[0] != "" {
+		assignedTag = d.Tags[0]
+	}
+
 	if existing, ok := c.devices[d.PDID]; ok {
-		tags := existing.Tags
 		pol := existing.Policy
 		nextChange := existing.NextStateChange
 
 		existing.Device = d
-		existing.Tags = tags
+		existing.Tags = []string{assignedTag}
 		existing.Policy = pol
 		existing.NextStateChange = nextChange
 	} else {
 		c.devices[d.PDID] = &LocalDevice{
 			Device: d,
-			Tags:   []string{"generic"}, // Default tag assignment per §4.7
+			Tags:   []string{assignedTag},
 		}
 	}
 }
 
-// RemoveDevice deletes a device record from the local cache.
 func (c *Cache) RemoveDevice(pdid string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.devices, pdid)
 }
 
-// SetPolicy assigns a policy overlay to a device in the local cache.
 func (c *Cache) SetPolicy(pdid string, p *models.Policy) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -103,20 +116,22 @@ func (c *Cache) SetPolicy(pdid string, p *models.Policy) {
 	}
 }
 
-// SetTags assigns tags to a device in the local cache.
 func (c *Cache) SetTags(pdid string, tags []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	tagID := "generic"
+	if len(tags) > 0 && tags[0] != "" {
+		tagID = tags[0]
+	}
+
+	c.stickyTags[pdid] = tagID
+
 	if d, ok := c.devices[pdid]; ok {
-		if len(tags) == 0 {
-			d.Tags = []string{"generic"}
-		} else {
-			d.Tags = tags
-		}
+		d.Tags = []string{tagID}
 	}
 }
 
-// SetNextStateChange updates the next state change timestamp for scheduled devices.
 func (c *Cache) SetNextStateChange(pdid string, t *time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
