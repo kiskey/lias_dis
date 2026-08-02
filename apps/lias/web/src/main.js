@@ -1,7 +1,7 @@
 /*
  * LIAS Control Center - Main Dashboard Application
  * File:    apps/lias/web/src/main.js
- * Version: 2.1 (Resilient Boot Lifecycle, Error State Cards, HIG Segmented Day Tiles)
+ * Version: 2.2 (Restored renderCurrentView Method, Complete Null Safety, Real-Time SSE)
  */
 
 import { API } from './api.js';
@@ -84,7 +84,6 @@ class LiasDashboard {
       this.renderCurrentView();
     } catch (err) {
       console.error('Silent refresh error:', err);
-      // If view is still showing the loader, replace with error state UI
       if (this.viewContainer && this.viewContainer.querySelector('.loader')) {
         this.renderErrorState(err);
       }
@@ -133,6 +132,29 @@ class LiasDashboard {
     if (this.viewTitle) this.viewTitle.textContent = titles[view] || 'Dashboard';
 
     this.renderCurrentView();
+  }
+
+  // RESTORED METHOD: Renders active view based on currentView property
+  renderCurrentView() {
+    switch (this.currentView) {
+      case 'dashboard':
+        this.renderDashboardView();
+        break;
+      case 'devices':
+        this.renderDevicesView();
+        break;
+      case 'schedules':
+        this.renderSchedulesView();
+        break;
+      case 'policies':
+        this.renderPoliciesView();
+        break;
+      case 'settings':
+        this.renderSettingsView();
+        break;
+      default:
+        this.renderDashboardView();
+    }
   }
 
   formatLastSeen(isoStr, isOnline) {
@@ -517,7 +539,7 @@ class LiasDashboard {
       <div class="card">
         <h3>System Settings</h3>
         <p style="color: var(--text-secondary); margin-top: 8px;">
-          LIAS Version: 2.1 &bull; Netfilter Table: <code>netdev lancontrol</code>
+          LIAS Version: 2.2 &bull; Netfilter Table: <code>netdev lancontrol</code>
         </p>
       </div>
     `;
