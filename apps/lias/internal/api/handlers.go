@@ -1,7 +1,7 @@
 // Package api implements the HTTP server and REST handlers for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 1.3
+// Version: 1.4
 package api
 
 import (
@@ -20,7 +20,6 @@ import (
 	"github.com/user/lias-dis/shared/models"
 )
 
-// Handlers contains the HTTP handlers for the LIAS REST API.
 type Handlers struct {
 	cache    *liasSync.Cache
 	tagMgr   *tags.Manager
@@ -31,7 +30,6 @@ type Handlers struct {
 	trigger  chan struct{}
 }
 
-// NewHandlers creates a new Handlers instance.
 func NewHandlers(
 	cache *liasSync.Cache,
 	tagMgr *tags.Manager,
@@ -52,32 +50,26 @@ func NewHandlers(
 	}
 }
 
-// RegisterRoutes wires the handlers to the HTTP mux using Go 1.22+ routing patterns.
 func (h *Handlers) RegisterRoutes(mux *http.ServeMux) {
-	// Devices
 	mux.HandleFunc("GET /api/v1/devices", h.ListDevices)
 	mux.HandleFunc("GET /api/v1/devices/{pdid}", h.GetDevice)
 	mux.HandleFunc("POST /api/v1/devices/{pdid}/tags", h.AssignDeviceTag)
 
-	// Tags
 	mux.HandleFunc("GET /api/v1/tags", h.ListTags)
 	mux.HandleFunc("POST /api/v1/tags", h.CreateTag)
 	mux.HandleFunc("PUT /api/v1/tags/{id}", h.UpdateTag)
 	mux.HandleFunc("DELETE /api/v1/tags/{id}", h.DeleteTag)
 
-	// Policies
 	mux.HandleFunc("GET /api/v1/policies", h.ListPolicies)
 	mux.HandleFunc("POST /api/v1/policies", h.CreatePolicy)
 	mux.HandleFunc("PUT /api/v1/policies/{id}", h.UpdatePolicy)
 	mux.HandleFunc("DELETE /api/v1/policies/{id}", h.DeletePolicy)
 
-	// Schedules
 	mux.HandleFunc("GET /api/v1/schedules", h.ListSchedules)
 	mux.HandleFunc("POST /api/v1/schedules", h.CreateSchedule)
 	mux.HandleFunc("PUT /api/v1/schedules/{id}", h.UpdateSchedule)
 	mux.HandleFunc("DELETE /api/v1/schedules/{id}", h.DeleteSchedule)
 
-	// System
 	mux.HandleFunc("POST /api/v1/nftables/flush", h.FlushNftables)
 }
 
@@ -87,8 +79,6 @@ func (h *Handlers) tryTrigger() {
 	default:
 	}
 }
-
-// --- Devices ---
 
 func (h *Handlers) ListDevices(w http.ResponseWriter, r *http.Request) {
 	localDevs := h.cache.List()
@@ -126,11 +116,14 @@ func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.cache.SetTags(pdid, []string{req.TagID})
+
+	if h.store != nil {
+		_ = h.store.SaveDeviceTag(pdid, req.TagID)
+	}
+
 	h.tryTrigger()
 	w.WriteHeader(http.StatusNoContent)
 }
-
-// --- Tags ---
 
 func (h *Handlers) ListTags(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -196,8 +189,6 @@ func (h *Handlers) DeleteTag(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// --- Policies ---
-
 func (h *Handlers) ListPolicies(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(h.polEng.ListPolicies())
@@ -209,7 +200,9 @@ func (h *Handlers) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
 		return
 	}
-	p.ID = "pol_" + generateID()
+	if p.ID == "" {
+		p.ID = "pol_" + generateID()
+	}
 	h.polEng.UpsertPolicy(p)
 
 	if h.store != nil {
@@ -253,8 +246,6 @@ func (h *Handlers) DeletePolicy(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// --- Schedules ---
-
 func (h *Handlers) ListSchedules(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(h.schedEng.ListSchedules())
@@ -266,7 +257,9 @@ func (h *Handlers) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
 		return
 	}
-	s.ID = "sched_" + generateID()
+	if s.ID == "" {
+		s.ID = "sched_" + generateID()
+	}
 	h.schedEng.UpsertSchedule(s)
 
 	if h.store != nil {
@@ -309,8 +302,6 @@ func (h *Handlers) DeleteSchedule(w http.ResponseWriter, r *http.Request) {
 	h.tryTrigger()
 	w.WriteHeader(http.StatusNoContent)
 }
-
-// --- System ---
 
 func (h *Handlers) FlushNftables(w http.ResponseWriter, r *http.Request) {
 	if err := h.nftCtrl.FlushTable(); err != nil {
