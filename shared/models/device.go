@@ -2,7 +2,7 @@
 // Discovery Intelligence Service (DIS) and the LAN Internet Access Scheduler (LIAS).
 //
 // File:    shared/models/device.go
-// Version: 1.2
+// Version: 1.3
 package models
 
 import (
@@ -42,6 +42,40 @@ type SourceMeta struct {
 	Confidence float64                `json:"confidence"`
 	Timestamp  time.Time              `json:"timestamp"`
 	Raw        map[string]interface{} `json:"raw,omitempty"`
+}
+
+// PDIDRecord aggregates all known identity observations for a Persistent Device Identity.
+type PDIDRecord struct {
+	ID         string       `json:"id"`
+	PrimaryMAC string       `json:"primary_mac"`
+	KnownMACs  []string     `json:"known_macs"`
+	KnownIPs   []string     `json:"known_ips"`
+	Hostnames  []string     `json:"hostnames"`
+	MergeLog   []MergeEvent `json:"merge_log,omitempty"`
+	Confidence float64      `json:"confidence"`
+}
+
+// MergeEvent records a single correlation merge decision in the PDID history.
+type MergeEvent struct {
+	Timestamp  time.Time `json:"timestamp"`
+	Reason     string    `json:"reason"`
+	FromMAC    string    `json:"from_mac"`
+	ToPDID     string    `json:"to_pdid"`
+	Confidence float64   `json:"confidence"`
+}
+
+// Enrichment represents the structured output of an Enricher invocation.
+type Enrichment struct {
+	Hostname     string                 `json:"hostname,omitempty"`
+	FriendlyName string                 `json:"friendly_name,omitempty"`
+	Manufacturer string                 `json:"manufacturer,omitempty"`
+	Vendor       string                 `json:"vendor,omitempty"`
+	Model        string                 `json:"model,omitempty"`
+	DeviceType   string                 `json:"device_type,omitempty"`
+	Services     []string               `json:"services,omitempty"`
+	Confidence   float64                `json:"confidence"`
+	Source       string                 `json:"source"`
+	Raw          map[string]interface{} `json:"raw,omitempty"`
 }
 
 // FormatMAC normalizes a HardwareAddr to colon-separated lowercase form.
