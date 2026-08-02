@@ -43,46 +43,99 @@ Binaries will be placed in the `bin/` directory.
 
 ### DIS Config (`/etc/dis/config.yaml`)
 ```yaml
-http:
-  listen: ":8080"
+# ==============================================================================
+# Discovery Intelligence Service (DIS) Configuration
+# Version: 1.4
+# File: /etc/dis/config.yaml
+# ==============================================================================
 
+# HTTP Server Settings for the DIS REST API and SSE Event Stream
+http:
+  listen: ":8080"            # Address and port to bind (default: ":8080")
+  auth_token: ""             # Optional Bearer token for API authentication (empty = open LAN)
+
+# Network Discovery & Observation Providers
 discovery:
-  interface: "eth0"
+  interface: "eth0"          # Primary network interface to monitor (default: "eth0")
+
+  # Real-time Kernel Netlink Provider (ARP/NDP table subscription)
   netlink:
-    enabled: true
+    enabled: true            # Enable real-time kernel netlink neighbor monitoring
+
+  # Pi-hole v6 API Activity Intelligence Provider
   pihole:
-    enabled: true
-    url: "http://pi.hole"
-    password: "your_password"
+    enabled: true            # Enable polling active DNS clients from Pi-hole
+    url: "http://pi.hole"    # Pi-hole v6 base API URL (e.g., http://192.168.1.2 or http://pi.hole)
+    password: "your_pihole_password" # Pi-hole web password (used for /api/auth session tokens)
+
+  # DHCP Lease File Provider
   dhcp:
-    enabled: true
+    enabled: true            # Enable reading DHCP leases to map hostnames and IPs
+    type: "router"           # DHCP server type: "router", "pihole", "dnsmasq", or "kea"
+    
+    # Select ONE of the 3 data source strategies below:
+    # --------------------------------------------------------------------------
+    # Option A: Remote SSH Execution (Recommended for OpenWrt/Routers)
+    ssh_host: "192.168.1.1"  # Router IP to fetch /tmp/dhcp.leases via SSH key
+    ssh_user: "root"         # SSH username (default: "root")
+    
+    # Option B: Remote HTTP URL Fetching
+    lease_url: ""            # e.g., "http://192.168.1.1/dhcp.leases"
+    
+    # Option C: Local File Path (If DIS runs on the router itself or uses NFS)
     lease_file: "/tmp/dhcp.leases"
+
+  # On-Demand Device Fingerprinting & Enrichment Pipeline
   enrichment:
-    nmap_enabled: true
-    avahi_enabled: true
-    ssdp_enabled: true
-    netbios_enabled: true
+    avahi_enabled: true       # Enable mDNS service discovery via system avahi-browse
+    ssdp_enabled: true        # Enable native Go UPnP multicast M-SEARCH discovery
+    netbios_enabled: true     # Enable UDP port 137 NetBIOS node status queries
+    nmap_enabled: true        # Enable Nmap port and OS fingerprinting fallback
+    unknown_device_scan: true # Automatically trigger enrichment for unclassified devices
+    validation_interval: "24h"# Periodic re-validation check interval for known devices (default: "24h")
+
+# Logging Output Settings
+logging:
+  level: "info"              # Log verbosity: "debug", "info", "warn", or "error" (default: "info")
+  format: "json"             # Log format: "json" or "text" (default: "json")
 ```
 
 ### LIAS Config (`/etc/lias/config.yaml`)
 ```yaml
+# ==============================================================================
+# LAN Internet Access Scheduler (LIAS) Configuration
+# Version: 1.5
+# File: /etc/lias/config.yaml
+# ==============================================================================
+
+# HTTP Server Settings for the LIAS API and Embedded Apple HIG Web Dashboard
 http:
-  listen: ":8081"
+  listen: ":8081"            # Address and port to bind (default: ":8081")
 
+# Discovery Intelligence Service (DIS) Connection Settings
 dis:
-  url: "http://192.168.1.10"
-  sync_interval: "30s"
+  url: "http://192.168.1.10" # DIS server IP or hostname (DIS port :8080 is targeted automatically)
+  auth_token: ""             # Bearer auth token if configured in DIS
+  sync_interval: "30s"       # Background REST poll interval fallback (default: "30s")
 
+# Isolated Netfilter Architecture (netdev ingress table)
 nftables:
-  interface: "eth0"
-  table_name: "lancontrol"
-  shutdown_behavior: "flush" # flush or persist
+  interface: "eth0"          # LAN-facing network interface to apply packet filtering (default: "eth0")
+  table_name: "lancontrol"   # Isolated netdev table name (default: "lancontrol")
+  shutdown_behavior: "flush" # Action on SIGTERM shutdown: "flush" (remove table) or "persist" (keep rules)
 
+# Schedule Engine Evaluation Defaults
 schedules:
-  timezone: "UTC"
+  timezone: "UTC"            # Default IANA timezone (e.g. "America/Los_Angeles", "Europe/London", "UTC")
 
+# CGO-Free Pure-Go SQLite Persistent Storage Engine
 storage:
-  path: "/var/lib/lias/state.db"
+  path: "/var/lib/lias/state.db" # Database file path for persisting Tags, Policies, and Schedules
+
+# Logging Output Settings
+logging:
+  level: "info"              # Log verbosity: "debug", "info", "warn", or "error" (default: "info")
+  format: "json"             # Log format: "json" or "text" (default: "json")
 ```
 
 ## Deployment
