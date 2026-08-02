@@ -1,131 +1,136 @@
 // Binary lias implements the LAN Internet Access Scheduler.
-// It consumes device data from DIS, evaluates policies and schedules,
-// and manages an isolated nftables table to enforce network access.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 1.3
+// Version: 1.4
 package main
 
 import (
-    "context"
-    "encoding/json"
-    "errors"
-    "log/slog"
-    "net/http"
-    "os"
-    "os/signal"
-    "syscall"
-    "time"
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-    liasAPI "github.com/user/lias-dis/apps/lias/internal/api"
-    "github.com/user/lias-dis/apps/lias/internal/config"
-    "github.com/user/lias-dis/apps/lias/internal/nftables"
-    "github.com/user/lias-dis/apps/lias/internal/policy"
-    "github.com/user/lias-dis/apps/lias/internal/schedule"
-    liasSync "github.com/user/lias-dis/apps/lias/internal/sync"
-    "github.com/user/lias-dis/apps/lias/internal/tags"
-    "github.com/user/lias-dis/apps/lias/web"
-    sharedAPI "github.com/user/lias-dis/shared/api"
+	liasAPI "github.com/user/lias-dis/apps/lias/internal/api"
+	"github.com/user/lias-dis/apps/lias/internal/config"
+	"github.com/user/lias-dis/apps/lias/internal/nftables"
+	"github.com/user/lias-dis/apps/lias/internal/policy"
+	"github.com/user/lias-dis/apps/lias/internal/schedule"
+	"github.com/user/lias-dis/apps/lias/internal/storage"
+	liasSync "github.com/user/lias-dis/apps/lias/internal/sync"
+	"github.com/user/lias-dis/apps/lias/internal/tags"
+	"github.com/user/lias-dis/apps/lias/web"
+	sharedAPI "github.com/user/lias-dis/shared/api"
 )
 
-// version is injected at build time using -ldflags "-X main.version=..."
 var version = "dev"
 
 func main() {
-    logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-    slog.SetDefault(logger)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
 
-    cfgPath := "/etc/lias/config.yaml"
-    if envPath := os.Getenv("LIAS_CONFIG"); envPath != "" {
-        cfgPath = envPath
-    }
+	cfgPath := "/etc/lias/config.yaml"
+	if envPath := os.Getenv("LIAS_CONFIG"); envPath != "" {
+		cfgPath = envPath
+	}
 
-    cfg, err := config.Load(cfgPath)
-    if err != nil {
-        slog.Error("Failed to load configuration", "error", err)
-        os.Exit(1)
-    }
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		slog.Error("Failed to load configuration", "error", err)
+		os.Exit(1)
+	}
 
-    // Core Components
-    cache := liasSync.NewCache()
-    trigger := make(chan struct{}, 1) // Buffered to prevent blocking
-    
-    // FIX: Pass trigger channel to NewDISClient
-    disClient := liasSync.NewDISClient(cfg.DIS, cache, trigger)
-    
-    tagMgr := tags.NewManager()
-    polEng := policy.NewEngine()
-    schedEng := schedule.NewEngine(cache)
+	// Core Components
+	cache := liasSync.NewCache()
+	trigger := make(chan struct{}, 1)
 
-    // nftables Controller
-    nftCtrl := nftables.NewController(cfg.Nftables)
-    if err := nftCtrl.Init(); err != nil {
-        slog.Error("Failed to initialize nftables", "error", err)
-        os.Exit(1)
-    }
+	tagMgr := tags.NewManager()
+	polEng := policy.NewEngine()
+	schedEng := schedule.NewEngine(cache)
 
-    builder := nftables.NewBuilder(cache, nftCtrl)
-    nftSync := nftables.NewSync(builder, polEng, schedEng, trigger)
+	// SQLite Storage Engine
+	store, err := storage.NewStorage(cfg.Storage.Path)
+	if err != nil {
+		slog.Warn("Storage initialization failed, running in memory-only mode", "error", err)
+	} else {
+		defer store.Close()
+		_ = store.LoadHydrate(tagMgr, polEng, schedEng)
+	}
 
-    // Context for graceful shutdown
-    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-    defer stop()
+	// DIS Client
+	disClient := liasSync.NewDISClient(cfg.DIS, cache, trigger)
 
-    // Start background loops
-    go disClient.Run(ctx)
-    go schedEng.Run(ctx)
-    go nftSync.Run(ctx)
+	// nftables Controller
+	nftCtrl := nftables.NewController(cfg.Nftables)
+	if err := nftCtrl.Init(); err != nil {
+		slog.Error("Failed to initialize nftables controller", "error", err)
+		os.Exit(1)
+	}
 
-    // API Server
-    mux := http.NewServeMux()
-    handlers := liasAPI.NewHandlers(cache, tagMgr, polEng, schedEng, nftCtrl, trigger)
-    handlers.RegisterRoutes(mux)
+	builder := nftables.NewBuilder(cache, nftCtrl)
+	nftSync := nftables.NewSync(builder, polEng, schedEng, trigger)
 
-    mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusOK)
-        _ = json.NewEncoder(w).Encode(sharedAPI.HealthResponse{
-            Status:  "ok",
-            Version: version,
-        })
-    })
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-    // Serve embedded Web UI
-    mux.Handle("/", http.FileServer(http.FS(web.FS())))
+	// Start background workers
+	go disClient.Run(ctx)
+	go schedEng.Run(ctx)
+	go nftSync.Run(ctx)
 
-    srv := &http.Server{
-        Addr:         cfg.HTTP.Listen,
-        Handler:      mux,
-        ReadTimeout:  10 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  120 * time.Second,
-    }
+	// API Handlers
+	mux := http.NewServeMux()
+	handlers := liasAPI.NewHandlers(cache, tagMgr, polEng, schedEng, nftCtrl, trigger)
+	handlers.RegisterRoutes(mux)
 
-    go func() {
-        slog.Info("Starting LAN Internet Access Scheduler", "version", version, "listen_addr", cfg.HTTP.Listen)
-        if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-            slog.Error("HTTP server failed", "error", err)
-            os.Exit(1)
-        }
-    }()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(sharedAPI.HealthResponse{
+			Status:  "ok",
+			Version: version,
+		})
+	})
 
-    <-ctx.Done()
-    slog.Info("Shutdown signal received, draining connections...")
+	// Serve embedded Web Dashboard
+	mux.Handle("/", http.FileServer(http.FS(web.FS())))
 
-    shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-    defer cancel()
+	srv := &http.Server{
+		Addr:         cfg.HTTP.Listen,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
 
-    if err := srv.Shutdown(shutdownCtx); err != nil {
-        slog.Error("Graceful shutdown failed", "error", err)
-    }
+	go func() {
+		slog.Info("Starting LAN Internet Access Scheduler", "version", version, "listen_addr", cfg.HTTP.Listen)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("HTTP server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
 
-    // Execute nftables shutdown behavior
-    if cfg.Nftables.ShutdownBehavior == "flush" {
-        slog.Info("Flushing nftables table due to shutdown behavior config")
-        if err := nftCtrl.FlushTable(); err != nil {
-            slog.Error("Failed to flush nftables table on shutdown", "error", err)
-        }
-    }
+	<-ctx.Done()
+	slog.Info("Shutdown signal received, draining connections...")
 
-    slog.Info("LAN Internet Access Scheduler stopped gracefully")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("Graceful shutdown error", "error", err)
+	}
+
+	if cfg.Nftables.ShutdownBehavior == "flush" {
+		slog.Info("Flushing nftables netdev table on shutdown")
+		if err := nftCtrl.FlushTable(); err != nil {
+			slog.Error("Failed to flush nftables on shutdown", "error", err)
+		}
+	}
+
+	slog.Info("LAN Internet Access Scheduler stopped gracefully")
 }
