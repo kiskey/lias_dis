@@ -25,7 +25,7 @@
                 </button>
                 <button class="nav-item" data-view="devices">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
-                    <span>Device Groups</span>
+                    <span>Tag Groups</span>
                 </button>
                 <button class="nav-item" data-view="schedules">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 16 14"></polyline></svg>
@@ -48,7 +48,7 @@
                 <h2 id="view-title">Dashboard</h2>
                 <div class="search-bar">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-                    <input type="text" placeholder="Search devices..." aria-label="Search">
+                    <input type="text" id="global-search" placeholder="Search devices..." aria-label="Search">
                 </div>
             </header>
 
@@ -65,9 +65,9 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
                 <span>Home</span>
             </button>
-            <button class="mob-nav-item" data-view="devices" aria-label="Devices">
+            <button class="mob-nav-item" data-view="devices" aria-label="Tag Groups">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
-                <span>Groups</span>
+                <span>Tags</span>
             </button>
             <button class="mob-nav-item" data-view="schedules" aria-label="Schedules">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
@@ -89,7 +89,7 @@
         <div class="modal-window" role="dialog" aria-modal="true">
             <div class="modal-header">
                 <h3 id="modal-title">Title</h3>
-                <button class="modal-close-btn" aria-label="Close">&times;</button>
+                <button class="modal-close-btn" id="modal-close-x" aria-label="Close">&times;</button>
             </div>
             <div class="modal-body smooth-scroll" id="modal-body"></div>
             <div class="modal-footer" id="modal-footer"></div>
