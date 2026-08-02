@@ -1,11 +1,10 @@
 // Package schedule implements time-based rule parsing and evaluation for LIAS.
 //
 // File:    apps/lias/internal/schedule/parser.go
-// Version: 1.2
+// Version: 1.3
 package schedule
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -77,8 +76,7 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
 			windowDuration = end.Sub(start)
 		} else {
 			// Cross-midnight window (e.g., 22:00 to 06:00)
-			// Matches if now >= 22:00 today OR now < 06:00 today
-			endOvernight := end
+			// Matches if now >= 22:00 yesterday OR now < 06:00 today
 			startOvernight := start.AddDate(0, 0, -1) // Yesterday's start
 
 			isMatchYesterday := (now.Equal(startOvernight) || now.After(startOvernight)) && now.Before(end)
