@@ -2,14 +2,13 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 1.4
+// Version: 1.5
 package discovery
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"sync"
 	"time"
 
@@ -105,7 +104,6 @@ func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
 	}
 
 	// 3. Filter by Netlink state and type
-	// RTM_NEWNEIGH = 0x10 (28 in unix/netlink package) or update.Type check
 	// Explicitly evaluate kernel NUD (Neighbor Unreachability Detection) flags
 	isFailed := (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0
 	isOnline := !isFailed && (n.State&(unix.NUD_REACHABLE|unix.NUD_PERMANENT|unix.NUD_STALE|unix.NUD_DELAY|unix.NUD_NOARP)) != 0
