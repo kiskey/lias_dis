@@ -1,7 +1,7 @@
 // Binary lias implements the LAN Internet Access Scheduler.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 1.5
+// Version: 1.6
 package main
 
 import (
@@ -44,7 +44,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Core Components
 	cache := liasSync.NewCache()
 	trigger := make(chan struct{}, 1)
 
@@ -52,21 +51,19 @@ func main() {
 	polEng := policy.NewEngine()
 	schedEng := schedule.NewEngine(cache)
 
-	// SQLite Storage Engine
 	var store *storage.Storage
 	st, err := storage.NewStorage(cfg.Storage.Path)
 	if err != nil {
 		slog.Warn("Storage initialization failed, running in memory-only mode", "error", err)
 	} else {
 		defer st.Close()
-		_ = st.LoadHydrate(tagMgr, polEng, schedEng)
+		deviceTags, _ := st.LoadHydrate(tagMgr, polEng, schedEng)
+		cache.LoadStickyTags(deviceTags) // Hydrate sticky user-assigned tags into cache
 		store = st
 	}
 
-	// DIS Client
 	disClient := liasSync.NewDISClient(cfg.DIS, cache, trigger)
 
-	// nftables Controller
 	nftCtrl := nftables.NewController(cfg.Nftables)
 	if err := nftCtrl.Init(); err != nil {
 		slog.Error("Failed to initialize nftables controller", "error", err)
@@ -79,12 +76,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Start background workers
 	go disClient.Run(ctx)
 	go schedEng.Run(ctx)
 	go nftSync.Run(ctx)
 
-	// API Handlers (Passing all 7 required dependencies including store)
 	mux := http.NewServeMux()
 	handlers := liasAPI.NewHandlers(cache, tagMgr, polEng, schedEng, nftCtrl, store, trigger)
 	handlers.RegisterRoutes(mux)
@@ -98,14 +93,13 @@ func main() {
 		})
 	})
 
-	// Serve embedded Web Dashboard
 	mux.Handle("/", http.FileServer(http.FS(web.FS())))
 
 	srv := &http.Server{
 		Addr:         cfg.HTTP.Listen,
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: 0, // Set WriteTimeout to 0 (unlimited) for long-lived HTTP streams
 		IdleTimeout:  120 * time.Second,
 	}
 
