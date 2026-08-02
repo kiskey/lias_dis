@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/pihole_provider.go
-// Version: 1.7
+// Version: 1.8
 package discovery
 
 import (
@@ -148,41 +148,49 @@ func (p *PiholeProvider) poll() {
 	}
 
 	baseURL := strings.TrimRight(p.cfg.URL, "/")
-	req, err := http.NewRequestWithContext(p.ctx, "GET", baseURL+"/api/stats/clients", nil)
-	if err != nil {
-		return
+
+	// Primary Pi-hole v6 Endpoint: GET /api/stats/top_clients
+	targetEndpoints := []string{
+		"/api/stats/top_clients?count=100",
+		"/api/network/devices",
+		"/api/stats/clients", // Legacy fallback
 	}
 
-	// Attach authentication headers ONLY if authentication is enabled
-	if !p.noAuth && p.sid != "" {
-		req.Header.Set("sid", p.sid)
-		req.Header.Set("X-FTL-SID", p.sid)
-		req.Header.Set("Cookie", "sid="+p.sid) // Lowercase cookie key per Pi-hole v6 spec
+	var resp *http.Response
+	var fetchErr error
+
+	for _, ep := range targetEndpoints {
+		req, err := http.NewRequestWithContext(p.ctx, "GET", baseURL+ep, nil)
+		if err != nil {
+			continue
+		}
+
+		if !p.noAuth && p.sid != "" {
+			req.Header.Set("sid", p.sid)
+			req.Header.Set("X-FTL-SID", p.sid)
+			req.Header.Set("Cookie", "sid="+p.sid)
+		}
+
+		res, err := p.client.Do(req)
+		if err == nil && res.StatusCode == http.StatusOK {
+			resp = res
+			break
+		}
+		if res != nil {
+			res.Body.Close()
+		}
+		fetchErr = err
 	}
 
-	resp, err := p.client.Do(req)
-	if err != nil {
-		slog.Error("Failed to fetch Pi-hole clients", "error", err)
+	if resp == nil {
+		slog.Error("Failed to fetch Pi-hole v6 clients from stats endpoints", "error", fetchErr)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		p.sidValid = false
-		slog.Warn("Pi-hole SID token rejected, will re-authenticate on next cycle")
-		return
-	}
-	if resp.StatusCode != http.StatusOK {
-		slog.Error("Pi-hole API returned non-200 status", "status", resp.StatusCode)
-		return
-	}
-
-	var raw struct {
-		Clients json.RawMessage `json:"clients"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		slog.Error("Failed to decode Pi-hole response wrapper", "error", err)
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Error("Failed to read Pi-hole response body", "error", err)
 		return
 	}
 
@@ -194,18 +202,38 @@ func (p *PiholeProvider) poll() {
 
 	var clientList []clientItem
 
-	if err := json.Unmarshal(raw.Clients, &clientList); err != nil {
-		var clientMap map[string]clientItem
-		if mapErr := json.Unmarshal(raw.Clients, &clientMap); mapErr == nil {
-			for ipKey, item := range clientMap {
-				if item.IP == "" {
-					item.IP = ipKey
-				}
-				clientList = append(clientList, item)
-			}
+	// 1. Decode Pi-hole v6 /api/stats/top_clients format: {"top_clients": [{"ip": "...", "name": "..."}]}
+	var topClientsWrapper struct {
+		TopClients []struct {
+			IP   string `json:"ip"`
+			Name string `json:"name"`
+			Mac  string `json:"hwaddr"`
+		} `json:"top_clients"`
+	}
+
+	if err := json.Unmarshal(bodyBytes, &topClientsWrapper); err == nil && len(topClientsWrapper.TopClients) > 0 {
+		for _, tc := range topClientsWrapper.TopClients {
+			clientList = append(clientList, clientItem{
+				IP:   tc.IP,
+				Name: tc.Name,
+				Mac:  tc.Mac,
+			})
+		}
+	} else {
+		// 2. Decode Pi-hole v6 /api/network/devices format: {"devices": [...]}
+		var devWrapper struct {
+			Devices []clientItem `json:"devices"`
+		}
+		if err := json.Unmarshal(bodyBytes, &devWrapper); err == nil && len(devWrapper.Devices) > 0 {
+			clientList = devWrapper.Devices
 		} else {
-			slog.Error("Failed to decode Pi-hole clients payload", "error", err)
-			return
+			// 3. Fallback map or array format
+			var rawWrapper struct {
+				Clients json.RawMessage `json:"clients"`
+			}
+			if err := json.Unmarshal(bodyBytes, &rawWrapper); err == nil {
+				_ = json.Unmarshal(rawWrapper.Clients, &clientList)
+			}
 		}
 	}
 
@@ -264,7 +292,7 @@ func (p *PiholeProvider) authenticate() error {
 		Session struct {
 			SID      string `json:"sid"`
 			Valid    bool   `json:"valid"`
-			Message  string `json:"message"`  // "no password set", "password incorrect", "app-password correct"
+			Message  string `json:"message"` // "no password set", "password incorrect", "app-password correct"
 			Validity int    `json:"validity"`
 		} `json:"session"`
 		Error struct {
@@ -275,7 +303,7 @@ func (p *PiholeProvider) authenticate() error {
 
 	_ = json.Unmarshal(bodyBytes, &authResp)
 
-	// Handle HTTP 4xx/5xx transport status codes (e.g. 429 Too Many Requests, 401 Unauthorized)
+	// Handle HTTP 4xx/5xx transport status codes
 	if resp.StatusCode != http.StatusOK {
 		reason := authResp.Error.Message
 		if reason == "" {
