@@ -1,246 +1,297 @@
 // Package nftables implements the isolated firewall controller for LIAS.
-// It creates and manages ONLY the 'netdev lancontrol' table.
+// It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 1.2
+// Version: 1.3
 package nftables
 
 import (
-    "fmt"
-    "log/slog"
-    "net"
-    "sync"
-    "time"
+	"fmt"
+	"log/slog"
+	"net"
+	"sync"
+	"time"
 
-    "github.com/google/nftables"
-    "github.com/google/nftables/expr"
-    "github.com/user/lias-dis/apps/lias/internal/config"
-    "golang.org/x/sys/unix"
+	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
+	"github.com/user/lias-dis/apps/lias/internal/config"
 )
 
-// Controller manages the nftables table, chain, and sets.
+// Controller manages the netdev lancontrol table, chain, sets, and rules.
 type Controller struct {
-    mu    sync.Mutex
-    conn  *nftables.Conn
-    cfg   config.NftablesConfig
-    table *nftables.Table
-    chain *nftables.Chain
-    sets  map[string]*nftables.Set
+	mu    sync.Mutex
+	conn  *nftables.Conn
+	cfg   config.NftablesConfig
+	table *nftables.Table
+	chain *nftables.Chain
+	sets  map[string]*nftables.Set
 }
 
-// NewController initializes a new nftables controller.
+// NewController initializes a new nftables controller instance.
 func NewController(cfg config.NftablesConfig) *Controller {
-    return &Controller{
-        cfg:  cfg,
-        sets: make(map[string]*nftables.Set),
-    }
+	return &Controller{
+		cfg:  cfg,
+		sets: make(map[string]*nftables.Set),
+	}
 }
 
-// Init creates or flushes the lancontrol table, chain, and sets.
+// Init creates or flushes the lancontrol table, ingress chain, sets, and filtering rules.
 func (c *Controller) Init() error {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-    // FIX: nftables.New() returns (*Conn, error)
-    conn, err := nftables.New()
-    if err != nil {
-        return fmt.Errorf("failed to connect to nftables: %w", err)
-    }
-    c.conn = conn
+	conn, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("failed to connect to netlink nftables: %w", err)
+	}
+	c.conn = conn
 
-    // 1. Create or get the netdev table
-    c.table = c.conn.AddTable(&nftables.Table{
-        Family: nftables.TableFamilyNetdev,
-        Name:   c.cfg.TableName,
-    })
+	// 1. Create or bind the netdev table
+	c.table = c.conn.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyNetdev,
+		Name:   c.cfg.TableName,
+	})
 
-    // 2. Create or flush the ingress chain
-    // FIX: Removed Device field as it's not present in this version of the library struct
-    c.chain = c.conn.AddChain(&nftables.Chain{
-        Name:     "ingress",
-        Table:    c.table,
-        Type:     nftables.ChainTypeFilter,
-        Hooknum:  nftables.ChainHookIngress,
-        Priority: nftables.ChainPriorityRef(0),
-    })
+	// 2. Create the ingress chain with MANDATORY interface binding (Device: eth0)
+	c.chain = c.conn.AddChain(&nftables.Chain{
+		Name:     "ingress",
+		Table:    c.table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookIngress,
+		Priority: nftables.ChainPriorityRef(0),
+		Device:   c.cfg.Interface, // Restored: Netdev ingress hook REQUIRES interface binding
+	})
 
-    // 3. Create the four sets with timeout flags
-    timeout := time.Hour
+	// Flush existing chain rules to prevent duplicate rule accumulation on re-initialization
+	c.conn.FlushChain(c.chain)
 
-    // FIX: AddSet returns error, not *Set. Timeout is time.Duration, not *time.Duration
-    allowedIPsSet := &nftables.Set{
-        Name:    "allowed_ips",
-        Table:   c.table,
-        KeyType: nftables.TypeIPAddr,
-        Timeout: timeout,
-    }
-    if err := c.conn.AddSet(allowedIPsSet, nil); err != nil {
-        return fmt.Errorf("failed to add allowed_ips set: %w", err)
-    }
-    c.sets["allowed_ips"] = allowedIPsSet
+	// 3. Create sets for allowed and blocked elements
+	timeout := 1 * time.Hour
 
-    allowedMACsSet := &nftables.Set{
-        Name:    "allowed_macs",
-        Table:   c.table,
-        KeyType: nftables.TypeEtherAddr,
-        Timeout: timeout,
-    }
-    if err := c.conn.AddSet(allowedMACsSet, nil); err != nil {
-        return fmt.Errorf("failed to add allowed_macs set: %w", err)
-    }
-    c.sets["allowed_macs"] = allowedMACsSet
+	allowedIPsSet := &nftables.Set{
+		Name:    "allowed_ips",
+		Table:   c.table,
+		KeyType: nftables.TypeIPAddr,
+		Timeout: timeout,
+	}
+	if err := c.conn.AddSet(allowedIPsSet, nil); err != nil {
+		return fmt.Errorf("failed to create allowed_ips set: %w", err)
+	}
+	c.sets["allowed_ips"] = allowedIPsSet
 
-    blockedIPsSet := &nftables.Set{
-        Name:    "blocked_ips",
-        Table:   c.table,
-        KeyType: nftables.TypeIPAddr,
-        Timeout: timeout,
-    }
-    if err := c.conn.AddSet(blockedIPsSet, nil); err != nil {
-        return fmt.Errorf("failed to add blocked_ips set: %w", err)
-    }
-    c.sets["blocked_ips"] = blockedIPsSet
+	allowedMACsSet := &nftables.Set{
+		Name:    "allowed_macs",
+		Table:   c.table,
+		KeyType: nftables.TypeEtherAddr,
+		Timeout: timeout,
+	}
+	if err := c.conn.AddSet(allowedMACsSet, nil); err != nil {
+		return fmt.Errorf("failed to create allowed_macs set: %w", err)
+	}
+	c.sets["allowed_macs"] = allowedMACsSet
 
-    blockedMACsSet := &nftables.Set{
-        Name:    "blocked_macs",
-        Table:   c.table,
-        KeyType: nftables.TypeEtherAddr,
-        Timeout: timeout,
-    }
-    if err := c.conn.AddSet(blockedMACsSet, nil); err != nil {
-        return fmt.Errorf("failed to add blocked_macs set: %w", err)
-    }
-    c.sets["blocked_macs"] = blockedMACsSet
+	blockedIPsSet := &nftables.Set{
+		Name:    "blocked_ips",
+		Table:   c.table,
+		KeyType: nftables.TypeIPAddr,
+		Timeout: timeout,
+	}
+	if err := c.conn.AddSet(blockedIPsSet, nil); err != nil {
+		return fmt.Errorf("failed to create blocked_ips set: %w", err)
+	}
+	c.sets["blocked_ips"] = blockedIPsSet
 
-    // 4. Create the rules using real nftables expressions
-    // Rule: Allow MACs
-    c.conn.AddRule(&nftables.Rule{
-        Table: c.table,
-        Chain: c.chain,
-        Exprs: []expr.Any{
-            &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseLLHeader, Offset: 8, Len: 6},
-            &expr.Lookup{SourceRegister: 1, SetName: "allowed_macs", SetID: c.sets["allowed_macs"].ID},
-            &expr.Verdict{Kind: expr.VerdictAccept},
-        },
-    })
+	blockedMACsSet := &nftables.Set{
+		Name:    "blocked_macs",
+		Table:   c.table,
+		KeyType: nftables.TypeEtherAddr,
+		Timeout: timeout,
+	}
+	if err := c.conn.AddSet(blockedMACsSet, nil); err != nil {
+		return fmt.Errorf("failed to create blocked_macs set: %w", err)
+	}
+	c.sets["blocked_macs"] = blockedMACsSet
 
-    // Rule: Allow IPs
-    c.conn.AddRule(&nftables.Rule{
-        Table: c.table,
-        Chain: c.chain,
-        Exprs: []expr.Any{
-            &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
-            &expr.Lookup{SourceRegister: 1, SetName: "allowed_ips", SetID: c.sets["allowed_ips"].ID},
-            &expr.Verdict{Kind: expr.VerdictAccept},
-        },
-    })
+	// 4. Create filtering rules using CORRECT header payload offsets
+	// Rule 1: Allow MACs
+	// Ethernet Header: Dest MAC (0..5), Source MAC (6..11) -> Offset: 6, Len: 6
+	c.conn.AddRule(&nftables.Rule{
+		Table: c.table,
+		Chain: c.chain,
+		Exprs: []expr.Any{
+			&expr.Payload{
+				OperationType: expr.PayloadLoad,
+				DestRegister:  1,
+				Base:          expr.PayloadBaseLLHeader,
+				Offset:        6, // Corrected: Source MAC starts at byte 6 in Ethernet header
+				Len:           6,
+			},
+			&expr.Lookup{
+				SourceRegister: 1,
+				SetName:        "allowed_macs",
+				SetID:          c.sets["allowed_macs"].ID,
+			},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		},
+	})
 
-    // Rule: Block MACs
-    c.conn.AddRule(&nftables.Rule{
-        Table: c.table,
-        Chain: c.chain,
-        Exprs: []expr.Any{
-            &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseLLHeader, Offset: 8, Len: 6},
-            &expr.Lookup{SourceRegister: 1, SetName: "blocked_macs", SetID: c.sets["blocked_macs"].ID},
-            &expr.Verdict{Kind: expr.VerdictDrop},
-        },
-    })
+	// Rule 2: Allow IPs
+	// IPv4 Header: Source IP starts at byte 12 -> Offset: 12, Len: 4
+	c.conn.AddRule(&nftables.Rule{
+		Table: c.table,
+		Chain: c.chain,
+		Exprs: []expr.Any{
+			&expr.Payload{
+				OperationType: expr.PayloadLoad,
+				DestRegister:  1,
+				Base:          expr.PayloadBaseNetworkHeader,
+				Offset:        12,
+				Len:           4,
+			},
+			&expr.Lookup{
+				SourceRegister: 1,
+				SetName:        "allowed_ips",
+				SetID:          c.sets["allowed_ips"].ID,
+			},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		},
+	})
 
-    // Rule: Block IPs
-    c.conn.AddRule(&nftables.Rule{
-        Table: c.table,
-        Chain: c.chain,
-        Exprs: []expr.Any{
-            &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
-            &expr.Lookup{SourceRegister: 1, SetName: "blocked_ips", SetID: c.sets["blocked_ips"].ID},
-            &expr.Verdict{Kind: expr.VerdictDrop},
-        },
-    })
+	// Rule 3: Block MACs
+	c.conn.AddRule(&nftables.Rule{
+		Table: c.table,
+		Chain: c.chain,
+		Exprs: []expr.Any{
+			&expr.Payload{
+				OperationType: expr.PayloadLoad,
+				DestRegister:  1,
+				Base:          expr.PayloadBaseLLHeader,
+				Offset:        6, // Corrected: Source MAC starts at byte 6
+				Len:           6,
+			},
+			&expr.Lookup{
+				SourceRegister: 1,
+				SetName:        "blocked_macs",
+				SetID:          c.sets["blocked_macs"].ID,
+			},
+			&expr.Verdict{Kind: expr.VerdictDrop},
+		},
+	})
 
-    if err := c.conn.Flush(); err != nil {
-        return fmt.Errorf("failed to initialize nftables: %w", err)
-    }
+	// Rule 4: Block IPs
+	c.conn.AddRule(&nftables.Rule{
+		Table: c.table,
+		Chain: c.chain,
+		Exprs: []expr.Any{
+			&expr.Payload{
+				OperationType: expr.PayloadLoad,
+				DestRegister:  1,
+				Base:          expr.PayloadBaseNetworkHeader,
+				Offset:        12,
+				Len:           4,
+			},
+			&expr.Lookup{
+				SourceRegister: 1,
+				SetName:        "blocked_ips",
+				SetID:          c.sets["blocked_ips"].ID,
+			},
+			&expr.Verdict{Kind: expr.VerdictDrop},
+		},
+	})
 
-    slog.Info("nftables initialized", "table", c.cfg.TableName)
-    return nil
+	if err := c.conn.Flush(); err != nil {
+		return fmt.Errorf("failed to initialize netdev lancontrol table: %w", err)
+	}
+
+	slog.Info("nftables netdev table initialized successfully", "table", c.cfg.TableName, "iface", c.cfg.Interface)
+	return nil
 }
 
-// FlushTable removes the entire lancontrol table from the system.
+// FlushTable completely removes the lancontrol table from the system kernel.
 func (c *Controller) FlushTable() error {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-    c.conn.FlushTable(c.table)
-    c.conn.DelTable(c.table)
+	if c.conn == nil || c.table == nil {
+		return nil
+	}
 
-    if err := c.conn.Flush(); err != nil {
-        return fmt.Errorf("failed to flush nftables table: %w", err)
-    }
+	c.conn.FlushTable(c.table)
+	c.conn.DelTable(c.table)
 
-    slog.Info("nftables table flushed and removed", "table", c.cfg.TableName)
-    return nil
+	if err := c.conn.Flush(); err != nil {
+		return fmt.Errorf("failed to flush netdev table: %w", err)
+	}
+
+	slog.Info("nftables netdev lancontrol table flushed and removed", "table", c.cfg.TableName)
+	return nil
 }
 
-// SetElements provides a safe way to pass elements to the Builder.
+// SetElements structure for transferring IP and MAC element sets.
 type SetElements struct {
-    IPs  []net.IP
-    MACs []net.HardwareAddr
+	IPs  []net.IP
+	MACs []net.HardwareAddr
 }
 
-// Apply updates the nftables sets with the provided elements.
+// Apply flushes existing sets and atomically updates netfilter sets with new elements.
 func (c *Controller) Apply(allowed, blocked SetElements) error {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-    c.conn.FlushSet(c.sets["allowed_ips"])
-    c.conn.FlushSet(c.sets["allowed_macs"])
-    c.conn.FlushSet(c.sets["blocked_ips"])
-    c.conn.FlushSet(c.sets["blocked_macs"])
+	if c.conn == nil {
+		return fmt.Errorf("nftables connection uninitialized")
+	}
 
-    if err := c.addElements("allowed_ips", allowed.IPs); err != nil {
-        return err
-    }
-    if err := c.addElements("allowed_macs", allowed.MACs); err != nil {
-        return err
-    }
-    if err := c.addElements("blocked_ips", blocked.IPs); err != nil {
-        return err
-    }
-    if err := c.addElements("blocked_macs", blocked.MACs); err != nil {
-        return err
-    }
+	c.conn.FlushSet(c.sets["allowed_ips"])
+	c.conn.FlushSet(c.sets["allowed_macs"])
+	c.conn.FlushSet(c.sets["blocked_ips"])
+	c.conn.FlushSet(c.sets["blocked_macs"])
 
-    if err := c.conn.Flush(); err != nil {
-        return fmt.Errorf("failed to apply nftables transaction: %w", err)
-    }
+	if err := c.addElements("allowed_ips", allowed.IPs); err != nil {
+		return err
+	}
+	if err := c.addElements("allowed_macs", allowed.MACs); err != nil {
+		return err
+	}
+	if err := c.addElements("blocked_ips", blocked.IPs); err != nil {
+		return err
+	}
+	if err := c.addElements("blocked_macs", blocked.MACs); err != nil {
+		return err
+	}
 
-    return nil
+	if err := c.conn.Flush(); err != nil {
+		return fmt.Errorf("failed to commit nftables set update: %w", err)
+	}
+
+	return nil
 }
 
-// addElements converts IPs/MACs to nftables.SetElement and adds them.
 func (c *Controller) addElements(setName string, items interface{}) error {
-    set := c.sets[setName]
-    var elements []nftables.SetElement
+	set := c.sets[setName]
+	var elements []nftables.SetElement
 
-    switch v := items.(type) {
-    case []net.IP:
-        for _, ip := range v {
-            elements = append(elements, nftables.SetElement{Key: ip.To4()})
-        }
-    case []net.HardwareAddr:
-        for _, mac := range v {
-            elements = append(elements, nftables.SetElement{Key: mac})
-        }
-    default:
-        return fmt.Errorf("unsupported element type")
-    }
+	switch v := items.(type) {
+	case []net.IP:
+		for _, ip := range v {
+			if ip4 := ip.To4(); ip4 != nil {
+				elements = append(elements, nftables.SetElement{Key: ip4})
+			}
+		}
+	case []net.HardwareAddr:
+		for _, mac := range v {
+			if len(mac) == 6 {
+				elements = append(elements, nftables.SetElement{Key: mac})
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported element type for set %s", setName)
+	}
 
-    if len(elements) > 0 {
-        if err := c.conn.SetAddElements(set, elements); err != nil {
-            return fmt.Errorf("failed to add elements to set %s: %w", setName, err)
-        }
-    }
-    return nil
+	if len(elements) > 0 {
+		if err := c.conn.SetAddElements(set, elements); err != nil {
+			return fmt.Errorf("failed to add elements to set %s: %w", setName, err)
+		}
+	}
+	return nil
 }
-
-var _ = unix.NFT_MSG_NEWSET
