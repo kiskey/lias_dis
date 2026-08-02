@@ -2,7 +2,7 @@
 // from multiple providers into canonical device records.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 1.8
+// Version: 1.9
 package correlation
 
 import (
@@ -17,6 +17,7 @@ import (
 	"github.com/user/lias-dis/apps/discovery-service/internal/discovery"
 	"github.com/user/lias-dis/apps/discovery-service/internal/inventory"
 	"github.com/user/lias-dis/apps/discovery-service/internal/storage"
+	"github.com/user/lias-dis/pkg/oui"
 	"github.com/user/lias-dis/shared/models"
 )
 
@@ -142,7 +143,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	}
 
 	// 1. DHCP IP-REUSE GUARD
-	// Check if IP matches an existing device record whose known MACs do NOT include the incoming MAC
 	if ipStr != "" && macStr != "" {
 		if ipMatch := e.cache.GetByIP(ipStr); ipMatch != nil {
 			hasMAC := false
@@ -160,8 +160,19 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		}
 	}
 
-	// 2. QUERY CACHE
+	// 2. QUERY CACHE (With LAA Private MAC Hostname Match Fallback)
 	d := e.cache.GetByMACOrIP(macStr, ipStr)
+
+	// Apple / Android Private MAC Rotation Fallback:
+	// If direct MAC/IP lookup misses, but the MAC is randomized (LAA) AND we have a valid hostname,
+	// query the cache by normalized hostname to link the rotated MAC to the device's canonical record.
+	if d == nil && macStr != "" && oui.IsRandomizedMAC(macStr) && cleanHost != "" {
+		if hostMatch := e.cache.GetByHostname(cleanHost); hostMatch != nil {
+			slog.Info("Linked rotated Private MAC address to existing device record by L7 Hostname",
+				"pdid", hostMatch.PDID, "new_mac", macStr, "hostname", cleanHost)
+			d = hostMatch
+		}
+	}
 
 	// Handle new device discovery
 	if d == nil {
@@ -201,7 +212,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	}
 
 	// 3. TENTATIVE PDID PROMOTION
-	// Upgrade pdid_tentative_... to deterministic pdid_mac_v1_... when MAC is learned
 	if macStr != "" && strings.HasPrefix(d.PDID, "pdid_tentative_") {
 		oldPDID := d.PDID
 		newPDID := inventory.GeneratePDID(macStr, cleanHost, d.Vendor)
@@ -225,7 +235,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 			_ = e.store.SaveDevice(d)
 		}
 
-		// Broadcast lifecycle migration events to downstream consumers (LIAS)
 		e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
 		e.broker.Broadcast(models.NewEvent(models.EventDeviceRemoved, oldPDID, nil))
 		return
@@ -247,7 +256,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
 	if macStr != "" && d.CurrentMAC != macStr {
 		payload.OldMAC = d.CurrentMAC
-		d.AddMAC(macStr)
+		d.AddMAC(macStr) // Accumulates rotated MACs into d.MACs slice
 		payload.MAC = macStr
 		changed = true
 		eventTypes = append(eventTypes, models.EventMACChanged)
