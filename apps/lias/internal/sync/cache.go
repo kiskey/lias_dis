@@ -2,11 +2,10 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/cache.go
-// Version: 1.1
+// Version: 1.2
 package sync
 
 import (
-	"strings"
 	"sync"
 	"time"
 
