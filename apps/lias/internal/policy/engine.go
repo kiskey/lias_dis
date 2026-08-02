@@ -1,7 +1,7 @@
 // Package policy implements the rule evaluation engine for LIAS.
 //
 // File:    apps/lias/internal/policy/engine.go
-// Version: 1.4
+// Version: 1.5
 package policy
 
 import (
@@ -11,23 +11,19 @@ import (
 	"github.com/user/lias-dis/shared/models"
 )
 
-// PolicyEvaluator resolves the active firewall action for a target device.
 type PolicyEvaluator interface {
 	EvaluateAction(d *liasSync.LocalDevice, sched ScheduleEvaluator) models.Action
 }
 
-// ScheduleEvaluator resolves time-based schedule rules.
 type ScheduleEvaluator interface {
 	EvaluateNow(schedID string) models.Action
 }
 
-// Engine manages configured policies and evaluates precedence rules.
 type Engine struct {
 	mu       sync.RWMutex
 	policies map[string]models.Policy
 }
 
-// NewEngine initializes the policy engine with default global policy settings.
 func NewEngine() *Engine {
 	return &Engine{
 		policies: map[string]models.Policy{
@@ -35,28 +31,25 @@ func NewEngine() *Engine {
 				ID:       "global_default",
 				Name:     "Global Access Switch",
 				Type:     models.PolicyTypeGlobal,
-				Action:   models.ActionAllow, // Default: Always Allow
+				Action:   models.ActionAllow,
 				Priority: 0,
 			},
 		},
 	}
 }
 
-// UpsertPolicy adds or updates a policy record.
 func (e *Engine) UpsertPolicy(p models.Policy) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.policies[p.ID] = p
 }
 
-// DeletePolicy removes a policy by ID.
 func (e *Engine) DeletePolicy(id string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.policies, id)
 }
 
-// ListPolicies returns a list of all configured policies.
 func (e *Engine) ListPolicies() []models.Policy {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -68,13 +61,6 @@ func (e *Engine) ListPolicies() []models.Policy {
 	return list
 }
 
-// GetEffectivePolicy determines the active policy based on strict precedence rules:
-//
-// RULE 1: Infrastructure Immunity (Infrastructure tagged devices are ALWAYS allowed and immune to global switches)
-// RULE 2: Global Kill-Switch Override (If Global Default is set to 'block', non-infrastructure devices are blocked)
-// RULE 3: Device-Specific Policy (TargetID == PDID)
-// RULE 4: Tag-Group Policy (TargetID in device.Tags)
-// RULE 5: Global Default Policy
 func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 	if d == nil {
 		return models.Policy{ID: "fallback", Action: models.ActionAllow}
@@ -84,7 +70,6 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 	defer e.mu.RUnlock()
 
 	// 1. INFRASTRUCTURE IMMUNITY CHECK
-	// Devices tagged as 'infrastructure' are completely immune to global blocks and device rules.
 	for _, t := range d.Tags {
 		if t == "infrastructure" {
 			return models.Policy{
@@ -97,7 +82,6 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 	}
 
 	// 2. GLOBAL KILL-SWITCH CHECK
-	// If Global Policy is explicitly set to 'block' (Global Downtime Switch), it overrides all regular devices.
 	globalPol, hasGlobal := e.policies["global_default"]
 	if hasGlobal && globalPol.Action == models.ActionBlock {
 		return models.Policy{
@@ -122,20 +106,25 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 		return *bestDevPolicy
 	}
 
-	// 4. TAG-GROUP POLICY (Schedule or Block assigned to entire Tag Group e.g. 'kids')
-	var bestTagPolicy *models.Policy
+	// 4. TAG-GROUP POLICIES (Supports multiple policies/schedules per tag group)
+	var tagPolicies []models.Policy
 	for _, tagID := range d.Tags {
 		for _, p := range e.policies {
 			if p.Type == models.PolicyTypeTag && p.TargetID == tagID {
-				if bestTagPolicy == nil || p.Priority > bestTagPolicy.Priority {
-					pCopy := p
-					bestTagPolicy = &pCopy
-				}
+				tagPolicies = append(tagPolicies, p)
 			}
 		}
 	}
-	if bestTagPolicy != nil {
-		return *bestTagPolicy
+
+	if len(tagPolicies) > 0 {
+		// Return highest priority policy as representative
+		bestTagPol := tagPolicies[0]
+		for _, p := range tagPolicies {
+			if p.Priority > bestTagPol.Priority {
+				bestTagPol = p
+			}
+		}
+		return bestTagPol
 	}
 
 	// 5. GLOBAL POLICY FALLBACK
@@ -151,16 +140,66 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 	}
 }
 
-// EvaluateAction resolves the final firewall action (allow or block) for a device.
+// EvaluateAction resolves final action, evaluating ALL policies attached to the device's tag group.
 func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvaluator) models.Action {
-	p := e.GetEffectivePolicy(d)
-
-	if p.Action == models.ActionSchedule {
-		if p.ScheduleID == nil || *p.ScheduleID == "" || schedEval == nil {
-			return models.ActionBlock // Fail-closed if schedule reference is broken
-		}
-		return schedEval.EvaluateNow(*p.ScheduleID)
+	if d == nil {
+		return models.ActionAllow
 	}
 
-	return p.Action
+	// Infrastructure immunity
+	if d.HasTag("infrastructure") {
+		return models.ActionAllow
+	}
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	// Global kill-switch check
+	if globalPol, ok := e.policies["global_default"]; ok && globalPol.Action == models.ActionBlock {
+		return models.ActionBlock
+	}
+
+	// Evaluate device policies
+	for _, p := range e.policies {
+		if p.Type == models.PolicyTypeDevice && p.TargetID == d.PDID {
+			if p.Action == models.ActionSchedule && p.ScheduleID != nil && schedEval != nil {
+				return schedEval.EvaluateNow(*p.ScheduleID)
+			}
+			return p.Action
+		}
+	}
+
+	// Evaluate ALL policies attached to device's Tag Groups
+	var tagActions []models.Action
+	for _, tagID := range d.Tags {
+		for _, p := range e.policies {
+			if p.Type == models.PolicyTypeTag && p.TargetID == tagID {
+				act := p.Action
+				if act == models.ActionSchedule && p.ScheduleID != nil && schedEval != nil {
+					act = schedEval.EvaluateNow(*p.ScheduleID)
+				}
+				tagActions = append(tagActions, act)
+			}
+		}
+	}
+
+	// Fail-Closed Rule for multiple tag policies: If ANY attached policy/schedule resolves to BLOCK, drop traffic.
+	if len(tagActions) > 0 {
+		for _, act := range tagActions {
+			if act == models.ActionBlock {
+				return models.ActionBlock
+			}
+		}
+		return models.ActionAllow
+	}
+
+	// Fallback to global policy action
+	if globalPol, ok := e.policies["global_default"]; ok {
+		if globalPol.Action == models.ActionSchedule && globalPol.ScheduleID != nil && schedEval != nil {
+			return schedEval.EvaluateNow(*globalPol.ScheduleID)
+		}
+		return globalPol.Action
+	}
+
+	return models.ActionAllow
 }
