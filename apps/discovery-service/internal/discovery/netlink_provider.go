@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 1.7
+// Version: 1.8
 package discovery
 
 import (
