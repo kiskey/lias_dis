@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/cache.go
-// Version: 1.5
+// Version: 1.6
 package inventory
 
 import (
@@ -14,7 +14,8 @@ import (
 )
 
 const (
-	offlineTTL = 24 * time.Hour
+	offlineTTL     = 24 * time.Hour
+	staleThreshold = 90 * time.Second
 )
 
 // Cache is a thread-safe in-memory store with O(1) MAC and IP index lookups.
@@ -36,6 +37,24 @@ func NewCache() *Cache {
 	}
 	go c.purgeLoop()
 	return c
+}
+
+// DemoteStale flips Online: true -> false for devices with no observation
+// within staleThreshold, serving as a safety net for missed L2 offline transitions.
+// Returns the slice of PDIDs that transitioned offline.
+func (c *Cache) DemoteStale() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var changed []string
+	now := time.Now()
+	for pdid, d := range c.devices {
+		if d.Online && now.Sub(d.LastSeen) > staleThreshold {
+			d.Online = false
+			changed = append(changed, pdid)
+		}
+	}
+	return changed
 }
 
 // GetByMAC performs an O(1) indexed lookup by MAC address.
@@ -158,11 +177,9 @@ func (c *Cache) Upsert(d *models.Device) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Store copy
 	devCopy := *d
 	c.devices[d.PDID] = &devCopy
 
-	// Update secondary indices
 	for _, mac := range d.MACs {
 		cleanMAC := NormalizeMAC(mac)
 		if cleanMAC != "" {
@@ -200,7 +217,7 @@ func (c *Cache) Stop() {
 }
 
 func (c *Cache) purgeLoop() {
-	ticker := time.NewTicker(10 * time.Minute)
+	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 
 	for {
