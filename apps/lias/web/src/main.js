@@ -1,7 +1,7 @@
 /*
  * LIAS Control Center - Main Dashboard Application
  * File:    apps/lias/web/src/main.js
- * Version: 1.9 (Hostname-First Primary Device Name Priority)
+ * Version: 2.0 (24-Hour Time Pickers, Desktop Segmented Day Tiles, Hostname Priority)
  */
 
 import { API } from './api.js';
@@ -58,7 +58,6 @@ class LiasDashboard {
 
   initRealtimeEvents() {
     API.subscribeEvents((evt) => {
-      // Re-fetch data upon real-time DIS/LIAS network events
       this.loadInitialDataSilently();
     });
   }
@@ -110,28 +109,6 @@ class LiasDashboard {
     this.renderCurrentView();
   }
 
-  renderCurrentView() {
-    switch (this.currentView) {
-      case 'dashboard':
-        this.renderDashboardView();
-        break;
-      case 'devices':
-        this.renderDevicesView();
-        break;
-      case 'schedules':
-        this.renderSchedulesView();
-        break;
-      case 'policies':
-        this.renderPoliciesView();
-        break;
-      case 'settings':
-        this.renderSettingsView();
-        break;
-      default:
-        this.renderDashboardView();
-    }
-  }
-
   formatLastSeen(isoStr, isOnline) {
     if (isOnline) return '<span style="color: var(--success); font-weight: 600;">Online Now</span>';
     if (!isoStr) return '<span style="color: var(--text-secondary);">Offline</span>';
@@ -150,6 +127,24 @@ class LiasDashboard {
     } catch (e) {
       return 'Offline';
     }
+  }
+
+  // Normalizes time strings to strict 24-hour "HH:MM" format expected by <input type="time">
+  ensure24Hour(timeStr) {
+    if (!timeStr) return "12:00";
+    if (/^\d{2}:\d{2}$/.test(timeStr)) return timeStr;
+    if (/^\d{1}:\d{2}$/.test(timeStr)) return "0" + timeStr;
+
+    const match = timeStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+    if (match) {
+      let hrs = parseInt(match[1], 10);
+      const mins = match[2];
+      const ampm = match[3] ? match[3].toUpperCase() : '';
+      if (ampm === 'PM' && hrs < 12) hrs += 12;
+      if (ampm === 'AM' && hrs === 12) hrs = 0;
+      return `${hrs.toString().padStart(2, '0')}:${mins}`;
+    }
+    return timeStr;
   }
 
   renderDashboardView() {
@@ -305,7 +300,7 @@ class LiasDashboard {
           const vendorName = d.vendor || d.manufacturer || 'Generic Hardware';
           const lastSeenHTML = this.formatLastSeen(d.last_seen, d.online);
 
-          // Name Priority: d.hostname -> d.friendly_name -> 'Unknown Device'
+          // Priority: d.hostname -> d.friendly_name -> 'Unknown Device'
           const displayName = (d.hostname && d.hostname.trim()) || 
                               (d.friendly_name && d.friendly_name.trim()) || 
                               'Unknown Device';
@@ -484,7 +479,7 @@ class LiasDashboard {
       <div class="card">
         <h3>System Settings</h3>
         <p style="color: var(--text-secondary); margin-top: 8px;">
-          LIAS Version: 1.9 &bull; Netfilter Table: <code>netdev lancontrol</code>
+          LIAS Version: 2.0 &bull; Netfilter Table: <code>netdev lancontrol</code>
         </p>
       </div>
     `;
@@ -503,6 +498,10 @@ class LiasDashboard {
     const name = existingSched ? existingSched.name : '';
     const tz = existingSched ? existingSched.timezone : detectedTz;
     const firstRule = existingSched && existingSched.rules && existingSched.rules[0] ? existingSched.rules[0] : { days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_time: '22:00', end_time: '06:00', action: 'block' };
+
+    // Format start and end times to strict 24-hour "HH:MM" for HTML5 <input type="time">
+    const startTime24 = this.ensure24Hour(firstRule.start_time);
+    const endTime24 = this.ensure24Hour(firstRule.end_time);
 
     this.modalTitle.textContent = scheduleId ? 'Edit Schedule Window' : 'Create New Schedule Window';
     this.modalBody.innerHTML = `
@@ -541,11 +540,11 @@ class LiasDashboard {
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
           <div>
             <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">Start Time</label>
-            <input type="time" id="sched-start" value="${firstRule.start_time || '22:00'}" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
+            <input type="time" id="sched-start" value="${startTime24}" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
           </div>
           <div>
             <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">End Time</label>
-            <input type="time" id="sched-end" value="${firstRule.end_time || '06:00'}" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
+            <input type="time" id="sched-end" value="${endTime24}" style="width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--separator); background: var(--bg-tertiary); color: var(--text-primary);">
           </div>
         </div>
 
