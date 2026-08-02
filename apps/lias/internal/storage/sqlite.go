@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 1.0
+// Version: 1.1
 package storage
 
 import (
@@ -20,20 +20,17 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Storage manages SQLite database operations for LIAS rules and tags.
 type Storage struct {
 	mu     sync.Mutex
 	dbPath string
 	db     *sql.DB
 }
 
-// NewStorage initializes and returns a new Storage instance.
 func NewStorage(dbPath string) (*Storage, error) {
 	if dbPath == "" {
 		dbPath = "/var/lib/lias/state.db"
 	}
 
-	// Ensure destination directory exists
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create database directory: %w", err)
 	}
@@ -70,6 +67,11 @@ func (s *Storage) initSchema() error {
 		builtin INTEGER NOT NULL
 	);
 
+	CREATE TABLE IF NOT EXISTS device_tags (
+		pdid TEXT PRIMARY KEY,
+		tag_id TEXT NOT NULL
+	);
+
 	CREATE TABLE IF NOT EXISTS policies (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
@@ -96,10 +98,11 @@ func (s *Storage) initSchema() error {
 	return nil
 }
 
-// LoadHydrate populates tag, policy, and schedule managers from the SQLite database.
-func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, schedEng *schedule.Engine) error {
+func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, schedEng *schedule.Engine) (map[string]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	deviceTags := make(map[string]string)
 
 	// 1. Hydrate Tags
 	rows, err := s.db.Query("SELECT id, name, color, precedence, builtin FROM tags")
@@ -110,13 +113,24 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 			var builtin int
 			if err := rows.Scan(&t.ID, &t.Name, &t.Color, &t.Precedence, &builtin); err == nil {
 				t.Builtin = builtin == 1
-				// Register loaded tag
 				_, _ = tagMgr.Create(t.Name, t.Color)
 			}
 		}
 	}
 
-	// 2. Hydrate Policies
+	// 2. Hydrate Device Tags (Sticky Assignments)
+	dtRows, err := s.db.Query("SELECT pdid, tag_id FROM device_tags")
+	if err == nil {
+		defer dtRows.Close()
+		for dtRows.Next() {
+			var pdid, tagID string
+			if err := dtRows.Scan(&pdid, &tagID); err == nil {
+				deviceTags[pdid] = tagID
+			}
+		}
+	}
+
+	// 3. Hydrate Policies
 	pRows, err := s.db.Query("SELECT data FROM policies")
 	if err == nil {
 		defer pRows.Close()
@@ -131,7 +145,7 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 		}
 	}
 
-	// 3. Hydrate Schedules
+	// 4. Hydrate Schedules
 	sRows, err := s.db.Query("SELECT id, name, timezone, rules FROM schedules")
 	if err == nil {
 		defer sRows.Close()
@@ -146,11 +160,23 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 		}
 	}
 
-	slog.Info("Successfully hydrated LIAS state from persistent storage")
-	return nil
+	slog.Info("Successfully hydrated LIAS state from persistent storage", "loaded_device_tags", len(deviceTags))
+	return deviceTags, nil
 }
 
-// SaveTag persists a tag record.
+func (s *Storage) SaveDeviceTag(pdid, tagID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		INSERT INTO device_tags (pdid, tag_id)
+		VALUES (?, ?)
+		ON CONFLICT(pdid) DO UPDATE SET tag_id=excluded.tag_id
+	`, pdid, tagID)
+
+	return err
+}
+
 func (s *Storage) SaveTag(t tags.Tag) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -172,7 +198,6 @@ func (s *Storage) SaveTag(t tags.Tag) error {
 	return err
 }
 
-// DeleteTag removes a tag record from disk.
 func (s *Storage) DeleteTag(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -180,7 +205,6 @@ func (s *Storage) DeleteTag(id string) error {
 	return err
 }
 
-// SavePolicy persists a policy record.
 func (s *Storage) SavePolicy(p models.Policy) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -211,7 +235,6 @@ func (s *Storage) SavePolicy(p models.Policy) error {
 	return err
 }
 
-// DeletePolicy removes a policy record from disk.
 func (s *Storage) DeletePolicy(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -219,7 +242,6 @@ func (s *Storage) DeletePolicy(id string) error {
 	return err
 }
 
-// SaveSchedule persists a schedule record.
 func (s *Storage) SaveSchedule(sch models.Schedule) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -241,7 +263,6 @@ func (s *Storage) SaveSchedule(sch models.Schedule) error {
 	return err
 }
 
-// DeleteSchedule removes a schedule record from disk.
 func (s *Storage) DeleteSchedule(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -249,7 +270,6 @@ func (s *Storage) DeleteSchedule(id string) error {
 	return err
 }
 
-// Close closes the underlying database connection.
 func (s *Storage) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
