@@ -1,7 +1,7 @@
 // Package nftables implements the isolated firewall controller for LIAS.
 //
 // File:    apps/lias/internal/nftables/sync.go
-// Version: 1.3
+// Version: 1.4
 package nftables
 
 import (
@@ -32,7 +32,6 @@ func NewSync(b *Builder, p policy.PolicyEvaluator, s policy.ScheduleEvaluator, t
 
 // Run starts the background sync loop.
 func (s *Sync) Run(ctx context.Context) {
-	// 10-second self-healing ticker to protect against external netfilter flushes
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -52,6 +51,12 @@ func (s *Sync) Run(ctx context.Context) {
 }
 
 func (s *Sync) resync() {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Recovered from panic during nftables resync", "panic", r)
+		}
+	}()
+
 	if err := s.builder.Sync(s.policy, s.sched); err != nil {
 		slog.Error("Failed to synchronize nftables rules", "error", err)
 	}
