@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/cache.go
-// Version: 1.3
+// Version: 1.4
 package inventory
 
 import (
@@ -38,8 +38,8 @@ func NewCache() *Cache {
 	return c
 }
 
-// GetByMACOrIP performs an O(1) indexed lookup without copying the full device inventory.
-func (c *Cache) GetByMACOrIP(macStr, ipStr string) *models.Device {
+// GetByMAC performs an O(1) indexed lookup by MAC address.
+func (c *Cache) GetByMAC(macStr string) *models.Device {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -50,6 +50,13 @@ func (c *Cache) GetByMACOrIP(macStr, ipStr string) *models.Device {
 			return &devCopy
 		}
 	}
+	return nil
+}
+
+// GetByIP performs an O(1) indexed lookup by IP string.
+func (c *Cache) GetByIP(ipStr string) *models.Device {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	cleanIP := strings.TrimSpace(ipStr)
 	if cleanIP != "" {
@@ -58,8 +65,45 @@ func (c *Cache) GetByMACOrIP(macStr, ipStr string) *models.Device {
 			return &devCopy
 		}
 	}
-
 	return nil
+}
+
+// RemoveIPIndex removes a stale IP index mapping when DHCP reassigns an IP to another MAC.
+func (c *Cache) RemoveIPIndex(ipStr string) {
+	cleanIP := strings.TrimSpace(ipStr)
+	if cleanIP == "" {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if d, found := c.ipIndex[cleanIP]; found {
+		// Strip the IP from the device's slice of IPs
+		newIPs := make([]string, 0, len(d.IPs))
+		for _, ip := range d.IPs {
+			if ip != cleanIP {
+				newIPs = append(newIPs, ip)
+			}
+		}
+		d.IPs = newIPs
+		if d.CurrentIP == cleanIP {
+			d.CurrentIP = ""
+			if len(d.IPs) > 0 {
+				d.CurrentIP = d.IPs[len(d.IPs)-1]
+			}
+		}
+		delete(c.ipIndex, cleanIP)
+		slog.Info("Invalidated stale IP index mapping due to DHCP IP reassignment", "ip", cleanIP, "pdid", d.PDID)
+	}
+}
+
+// GetByMACOrIP performs an indexed lookup checking MAC first, falling back to IP.
+func (c *Cache) GetByMACOrIP(macStr, ipStr string) *models.Device {
+	if d := c.GetByMAC(macStr); d != nil {
+		return d
+	}
+	return c.GetByIP(ipStr)
 }
 
 // Get retrieves a device by PDID. Returns nil if not found.
