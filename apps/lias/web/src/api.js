@@ -1,181 +1,207 @@
-/*
- * LIAS Control Center - API Client
+/**
+ * LIAS REST API Client & Real-time EventSource Subscriber
  * File:    apps/lias/web/src/api.js
- * Version: 1.2 (Includes Real-Time SSE Named Event Listeners)
+ * Version: 1.2
  */
 
-const BASE_URL = '/api/v1';
-
 export const API = {
-  // ---------------------------------------------------------------------------
-  // Devices
-  // ---------------------------------------------------------------------------
-  async getDevices() {
-    const res = await fetch(`${BASE_URL}/devices`);
-    if (!res.ok) throw new Error('Failed to fetch devices');
-    return await res.json();
-  },
+    /**
+     * Internal generic fetch helper handling JSON responses and status validation.
+     */
+    async request(endpoint, options = {}) {
+        const config = {
+            headers: {
+                'Content-Type': 'application/json',
+                ...options.headers
+            },
+            ...options
+        };
 
-  async getDevice(pdid) {
-    const res = await fetch(`${BASE_URL}/devices/${pdid}`);
-    if (!res.ok) throw new Error('Failed to fetch device details');
-    return await res.json();
-  },
+        const response = await fetch(endpoint, config);
 
-  async assignDeviceTag(pdid, tagId) {
-    const res = await fetch(`${BASE_URL}/devices/${pdid}/tags`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tag_id: tagId }),
-    });
-    if (!res.ok) throw new Error('Failed to assign tag');
-  },
+        if (response.status === 204) {
+            return null;
+        }
 
-  // ---------------------------------------------------------------------------
-  // Tags
-  // ---------------------------------------------------------------------------
-  async getTags() {
-    const res = await fetch(`${BASE_URL}/tags`);
-    if (!res.ok) throw new Error('Failed to fetch tags');
-    return await res.json();
-  },
+        if (!response.ok) {
+            let errorMsg = `HTTP Error ${response.status}`;
+            try {
+                const errData = await response.json();
+                if (errData && errData.error) {
+                    errorMsg = errData.error;
+                }
+            } catch (e) {
+                // Ignore JSON parse errors on non-OK responses
+            }
+            throw new Error(errorMsg);
+        }
 
-  async createTag(name, color) {
-    const res = await fetch(`${BASE_URL}/tags`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, color }),
-    });
-    if (!res.ok) throw new Error('Failed to create tag');
-    return await res.json();
-  },
+        return await response.json();
+    },
 
-  async updateTag(id, name, color) {
-    const res = await fetch(`${BASE_URL}/tags/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, color }),
-    });
-    if (!res.ok) throw new Error('Failed to update tag');
-    return await res.json();
-  },
+    // --- DEVICE ENDPOINTS ---
+    async getDevices() {
+        return await this.request('/api/v1/devices');
+    },
 
-  async deleteTag(id) {
-    const res = await fetch(`${BASE_URL}/tags/${id}`, { method: 'DELETE' });
-    if (!res.ok) throw new Error('Failed to delete tag');
-  },
+    async getDevice(pdid) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}`);
+    },
 
-  // ---------------------------------------------------------------------------
-  // Policies
-  // ---------------------------------------------------------------------------
-  async getPolicies() {
-    const res = await fetch(`${BASE_URL}/policies`);
-    if (!res.ok) throw new Error('Failed to fetch policies');
-    return await res.json();
-  },
+    async assignDeviceTag(pdid, tagId) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/tags`, {
+            method: 'POST',
+            body: JSON.stringify({ tag_id: tagId })
+        });
+    },
 
-  async createPolicy(policy) {
-    const res = await fetch(`${BASE_URL}/policies`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(policy),
-    });
-    if (!res.ok) throw new Error('Failed to create policy');
-    return await res.json();
-  },
+    // --- TAG ENDPOINTS ---
+    async getTags() {
+        return await this.request('/api/v1/tags');
+    },
 
-  async updatePolicy(id, policy) {
-    const res = await fetch(`${BASE_URL}/policies/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(policy),
-    });
-    if (!res.ok) throw new Error('Failed to update policy');
-    return await res.json();
-  },
+    async createTag(tagData) {
+        return await this.request('/api/v1/tags', {
+            method: 'POST',
+            body: JSON.stringify(tagData)
+        });
+    },
 
-  async deletePolicy(id) {
-    const res = await fetch(`${BASE_URL}/policies/${id}`, { method: 'DELETE' });
-    if (!res.ok) throw new Error('Failed to delete policy');
-  },
+    async updateTag(id, tagData) {
+        return await this.request(`/api/v1/tags/${encodeURIComponent(id)}`, {
+            method: 'PUT',
+            body: JSON.stringify(tagData)
+        });
+    },
 
-  // ---------------------------------------------------------------------------
-  // Schedules
-  // ---------------------------------------------------------------------------
-  async getSchedules() {
-    const res = await fetch(`${BASE_URL}/schedules`);
-    if (!res.ok) throw new Error('Failed to fetch schedules');
-    return await res.json();
-  },
+    async deleteTag(id) {
+        return await this.request(`/api/v1/tags/${encodeURIComponent(id)}`, {
+            method: 'DELETE'
+        });
+    },
 
-  async createSchedule(schedule) {
-    const res = await fetch(`${BASE_URL}/schedules`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(schedule),
-    });
-    if (!res.ok) throw new Error('Failed to create schedule');
-    return await res.json();
-  },
+    // --- POLICY ENDPOINTS ---
+    async getPolicies() {
+        return await this.request('/api/v1/policies');
+    },
 
-  async updateSchedule(id, schedule) {
-    const res = await fetch(`${BASE_URL}/schedules/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(schedule),
-    });
-    if (!res.ok) throw new Error('Failed to update schedule');
-    return await res.json();
-  },
+    async createPolicy(policyData) {
+        return await this.request('/api/v1/policies', {
+            method: 'POST',
+            body: JSON.stringify(policyData)
+        });
+    },
 
-  async deleteSchedule(id) {
-    const res = await fetch(`${BASE_URL}/schedules/${id}`, { method: 'DELETE' });
-    if (!res.ok) throw new Error('Failed to delete schedule');
-  },
+    async updatePolicy(id, policyData) {
+        return await this.request(`/api/v1/policies/${encodeURIComponent(id)}`, {
+            method: 'PUT',
+            body: JSON.stringify(policyData)
+        });
+    },
 
-  // ---------------------------------------------------------------------------
-  // Nftables Management
-  // ---------------------------------------------------------------------------
-  async flushNftables() {
-    const res = await fetch(`${BASE_URL}/nftables/flush`, { method: 'POST' });
-    if (!res.ok) throw new Error('Failed to flush nftables');
-  },
+    async savePolicy(policyData) {
+        if (policyData.id) {
+            try {
+                return await this.updatePolicy(policyData.id, policyData);
+            } catch (err) {
+                // Fall back to create if policy record doesn't exist yet
+                return await this.createPolicy(policyData);
+            }
+        }
+        return await this.createPolicy(policyData);
+    },
 
-  // ---------------------------------------------------------------------------
-  // SSE Real-Time Stream Subscription (Listens for named event types)
-  // ---------------------------------------------------------------------------
-  subscribeEvents(onEvent) {
-    const es = new EventSource(`${BASE_URL}/events`);
+    async deletePolicy(id) {
+        return await this.request(`/api/v1/policies/${encodeURIComponent(id)}`, {
+            method: 'DELETE'
+        });
+    },
 
-    const eventTypes = [
-      'device.added',
-      'device.removed',
-      'device.online',
-      'device.offline',
-      'device.hostname_changed',
-      'device.fingerprint_updated',
-      'device.ip_changed',
-      'device.mac_changed'
-    ];
+    // --- SCHEDULE ENDPOINTS ---
+    async getSchedules() {
+        return await this.request('/api/v1/schedules');
+    },
 
-    const handler = (e) => {
-      try {
-        const payload = JSON.parse(e.data);
-        onEvent({ type: e.type, payload });
-      } catch (err) {
-        console.error('Failed to parse SSE frame', err);
-      }
-    };
+    async createSchedule(scheduleData) {
+        return await this.request('/api/v1/schedules', {
+            method: 'POST',
+            body: JSON.stringify(scheduleData)
+        });
+    },
 
-    es.onmessage = handler;
-    eventTypes.forEach((type) => {
-      es.addEventListener(type, handler);
-    });
+    async updateSchedule(id, scheduleData) {
+        return await this.request(`/api/v1/schedules/${encodeURIComponent(id)}`, {
+            method: 'PUT',
+            body: JSON.stringify(scheduleData)
+        });
+    },
 
-    es.onerror = () => {
-      console.warn('SSE connection lost, reconnecting...');
-    };
+    async saveSchedule(scheduleData) {
+        if (scheduleData.id) {
+            try {
+                return await this.updateSchedule(scheduleData.id, scheduleData);
+            } catch (err) {
+                return await this.createSchedule(scheduleData);
+            }
+        }
+        return await this.createSchedule(scheduleData);
+    },
 
-    return es;
-  },
+    async deleteSchedule(id) {
+        return await this.request(`/api/v1/schedules/${encodeURIComponent(id)}`, {
+            method: 'DELETE'
+        });
+    },
+
+    // --- NFTABLES ENDPOINTS ---
+    async flushNftables() {
+        return await this.request('/api/v1/nftables/flush', {
+            method: 'POST'
+        });
+    },
+
+    // --- REAL-TIME SSE EVENT STREAM ---
+    subscribeEvents(onEventCallback) {
+        const eventSource = new EventSource('/api/v1/events');
+
+        eventSource.onmessage = (e) => {
+            try {
+                const eventData = JSON.parse(e.data);
+                onEventCallback(eventData);
+            } catch (err) {
+                // Ignore empty ping parse errors
+            }
+        };
+
+        const eventTypes = [
+            'device.added',
+            'device.removed',
+            'device.online',
+            'device.offline',
+            'device.hostname_changed',
+            'device.fingerprint_updated',
+            'device.ip_changed',
+            'device.mac_changed'
+        ];
+
+        eventTypes.forEach(evtType => {
+            eventSource.addEventListener(evtType, (e) => {
+                try {
+                    let payload = null;
+                    if (e.data) {
+                        payload = JSON.parse(e.data);
+                    }
+                    onEventCallback({ type: evtType, payload: payload });
+                } catch (err) {
+                    onEventCallback({ type: evtType, payload: null });
+                }
+            });
+        });
+
+        eventSource.onerror = (err) => {
+            // EventSource auto-reconnects natively on disconnect
+        };
+
+        return eventSource;
+    }
 };
