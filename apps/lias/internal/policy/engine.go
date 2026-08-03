@@ -1,7 +1,7 @@
 // Package policy implements the rule evaluation engine for LIAS.
 //
 // File:    apps/lias/internal/policy/engine.go
-// Version: 2.0 (Resolved global_default precedence bug)
+// Version: 2.1
 package policy
 
 import (
@@ -17,6 +17,7 @@ type PolicyEvaluator interface {
 
 type ScheduleEvaluator interface {
 	EvaluateNow(schedID string) models.Action
+	EvaluateBundle(schedIDs []string) models.Action
 }
 
 type Engine struct {
@@ -32,7 +33,7 @@ func NewEngine() *Engine {
 				ID:       "global_default",
 				Name:     "Global Access Switch",
 				Type:     models.PolicyTypeGlobal,
-				Action:   models.ActionSchedule, // Default is "Schedule" selected on unpersisted initial boot
+				Action:   models.ActionSchedule,
 				Priority: 0,
 			},
 		},
@@ -173,8 +174,8 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
 		}
 	}
 	if bestDevPolicy != nil {
-		if bestDevPolicy.Action == models.ActionSchedule && bestDevPolicy.ScheduleID != nil && schedEval != nil {
-			return schedEval.EvaluateNow(*bestDevPolicy.ScheduleID)
+		if bestDevPolicy.Action == models.ActionSchedule && schedEval != nil {
+			return schedEval.EvaluateBundle(bestDevPolicy.GetScheduleIDs())
 		}
 		return bestDevPolicy.Action
 	}
@@ -185,8 +186,8 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
 		for _, p := range e.policies {
 			if p.Type == models.PolicyTypeTag && p.TargetID == tagID {
 				act := p.Action
-				if act == models.ActionSchedule && p.ScheduleID != nil && schedEval != nil {
-					act = schedEval.EvaluateNow(*p.ScheduleID)
+				if act == models.ActionSchedule && schedEval != nil {
+					act = schedEval.EvaluateBundle(p.GetScheduleIDs())
 				}
 				tagActions = append(tagActions, act)
 			}
@@ -205,8 +206,8 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
 
 	// 5. Fallback to Global Default Policy
 	if globalPol, ok := e.policies["global_default"]; ok {
-		if globalPol.Action == models.ActionSchedule && globalPol.ScheduleID != nil && schedEval != nil {
-			return schedEval.EvaluateNow(*globalPol.ScheduleID)
+		if globalPol.Action == models.ActionSchedule && schedEval != nil {
+			return schedEval.EvaluateBundle(globalPol.GetScheduleIDs())
 		}
 		return globalPol.Action
 	}
