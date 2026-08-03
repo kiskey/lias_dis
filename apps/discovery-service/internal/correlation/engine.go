@@ -1,8 +1,7 @@
-// Package correlation implements the engine that merges raw observations
-// from multiple providers into canonical device records.
+// Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 2.4 (Deferred offline demotion to 3-min staleness sweep to eliminate L2 flapping)
+// Version: 3.0
 package correlation
 
 import (
@@ -29,6 +28,7 @@ type EnrichmentOrchestrator interface {
 type Engine struct {
 	cache       *inventory.Cache
 	broker      *api.Broker
+	debouncer   *Debouncer
 	store       *storage.Storage
 	orch        EnrichmentOrchestrator
 	dedupMu     sync.Mutex
@@ -36,9 +36,11 @@ type Engine struct {
 }
 
 func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
+	deb := NewDebouncer(broker)
 	return &Engine{
 		cache:       cache,
 		broker:      broker,
+		debouncer:   deb,
 		lastSeenObs: make(map[string]time.Time),
 	}
 }
@@ -52,6 +54,7 @@ func (e *Engine) SetStorage(store *storage.Storage) {
 }
 
 func (e *Engine) Run(ctx context.Context, providers []discovery.DiscoveryProvider) {
+	go e.debouncer.Run(ctx)
 	for _, p := range providers {
 		go e.consume(ctx, p.Events())
 	}
@@ -82,7 +85,7 @@ func (e *Engine) runStalenessSweep(ctx context.Context) {
 					IP:        d.CurrentIP,
 					Timestamp: time.Now(),
 				}))
-				slog.Info("Device transitioned offline via 3-min staleness sweep", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", d.CurrentIP)
+				slog.Info("Device transitioned offline via staleness sweep", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", d.CurrentIP)
 			}
 		}
 	}
@@ -116,15 +119,6 @@ func (e *Engine) isDuplicateObservation(macStr, ipStr string, online bool) bool 
 	}
 
 	e.lastSeenObs[key] = now
-
-	if len(e.lastSeenObs) > 1000 {
-		for k, t := range e.lastSeenObs {
-			if now.Sub(t) > 10*time.Second {
-				delete(e.lastSeenObs, k)
-			}
-		}
-	}
-
 	return false
 }
 
@@ -151,118 +145,90 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	}
 
 	cleanHost := discovery.UnescapeHostname(obs.Hostname)
+	canonicalHost := CanonicalizeHostname(cleanHost)
 
-	// 1. QUERY EXISTING DEVICE
+	// Step 6: Pi-hole cannot update CurrentIP (Confidence Matrix Gate)
+	if obs.Source == "pihole" && ipStr != "" {
+		if existing := e.cache.GetByIP(ipStr); existing != nil {
+			existing.AddIP(ipStr)
+			return
+		}
+	}
+
+	// 1. Query Existing Device
 	d := e.cache.GetByMACOrIP(macStr, ipStr)
 
-	// Handle offline observation: Defer offline state change to 3-minute staleness sweep.
-	// This suppresses transient L2 neighbor ARP state changes (e.g. Wi-Fi power-save) from flapping UI notifications.
-	if !obs.Online {
-		slog.Debug("Received transient offline observation, deferring offline transition to 3-min staleness sweep",
-			"mac", macStr, "ip", ipStr, "source", obs.Source)
-		return
-	}
-
-	// 2. PROVIDER CONFIDENCE GUARD
-	if d != nil && !d.Online && obs.Confidence < 0.8 {
-		slog.Debug("Ignoring Online: true from low-confidence background provider for L2-offline device",
-			"pdid", d.PDID, "source", obs.Source, "confidence", obs.Confidence)
-
-		if cleanHost != "" && d.Hostname != cleanHost {
-			d.Hostname = cleanHost
-			e.cache.Upsert(d)
-			if e.store != nil {
-				_ = e.store.SaveDevice(d)
-			}
-		}
-		return
-	}
-
-	// 3. DHCP IP-REUSE GUARD & PRIVATE-MAC CONTINUITY
-	if ipStr != "" && macStr != "" {
-		if ipMatch := e.cache.GetByIP(ipStr); ipMatch != nil {
-			if !ipMatch.HasMAC(macStr) {
-				if oui.IsRandomizedMAC(macStr) && !ipMatch.Online {
-					slog.Info("Observed Private MAC rotation on same IP",
-						"pdid", ipMatch.PDID, "ip", ipStr, "new_mac", macStr)
-					ipMatch.AddMAC(macStr)
-					ipMatch.Online = true
-					ipMatch.Touch(time.Now())
-					e.cache.Upsert(ipMatch)
-					if e.store != nil {
-						_ = e.store.SaveDevice(ipMatch)
-					}
-					e.broker.Broadcast(models.NewEvent(models.EventMACChanged, ipMatch.PDID, models.DeviceEventPayload{
-						PDID:      ipMatch.PDID,
-						MAC:       macStr,
-						IP:        ipStr,
-						Timestamp: time.Now(),
-					}))
-					return
-				}
-
-				slog.Info("DHCP IP reassignment detected, invalidating stale IP binding",
-					"ip", ipStr, "old_pdid", ipMatch.PDID, "new_mac", macStr)
+	// Step 2: Validate IP Claim on IP mismatch
+	if d != nil && ipStr != "" && d.CurrentIP != ipStr {
+		if existingOnIP := e.cache.GetByIP(ipStr); existingOnIP != nil && existingOnIP.PDID != d.PDID {
+			claimRes := ValidateIPClaim(obs, existingOnIP)
+			if claimRes == ClaimCreateNew {
 				e.cache.RemoveIPIndex(ipStr)
+				d = nil
 			}
 		}
 	}
 
-	// 4. PRIVATE MAC HOSTNAME FALLBACK
-	if d == nil && macStr != "" && oui.IsRandomizedMAC(macStr) && cleanHost != "" {
-		if hostMatch := e.cache.GetByHostname(cleanHost); hostMatch != nil {
-			slog.Info("Linked rotated Private MAC address to existing device record by L7 Hostname",
-				"pdid", hostMatch.PDID, "new_mac", macStr, "hostname", cleanHost)
-			d = hostMatch
+	// Step 3: Hostname Ownership Lock check
+	if canonicalHost != "" && (d == nil || d.CanonicalHostname != canonicalHost) {
+		ownerPDID, exists := e.cache.GetHostnameOwner(canonicalHost)
+		if exists && (d == nil || ownerPDID != d.PDID) {
+			acqRes := e.cache.AcquireHostname(canonicalHost, d.PDID)
+			if acqRes == AcquireReject {
+				slog.Debug("Hostname ownership lock rejected claim", "host", canonicalHost, "claimant", obs.Source)
+				canonicalHost = ""
+				cleanHost = ""
+			}
 		}
 	}
 
-	// Handle new device discovery
+	// 2. New Device Creation with Tiered Identity (Step 7)
 	if d == nil {
-		pdid := inventory.GeneratePDID(macStr, cleanHost, obs.Vendor)
-		isTentative := macStr == ""
+		tier, anchor := DeriveTierAndAnchor(macStr, cleanHost, obs.Vendor)
+		pdid := GeneratePDID(tier, anchor)
+
 		d = &models.Device{
-			PDID:        pdid,
-			Hostname:    cleanHost,
-			Vendor:      obs.Vendor,
-			Model:       obs.Model,
-			Online:      true,
-			IsTentative: isTentative,
-			Confidence:  obs.Confidence,
-			SourceInfo:  make(map[string]models.SourceMeta),
+			PDID:              pdid,
+			IdentityTier:      tier,
+			IdentityAnchor:    anchor,
+			CanonicalHostname: canonicalHost,
+			Hostname:          cleanHost,
+			Vendor:            obs.Vendor,
+			Model:             obs.Model,
+			Online:            false,
+			Confidence:        obs.Confidence,
+			SourceInfo:        make(map[string]models.SourceMeta),
 		}
 		d.AddMAC(macStr)
-		d.AddIP(ipStr)
+		if obs.Source != "pihole" {
+			d.AddIP(ipStr)
+		}
 		for _, svc := range obs.Services {
 			d.AddService(svc)
 		}
 		d.Touch(time.Now())
 
-		ApplySmartClassifications(d)
-
 		e.cache.Upsert(d)
+		if canonicalHost != "" {
+			_ = e.cache.AcquireHostname(canonicalHost, d.PDID)
+		}
+
 		if e.store != nil {
-			if err := e.store.SaveDevice(d); err != nil {
-				slog.Error("Failed to persist new device record to SQLite", "pdid", d.PDID, "error", err)
-			}
+			_ = e.store.SaveDevice(d)
 		}
 
-		slog.Info("New device correlated", "pdid", pdid, "mac", macStr, "ip", ipStr, "vendor", d.Vendor, "type", d.DeviceType)
+		slog.Info("New tiered device correlated", "pdid", pdid, "tier", tier, "mac", macStr, "ip", ipStr)
 		e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
-
-		if e.orch != nil {
-			go e.orch.TriggerEnrichment(d.PDID, false)
-		}
 		return
 	}
 
-	// 5. TENTATIVE PDID PROMOTION
-	if d.IsTentative && macStr != "" {
+	// 3. Identity Promotion State Machine (Step 7)
+	newTier, newAnchor := DeriveTierAndAnchor(macStr, cleanHost, obs.Vendor)
+	if CanPromote(d.IdentityTier, newTier) {
 		oldPDID := d.PDID
-		newPDID := inventory.GeneratePDID(macStr, cleanHost, d.Vendor)
+		newPDID := GeneratePDID(newTier, newAnchor)
 
-		slog.Info("Promoting tentative PDID to deterministic MAC-seeded PDID",
-			"old_pdid", oldPDID, "new_pdid", newPDID, "mac", macStr)
+		slog.Info("Promoting device identity tier", "old_pdid", oldPDID, "new_pdid", newPDID, "from", d.IdentityTier, "to", newTier)
 
 		e.cache.Delete(oldPDID)
 		if e.store != nil {
@@ -270,90 +236,64 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		}
 
 		d.PDID = newPDID
-		d.IsTentative = false
-		d.AddMAC(macStr)
-		d.AddIP(ipStr)
-		for _, svc := range obs.Services {
-			d.AddService(svc)
-		}
-		d.Touch(time.Now())
-		ApplySmartClassifications(d)
+		d.IdentityTier = newTier
+		d.IdentityAnchor = newAnchor
+		d.CanonicalHostname = canonicalHost
 
 		e.cache.Upsert(d)
 		if e.store != nil {
 			_ = e.store.SaveDevice(d)
 		}
 
-		e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
-		e.broker.Broadcast(models.NewEvent(models.EventDeviceRemoved, oldPDID, nil))
+		e.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, d.PDID, models.DeviceReidentifiedPayload{
+			OldPDID:   oldPDID,
+			NewPDID:   newPDID,
+			Reason:    string(newTier) + "_observed",
+			Timestamp: time.Now(),
+		}))
 		return
 	}
 
-	// 6. UPDATE EXISTING DEVICE RECORD
-	changed := false
-	var eventTypes []models.EventType
-	payload := models.DeviceEventPayload{
-		PDID:      d.PDID,
-		Timestamp: time.Now(),
-	}
-
-	if !d.Online {
-		d.Online = true
-		changed = true
-		eventTypes = append(eventTypes, models.EventDeviceOnline)
-	}
-
-	if macStr != "" && d.CurrentMAC != macStr {
-		payload.OldMAC = d.CurrentMAC
-		d.AddMAC(macStr)
-		payload.MAC = macStr
-		changed = true
-		eventTypes = append(eventTypes, models.EventMACChanged)
-	}
-
-	if ipStr != "" && d.CurrentIP != ipStr {
-		payload.OldIP = d.CurrentIP
-		d.AddIP(ipStr)
-		payload.IP = ipStr
-		changed = true
-		eventTypes = append(eventTypes, models.EventIPChanged)
-	}
-
-	if cleanHost != "" && d.Hostname != cleanHost {
-		payload.OldHost = d.Hostname
-		d.Hostname = cleanHost
-		payload.Hostname = cleanHost
-		changed = true
-		eventTypes = append(eventTypes, models.EventHostnameChanged)
-	}
-
-	if obs.Vendor != "" && (d.Vendor == "" || obs.Confidence >= d.Confidence) {
-		if d.Vendor != obs.Vendor {
-			d.Vendor = obs.Vendor
-			changed = true
-			eventTypes = append(eventTypes, models.EventFingerprintUpdated)
+	// 4. Asymmetric Online Flap Fix (Step 5)
+	if !d.Online && obs.Online {
+		d.PendingOnlineObs = append(d.PendingOnlineObs, obs.Source)
+		if len(d.PendingOnlineObs) >= 2 || obs.Group == discovery.GroupA {
+			d.Online = true
+			d.PendingOnlineObs = nil
+			e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
 		}
 	}
 
-	for _, svc := range obs.Services {
-		d.AddService(svc)
+	// 5. Update Record & Submit to Debouncer (Step 4)
+	if cleanHost != "" && !HostnamesAreEquivalent(d.Hostname, cleanHost) {
+		oldHost := d.Hostname
+		d.Hostname = cleanHost
+		d.CanonicalHostname = canonicalHost
+		e.debouncer.Submit(d.PDID, models.EventHostnameChanged, obs.Source, models.DeviceEventPayload{
+			PDID:                 d.PDID,
+			Hostname:             cleanHost,
+			CanonicalHostname:    canonicalHost,
+			OldHost:              oldHost,
+			OldCanonicalHostname: CanonicalizeHostname(oldHost),
+			Timestamp:            time.Now(),
+		})
 	}
 
-	ApplySmartClassifications(d)
+	if ipStr != "" && obs.Source != "pihole" && d.CurrentIP != ipStr {
+		oldIP := d.CurrentIP
+		e.cache.SetCurrentIP(d.PDID, ipStr)
+		e.debouncer.Submit(d.PDID, models.EventIPChanged, obs.Source, models.DeviceEventPayload{
+			PDID:      d.PDID,
+			IP:        ipStr,
+			OldIP:     oldIP,
+			Timestamp: time.Now(),
+		})
+	}
 
 	d.Touch(time.Now())
-	if changed {
-		e.cache.Upsert(d)
-		if e.store != nil {
-			_ = e.store.SaveDevice(d)
-		}
-		for _, et := range eventTypes {
-			e.broker.Broadcast(models.NewEvent(et, d.PDID, payload))
-		}
-	}
-
-	if (d.Vendor == "" || d.DeviceType == "") && e.orch != nil {
-		go e.orch.TriggerEnrichment(d.PDID, false)
+	e.cache.Upsert(d)
+	if e.store != nil {
+		_ = e.store.SaveDevice(d)
 	}
 }
 
