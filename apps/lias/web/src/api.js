@@ -1,7 +1,7 @@
 /**
  * LIAS REST API Client & Real-time EventSource Subscriber
  * File:    apps/lias/web/src/api.js
- * Version: 2.0 (Audited & Merged per Enhancement 3.0)
+ * Version: 2.1 (Audited & Merged per Enhancement 3.0 & 4.0)
  */
 
 export const API = {
@@ -207,7 +207,8 @@ export const API = {
             'device.hostname_changed',
             'device.fingerprint_updated',
             'device.ip_changed',
-            'device.mac_changed'
+            'device.mac_changed',
+            'device.reidentified' // GAP-I01: Added missing event type
         ];
 
         eventTypes.forEach(evtType => {
