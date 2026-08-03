@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 2.1 (Prioritized MAC Allow over IP Block to prevent DHCP lockouts)
+// Version: 2.2 (Fixed nftables.TableFamilyNetdev casing typo)
 package nftables
 
 import (
@@ -48,7 +48,7 @@ func (c *Controller) Init() error {
 
     // 1. Create or bind the netdev table
     c.table = c.conn.AddTable(&nftables.Table{
-        Family: nftables.TableFamilyNetDev,
+        Family: nftables.TableFamilyNetdev, // FIXED TYPO: Netdev instead of NetDev
         Name:   c.cfg.TableName,
     })
 
