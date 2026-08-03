@@ -1,7 +1,7 @@
 /* 
  * LIAS Dashboard Styles
  * File:    apps/lias/web/src/styles.css
- * Version: 1.6 (Apple HIG Confirmation Sheet & Warning Badge Callouts)
+ * Version: 1.7 (Multi-Schedule Timeline, Conflict Hatch, and Wizard Step Indicator)
  */
 
 :root {
@@ -108,7 +108,6 @@ html, body {
   border: 1px solid var(--separator);
 }
 
-/* Collapsible Tag Group Cards */
 .group-card {
   background-color: var(--bg-secondary); border-radius: var(--border-radius-card);
   box-shadow: var(--shadow-sm); border: 1px solid var(--separator); margin-bottom: 20px;
@@ -142,14 +141,12 @@ html, body {
 .device-item-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; }
 .device-name { font-size: 15px; font-weight: 700; color: var(--text-primary); }
 
-/* Status Indicators */
 .status-indicator { width: 10px; height: 10px; border-radius: 50%; background-color: var(--text-secondary); flex-shrink: 0; }
 .status-indicator.online { background-color: var(--success); box-shadow: 0 0 8px rgba(52, 199, 89, 0.4); }
 .status-indicator.offline { background-color: var(--text-secondary); }
 
 .device-meta { font-size: 12px; color: var(--text-secondary); line-height: 1.5; margin-bottom: 8px; }
 
-/* Service Pills - Apple HIG Rounded Badges */
 .service-pill-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .service-pill {
   display: inline-flex; align-items: center; gap: 4px;
@@ -163,10 +160,14 @@ html, body {
 }
 
 .global-switch-banner {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; flex-direction: column; gap: 16px;
   background: linear-gradient(135deg, var(--bg-secondary), var(--bg-tertiary));
   border-radius: var(--border-radius-card); padding: 20px 24px; margin-bottom: 24px;
   border: 1px solid var(--separator); box-shadow: var(--shadow-sm);
+}
+
+.global-switch-top {
+  display: flex; align-items: center; justify-content: space-between;
 }
 
 .segmented-control {
@@ -179,7 +180,7 @@ html, body {
 .segmented-btn.active { background: var(--bg-secondary); color: var(--text-primary); box-shadow: var(--shadow-sm); }
 .segmented-btn.danger.active { background: var(--danger); color: #fff; }
 
-/* Day Chips Selector - Fixed Desktop & Mobile HIG Segmented Flex Layout */
+/* Day Chips Selector */
 .day-chip-group {
   display: flex !important;
   flex-direction: row !important;
@@ -218,8 +219,7 @@ html, body {
   box-shadow: var(--shadow-sm) !important;
 }
 
-/* Time Picker Styling */
-input[type="time"] {
+input[type="time"], select {
   appearance: none;
   -webkit-appearance: none;
   padding: 10px 14px;
@@ -243,7 +243,140 @@ input[type="time"] {
 .btn-danger { background-color: var(--danger); color: #fff; }
 .btn-secondary { background-color: var(--bg-tertiary); color: var(--text-primary); }
 
-/* Apple HIG Callout Box for Impact Warnings */
+/* Multi-Schedule Timeline & Conflict Visualizer */
+.weekly-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg-tertiary);
+  border-radius: 12px;
+  padding: 14px;
+  margin-top: 14px;
+  border: 1px solid var(--separator);
+}
+
+.timeline-day-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.timeline-day-label {
+  width: 36px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.timeline-track {
+  position: relative;
+  flex-grow: 1;
+  height: 20px;
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+@media (prefers-color-scheme: dark) {
+  .timeline-track {
+    background: rgba(255, 255, 255, 0.08);
+  }
+}
+
+.timeline-band {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  border-radius: 4px;
+  opacity: 0.85;
+  transition: opacity 0.2s;
+}
+
+.timeline-band.conflict {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--danger),
+    var(--danger) 8px,
+    #000 8px,
+    #000 16px
+  ) !important;
+  opacity: 1 !important;
+  z-index: 10;
+  border: 1px solid #fff;
+}
+
+.wizard-steps {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--separator);
+  padding-bottom: 12px;
+}
+
+.wizard-step {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.wizard-step.active {
+  color: var(--accent);
+}
+
+.wizard-step-num {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--bg-tertiary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+}
+
+.wizard-step.active .wizard-step-num {
+  background: var(--accent);
+  color: #fff;
+}
+
+.overnight-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  margin-top: 6px;
+}
+
+.overnight-chip.moon {
+  background: rgba(88, 86, 214, 0.15);
+  color: #5856d6;
+  border: 1px solid rgba(88, 86, 214, 0.3);
+}
+
+.overnight-chip.sun {
+  background: rgba(255, 149, 0, 0.15);
+  color: var(--warning);
+  border: 1px solid rgba(255, 149, 0, 0.3);
+}
+
+.continuous-preview {
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 12px;
+  font-family: monospace;
+  margin-top: 8px;
+  line-height: 1.6;
+}
+
 .hig-callout-warning {
   background-color: rgba(255, 149, 0, 0.12);
   border: 1px solid rgba(255, 149, 0, 0.3);
@@ -261,19 +394,6 @@ input[type="time"] {
   margin-left: 20px;
 }
 
-/* Missing Schedule Badge Callout */
-.badge-missing-sched {
-  background-color: var(--danger) !important;
-  color: #ffffff !important;
-  animation: pulseWarning 2s infinite;
-}
-
-@keyframes pulseWarning {
-  0% { opacity: 0.85; }
-  50% { opacity: 1; }
-  100% { opacity: 0.85; }
-}
-
 .modal-backdrop {
   position: fixed; top: 0; left: 0; width: 100%; height: 100%;
   background-color: rgba(0,0,0,0.4); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
@@ -281,7 +401,7 @@ input[type="time"] {
 }
 .modal-backdrop.hidden { opacity: 0; pointer-events: none; }
 .modal-window {
-  background-color: var(--bg-secondary); border-radius: 20px; width: 90%; max-width: 540px;
+  background-color: var(--bg-secondary); border-radius: 20px; width: 90%; max-width: 580px;
   max-height: 85vh; display: flex; flex-direction: column; box-shadow: var(--shadow-lg);
   border: 1px solid var(--separator);
 }
