@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 3.4
+// Version: 3.5
 package correlation
 
 import (
@@ -50,6 +50,8 @@ func (e *Engine) SetOrchestrator(orch EnrichmentOrchestrator) {
 
 func (e *Engine) SetStorage(store *storage.Storage) {
     e.store = store
+    e.debouncer.SetStore(store)
+
     if store != nil {
         if owners, err := store.LoadHostnameOwners(); err == nil {
             e.cache.LoadHostnameOwners(owners)
@@ -61,6 +63,29 @@ func (e *Engine) SetStorage(store *storage.Storage) {
                 _ = store.SaveHostnameOwner(host, pdid)
             }
         })
+
+        // GAP-D11: Load pending events for crash recovery
+        if pending, err := store.LoadPendingEvents(); err == nil {
+            // Convert storage.PendingEventRecord to correlation.PendingEventRecord
+            // Since they are structurally identical but in different packages,
+            // we can just reconstruct the slice.
+            correlationPending := make([]PendingEventRecord, len(pending))
+            for i, p := range pending {
+                correlationPending[i] = PendingEventRecord{
+                    PDID:          p.PDID,
+                    EventType:     p.EventType,
+                    Payload:       p.Payload,
+                    FirstSeen:     p.FirstSeen,
+                    LastSeen:      p.LastSeen,
+                    Confirmations: p.Confirmations,
+                    Sources:       p.Sources,
+                }
+            }
+            e.debouncer.LoadPending(correlationPending)
+            if len(correlationPending) > 0 {
+                slog.Info("Loaded pending events from storage for recovery", "count", len(correlationPending))
+            }
+        }
     }
 }
 
