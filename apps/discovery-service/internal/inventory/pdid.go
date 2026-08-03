@@ -1,7 +1,7 @@
 // Package inventory provides identity helpers for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/pdid.go
-// Version: 2.2
+// Version: 2.3
 package inventory
 
 import (
