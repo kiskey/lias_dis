@@ -2,7 +2,7 @@
 // from multiple providers into canonical device records.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 2.3 (Fixed offline deduplication & service propagation)
+// Version: 2.4 (Deferred offline demotion to 3-min staleness sweep to eliminate L2 flapping)
 package correlation
 
 import (
@@ -82,7 +82,7 @@ func (e *Engine) runStalenessSweep(ctx context.Context) {
 					IP:        d.CurrentIP,
 					Timestamp: time.Now(),
 				}))
-				slog.Info("Device transitioned offline via staleness sweep", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", d.CurrentIP)
+				slog.Info("Device transitioned offline via 3-min staleness sweep", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", d.CurrentIP)
 			}
 		}
 	}
@@ -103,8 +103,6 @@ func (e *Engine) consume(ctx context.Context, ch <-chan discovery.Observation) {
 }
 
 func (e *Engine) isDuplicateObservation(macStr, ipStr string, online bool) bool {
-	// Crucial Fix: Include online status boolean in dedup key so rapid offline transitions
-	// are never dropped as duplicates of preceding online observations.
 	key := fmt.Sprintf("%s|%s|%t", macStr, ipStr, online)
 	now := time.Now()
 
@@ -157,23 +155,11 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	// 1. QUERY EXISTING DEVICE
 	d := e.cache.GetByMACOrIP(macStr, ipStr)
 
-	// Handle offline observation
+	// Handle offline observation: Defer offline state change to 3-minute staleness sweep.
+	// This suppresses transient L2 neighbor ARP state changes (e.g. Wi-Fi power-save) from flapping UI notifications.
 	if !obs.Online {
-		if d != nil && d.Online {
-			d.Online = false
-			d.LastSeen = time.Now()
-			e.cache.Upsert(d)
-			if e.store != nil {
-				_ = e.store.SaveDevice(d)
-			}
-			e.broker.Broadcast(models.NewEvent(models.EventDeviceOffline, d.PDID, models.DeviceEventPayload{
-				PDID:      d.PDID,
-				MAC:       macStr,
-				IP:        ipStr,
-				Timestamp: time.Now(),
-			}))
-			slog.Info("Device transitioned offline", "pdid", d.PDID, "mac", macStr, "ip", ipStr, "source", obs.Source)
-		}
+		slog.Debug("Received transient offline observation, deferring offline transition to 3-min staleness sweep",
+			"mac", macStr, "ip", ipStr, "source", obs.Source)
 		return
 	}
 
