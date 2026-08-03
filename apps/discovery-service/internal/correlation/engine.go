@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 3.5
+// Version: 3.6
 package correlation
 
 import (
@@ -66,9 +66,6 @@ func (e *Engine) SetStorage(store *storage.Storage) {
 
         // GAP-D11: Load pending events for crash recovery
         if pending, err := store.LoadPendingEvents(); err == nil {
-            // Convert storage.PendingEventRecord to correlation.PendingEventRecord
-            // Since they are structurally identical but in different packages,
-            // we can just reconstruct the slice.
             correlationPending := make([]PendingEventRecord, len(pending))
             for i, p := range pending {
                 correlationPending[i] = PendingEventRecord{
@@ -274,13 +271,22 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         }
     }
 
-    // Step 3: Hostname Ownership Lock check
-    if canonicalHost != "" && (d == nil || d.CanonicalHostname != canonicalHost) {
-        ownerPDID, exists := e.cache.GetHostnameOwner(canonicalHost)
-        if exists && (d == nil || ownerPDID != d.PDID) {
-            acqRes := e.cache.AcquireHostname(canonicalHost, d.PDID)
-            if acqRes == inventory.AcquireReject {
-                slog.Debug("Hostname ownership lock rejected claim", "host", canonicalHost, "claimant", obs.Source)
+    // Step 3: Hostname Ownership Lock check (FIX: Prevent nil pointer dereference)
+    if canonicalHost != "" {
+        if d != nil {
+            ownerPDID, exists := e.cache.GetHostnameOwner(canonicalHost)
+            if exists && ownerPDID != d.PDID {
+                acqRes := e.cache.AcquireHostname(canonicalHost, d.PDID)
+                if acqRes == inventory.AcquireReject {
+                    slog.Debug("Hostname ownership lock rejected claim", "host", canonicalHost, "claimant", obs.Source)
+                    canonicalHost = ""
+                    cleanHost = ""
+                }
+            }
+        } else {
+            // d == nil: new device. Check if hostname is actively owned by someone else.
+            if e.cache.IsHostnameActivelyOwned(canonicalHost) {
+                slog.Debug("Hostname ownership lock rejected claim for new device", "host", canonicalHost, "claimant", obs.Source)
                 canonicalHost = ""
                 cleanHost = ""
             }
