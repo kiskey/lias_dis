@@ -1,7 +1,7 @@
 // Schedule Conflict Detection & Minute-Grid Projection Engine
 //
 // File:    apps/lias/web/src/scheduleConflict.js
-// Version: 1.0
+// Version: 1.1 (Added expandDayRange & parseTime exports)
 
 const DAY_MAP = {
   sun: 0, sunday: 0,
@@ -15,19 +15,36 @@ const DAY_MAP = {
 
 const DAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
 
-function parseTime(timeStr) {
+export function parseTime(timeStr) {
   if (!timeStr) return 0;
   const parts = timeStr.split(':');
   return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
 }
 
-function formatMinuteOfWeek(m) {
+export function formatMinuteOfWeek(m) {
   m = ((m % 10080) + 10080) % 10080;
   const dayIdx = Math.floor(m / 1440);
   const minOfDay = m % 1440;
   const hh = String(Math.floor(minOfDay / 60)).padStart(2, '0');
   const mm = String(minOfDay % 60).padStart(2, '0');
   return { day: DAY_NAMES[dayIdx], time: `${hh}:${mm}` };
+}
+
+export function expandDayRange(fromDay, toDay) {
+  const daysOrder = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+  const startIdx = daysOrder.indexOf(fromDay.toLowerCase().substring(0, 3));
+  const endIdx = daysOrder.indexOf(toDay.toLowerCase().substring(0, 3));
+
+  if (startIdx === -1 || endIdx === -1) return [fromDay];
+
+  const result = [];
+  let curr = startIdx;
+  while (true) {
+    result.push(daysOrder[curr]);
+    if (curr === endIdx) break;
+    curr = (curr + 1) % 7;
+  }
+  return result;
 }
 
 export function projectSchedule(schedule) {
@@ -55,7 +72,8 @@ export function projectSchedule(schedule) {
           sourceRuleIdx: ruleIdx
         });
       } else {
-        // Overnight window
+        // Overnight window (e.g. 22:00 -> 06:00)
+        // Segment 1: startMin to midnight on current day
         segments.push({
           start: dayIdx * 1440 + startMin,
           end: (dayIdx + 1) * 1440,
@@ -65,6 +83,7 @@ export function projectSchedule(schedule) {
           sourceRuleIdx: ruleIdx
         });
 
+        // Segment 2: midnight to endMin on next day
         const nextDayIdx = (dayIdx + 1) % 7;
         segments.push({
           start: nextDayIdx * 1440,
