@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, middleware, and SSE broker for DIS.
 //
 // File:    apps/discovery-service/internal/api/sse.go
-// Version: 1.3
+// Version: 2.0
 package api
 
 import (
@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/user/lias-dis/apps/discovery-service/internal/inventory"
 	"github.com/user/lias-dis/shared/models"
 )
 
@@ -21,14 +22,16 @@ type Client struct {
 
 type Broker struct {
 	mu       sync.RWMutex
+	cache    *inventory.Cache
 	clients  map[string]*Client
 	history  []models.Event
 	histHead int
 	stopPing chan struct{}
 }
 
-func NewBroker() *Broker {
+func NewBroker(cache *inventory.Cache) *Broker {
 	b := &Broker{
+		cache:    cache,
 		clients:  make(map[string]*Client),
 		history:  make([]models.Event, 0, historyBufferCapacity),
 		stopPing: make(chan struct{}),
@@ -115,6 +118,13 @@ func (b *Broker) replayEventsLocked(client *Client, lastEventID int64) {
 	count := 0
 	for _, evt := range b.history {
 		if evt.Timestamp.UnixNano() > lastEventID {
+			// Suppress device.online replays for devices currently online to prevent reconnect bursts
+			if evt.Type == models.EventDeviceOnline && b.cache != nil {
+				if dev := b.cache.Get(evt.DeviceID); dev != nil && dev.Online {
+					continue
+				}
+			}
+
 			select {
 			case client.Events <- evt:
 				count++
