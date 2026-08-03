@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 2.3 (Added UI warnings for empty schedules)
+// Version: 2.4 (Timezone UX Dropdown & Empty Schedule Warnings)
 
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
@@ -15,6 +15,16 @@ class App {
     this.schedules = [];
     this.searchQuery = '';
     this.wizardState = {};
+
+    // UX Timezone Mapping (Label -> IANA Value)
+    this.timezones = [
+      { label: '(UTC-08:00) Pacific Time (PT)', value: 'America/Los_Angeles' },
+      { label: '(UTC-07:00) Mountain Time (MT)', value: 'America/Denver' },
+      { label: '(UTC-06:00) Central Time (CT)', value: 'America/Chicago' },
+      { label: '(UTC-05:00) Eastern Time (ET)', value: 'America/New_York' },
+      { label: '(UTC+00:00) Coordinated Universal Time (UTC)', value: 'UTC' },
+      { label: '(UTC+05:30) India Standard Time (IST)', value: 'Asia/Kolkata' }
+    ];
 
     this.initRouter();
     this.initSSE();
@@ -52,7 +62,6 @@ class App {
   handleRealtimeEvent(event) {
     const pdid = (event.payload && event.payload.pdid) || event.device_id || 'device';
     
-    // GAP-L07: Extract confirmed_by array for verified badge
     const confirmedBy = event.payload?.confirmed_by || [];
     const verifiedBadge = confirmedBy.length > 0
         ? ` <span class="verified-badge">✓ ${confirmedBy.length} sources</span>`
@@ -366,7 +375,6 @@ class App {
           const schedSummary = this.getScheduleSummary(p);
           const scheds = this.resolvePolicySchedules(p);
           
-          // ENG REC 2: Warning for empty schedules
           const isEmptySchedule = p.action === 'schedule' && scheds.length === 0;
           const emptySchedWarning = isEmptySchedule ? `
             <div class="hig-callout-warning" style="margin-top:8px; padding:8px 12px; font-size:12px;">
@@ -559,7 +567,6 @@ class App {
     const colors = ['#0071e3', '#34c759', '#ff9500', '#af52de', '#5856d6', '#00c7be'];
     const conflicts = detectConflicts(schedules);
 
-    // GAP-L06: Timezone mismatch soft warning
     const timezones = new Set(schedules.map(s => s.timezone).filter(Boolean));
     let tzWarningHtml = '';
     if (timezones.size > 1) {
@@ -637,7 +644,6 @@ class App {
     return html;
   }
 
-  // Multi-Step Policy Wizard
   openPolicyWizard(existingPolicy = null) {
     this.wizardState = {
       step: 1,
@@ -759,13 +765,11 @@ class App {
     this.bindPolicyWizardEvents();
     if (step === 1) this.checkShadowPolicy();
     
-    // GAP-L05: Disable Save button on load if conflicts exist
     if (step === 3) {
       this.updateWizardConflictState();
     }
   }
 
-  // GAP-L05: Helper to update save button state based on conflicts
   updateWizardConflictState() {
     const { policy } = this.wizardState;
     const selectedScheds = (policy.schedule_ids || []).map(id => this.schedules.find(s => s.id === id)).filter(Boolean);
@@ -905,7 +909,6 @@ class App {
           const selectedScheds = selected.map(id => this.schedules.find(s => s.id === id)).filter(Boolean);
           document.getElementById('wiz-timeline-container').innerHTML = this.renderWeeklyTimeline(selectedScheds);
           
-          // Re-render step to show/hide empty schedule warning
           this.renderPolicyWizardStep();
         });
       });
@@ -928,12 +931,11 @@ class App {
     }
   }
 
-  // Schedule Modal with Continuous Range Mode & Overnight Chip
   openScheduleModal(existingSchedule = null) {
     const s = existingSchedule ? JSON.parse(JSON.stringify(existingSchedule)) : {
       name: '',
       mode: 'downtime',
-      timezone: 'UTC',
+      timezone: 'UTC', // Default to UTC for new schedules
       rules: [{ days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_time: '22:00', end_time: '06:00', action: 'block' }]
     };
 
@@ -950,9 +952,13 @@ class App {
             <option value="whitelist" ${s.mode === 'whitelist' ? 'selected' : ''}>Whitelist Mode (Rules ALLOW, Default BLOCK)</option>
           </select>
         </div>
+        
+        <!-- UX Timezone Dropdown -->
         <div>
           <label style="font-size:12px; font-weight:700;">Timezone</label>
-          <input type="text" id="sched-tz" value="${s.timezone || 'UTC'}" placeholder="e.g. UTC, America/Los_Angeles" style="width:100%; margin-top:4px;">
+          <select id="sched-tz" style="width:100%; margin-top:4px;">
+            ${this.timezones.map(tz => `<option value="${tz.value}" ${s.timezone === tz.value ? 'selected' : ''}>${tz.label}</option>`).join('')}
+          </select>
         </div>
 
         <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
@@ -1024,7 +1030,6 @@ class App {
           <div class="overnight-container">
             ${isOvernight && !isAllDay ? `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${rule.end_time} the FOLLOWING day</div>` : ''}
           </div>
-          <!-- GAP-L08: Added All Day toggle -->
           <label style="display:flex; align-items:center; gap:4px; font-size:11px; font-weight:600; color:var(--text-secondary);">
             <input type="checkbox" class="rule-all-day" ${isAllDay ? 'checked' : ''}> All Day
           </label>
@@ -1059,7 +1064,7 @@ class App {
         const container = row.querySelector('.overnight-container');
         const allDayChk = row.querySelector('.rule-all-day');
 
-        if (allDayChk && allDayChk.checked) return; // Skip if All Day is checked
+        if (allDayChk && allDayChk.checked) return;
 
         if (start && end && end <= start) {
           container.innerHTML = `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${end} the FOLLOWING day</div>`;
@@ -1069,7 +1074,6 @@ class App {
       });
     });
 
-    // GAP-L08: Bind All Day toggle
     document.querySelectorAll('.rule-all-day').forEach(chk => {
       chk.addEventListener('change', (e) => {
         const row = e.target.closest('.rule-row');
@@ -1121,7 +1125,7 @@ class App {
       }
 
       const mode = document.getElementById('sched-mode').value;
-      const timezone = document.getElementById('sched-tz').value.trim() || 'UTC';
+      const timezone = document.getElementById('sched-tz').value; // Read from dropdown
 
       const rules = [];
       document.querySelectorAll('.rule-row').forEach(row => {
@@ -1242,7 +1246,7 @@ class App {
     const toast = document.createElement('div');
     toast.className = 'toast';
     if (type === 'danger') toast.style.backgroundColor = 'var(--danger)';
-    toast.innerHTML = msg; // Use innerHTML to allow spans like verified-badge
+    toast.innerHTML = msg;
     root.appendChild(toast);
     setTimeout(() => toast.remove(), 4000);
   }
