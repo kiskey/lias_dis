@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/cache.go
-// Version: 2.4
+// Version: 2.5
 package inventory
 
 import (
@@ -111,6 +111,29 @@ func (c *Cache) AcquireHostname(canonicalHost, pdid string) HostnameAcquisitionR
         listener(canonicalHost, pdid, false)
     }
     return AcquireProvisional
+}
+
+// IsHostnameActivelyOwned returns true if the hostname is owned by an online device.
+// Used to prevent nil pointer dereferences when checking availability for new devices.
+func (c *Cache) IsHostnameActivelyOwned(canonicalHost string) bool {
+    if canonicalHost == "" {
+        return false
+    }
+
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+
+    ownerPDID, exists := c.hostnameOwners[canonicalHost]
+    if !exists {
+        return false
+    }
+
+    owner := c.devices[ownerPDID]
+    if owner == nil {
+        return false
+    }
+
+    return owner.Online && time.Since(owner.LastSeen) < 5*time.Minute
 }
 
 // ReleaseHostname releases ownership of canonicalHost if owned by pdid.
