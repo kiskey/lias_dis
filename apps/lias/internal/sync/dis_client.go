@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 1.7 (Inline device payload parsing from SSE events)
+// Version: 1.8 (Emits EventDeviceAdded for new devices to trigger UI toast alerts)
 package sync
 
 import (
@@ -128,9 +128,17 @@ func (c *DISClient) pollDevices() {
 
 	for _, d := range listResp.Devices {
 		prev := c.cache.Get(d.PDID)
+		isNewDevice := prev == nil
+
 		c.cache.UpsertDevice(d)
 
-		if c.broker != nil && (prev == nil || prev.Online != d.Online) {
+		if isNewDevice {
+			slog.Info("Completely new device discovered in LIAS", "pdid", d.PDID, "name", d.DisplayName())
+			if c.broker != nil {
+				// Broadcast explicit EventDeviceAdded to trigger UI toast notification for brand-new device
+				c.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
+			}
+		} else if c.broker != nil && prev.Online != d.Online {
 			evtType := models.EventDeviceOnline
 			if !d.Online {
 				evtType = models.EventDeviceOffline
@@ -265,6 +273,9 @@ func (c *DISClient) handleEvent(e models.Event) {
 		models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged, models.EventFingerprintUpdated:
 
 		go func(pdid string, evt models.Event) {
+			prev := c.cache.Get(pdid)
+			isNewDevice := prev == nil || evt.Type == models.EventDeviceAdded
+
 			// Attempt to unmarshal full Device payload directly from event to avoid extra REST call
 			var inlineDev models.Device
 			if len(evt.Payload) > 0 && json.Unmarshal(evt.Payload, &inlineDev) == nil && inlineDev.PDID == pdid {
@@ -275,6 +286,10 @@ func (c *DISClient) handleEvent(e models.Event) {
 			}
 
 			if c.broker != nil {
+				if isNewDevice {
+					// Ensure event type is explicitly EventDeviceAdded so Web UI displays new device toast
+					evt.Type = models.EventDeviceAdded
+				}
 				c.broker.Broadcast(evt)
 			}
 		}(e.DeviceID, e)
