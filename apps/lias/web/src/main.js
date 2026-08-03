@@ -1,7 +1,7 @@
 /**
  * LIAS Control Center - Production Web Dashboard SPA Controller
  * File:    apps/lias/web/src/main.js
- * Version: 1.3
+ * Version: 1.4 (Enforced Display Name Hierarchy & Quiet Status Indicator Transitions)
  */
 
 import { API } from './api.js';
@@ -23,6 +23,31 @@ class AppController {
         this.bindGlobalEvents();
         await this.loadInitialData();
         this.initRealtimeEvents();
+    }
+
+    /**
+     * Canonical Display Name Helper enforcing strict hierarchy:
+     * 1. Hostname (if non-empty)
+     * 2. Friendly Name (if Hostname is empty)
+     * 3. Vendor + Model / Vendor / Model (if Friendly Name is empty)
+     * 4. Current MAC / PDID (if metadata is empty)
+     */
+    getDisplayName(dev) {
+        if (!dev) return 'Unknown Device';
+        if (dev.hostname && dev.hostname.trim() !== '') {
+            return dev.hostname.trim();
+        }
+        if (dev.friendly_name && dev.friendly_name.trim() !== '') {
+            return dev.friendly_name.trim();
+        }
+        const vendor = (dev.vendor || '').trim();
+        const model = (dev.model || '').trim();
+        if (vendor && model) return `${vendor} ${model}`;
+        if (vendor) return vendor;
+        if (model) return model;
+        if (dev.current_mac) return dev.current_mac;
+        if (dev.pdid) return dev.pdid;
+        return 'Unknown Device';
     }
 
     bindGlobalEvents() {
@@ -142,16 +167,18 @@ class AppController {
         }
 
         this.sseSubscription = API.subscribeEvents((evt) => {
-            // Re-fetch state silently to guarantee complete view consistency
+            // Re-fetch state silently to update green/gray status indicator dots and device cards
             this.loadInitialDataSilently();
 
-            if (evt.type === 'device.offline') {
-                const mac = (evt.payload && evt.payload.mac) ? ` (${evt.payload.mac})` : '';
-                this.showToast(`Device transitioned offline${mac}`, 'info');
-            } else if (evt.type === 'device.online') {
-                const mac = (evt.payload && evt.payload.mac) ? ` (${evt.payload.mac})` : '';
-                this.showToast(`Device connected online${mac}`, 'info');
+            // Immediate Toast Alert ONLY when a completely new device is discovered
+            if (evt.type === 'device.added') {
+                let devName = 'New Device';
+                if (evt.payload) {
+                    devName = this.getDisplayName(evt.payload);
+                }
+                this.showToast(`🎉 New Device Discovered: ${devName}`, 'info');
             }
+            // Routine 'device.online' and 'device.offline' events update UI status dots quietly
         });
 
         // Defense-in-Depth (GAP-12): 20s backstop polling interval ensures the UI
@@ -218,7 +245,9 @@ class AppController {
 
         this.devices.forEach(dev => {
             if (this.searchQuery) {
-                const match = (dev.hostname || '').toLowerCase().includes(this.searchQuery) ||
+                const displayName = this.getDisplayName(dev).toLowerCase();
+                const match = displayName.includes(this.searchQuery) ||
+                              (dev.hostname || '').toLowerCase().includes(this.searchQuery) ||
                               (dev.friendly_name || '').toLowerCase().includes(this.searchQuery) ||
                               (dev.current_mac || '').toLowerCase().includes(this.searchQuery) ||
                               (dev.current_ip || '').toLowerCase().includes(this.searchQuery) ||
@@ -337,7 +366,8 @@ class AppController {
 
     renderDeviceCard(dev) {
         const isOnline = dev.online;
-        const displayName = dev.friendly_name || dev.hostname || dev.current_mac || dev.pdid;
+        // Enforce strict display name hierarchy: Hostname -> Friendly Name -> Vendor/Model -> MAC/PDID
+        const displayName = this.getDisplayName(dev);
         const services = dev.services || [];
         const currentTag = (dev.tags && dev.tags[0]) ? dev.tags[0] : 'generic';
 
@@ -373,9 +403,10 @@ class AppController {
         if (!dev) return;
 
         const currentTag = (dev.tags && dev.tags[0]) ? dev.tags[0] : 'generic';
+        const displayName = this.getDisplayName(dev);
 
         let bodyHtml = `
-            <p style="font-size:14px; margin-bottom:16px;">Select tag group assignment for device <strong>${this.escapeHtml(dev.friendly_name || dev.hostname || dev.current_mac)}</strong>:</p>
+            <p style="font-size:14px; margin-bottom:16px;">Select tag group assignment for device <strong>${this.escapeHtml(displayName)}</strong>:</p>
             <div style="display:flex; flex-direction:column; gap:8px;">
                 ${this.tags.map(t => `
                     <label style="display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border:1px solid var(--separator); border-radius:10px; cursor:pointer; background:var(--bg-tertiary);">
@@ -789,7 +820,7 @@ class AppController {
                 targetContainer.innerHTML = `
                     <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Target Device</label>
                     <select id="pol-target" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
-                        ${this.devices.map(d => `<option value="${d.pdid}">${this.escapeHtml(d.friendly_name || d.hostname || d.current_mac)}</option>`).join('')}
+                        ${this.devices.map(d => `<option value="${d.pdid}">${this.escapeHtml(this.getDisplayName(d))}</option>`).join('')}
                     </select>
                 `;
             } else {
