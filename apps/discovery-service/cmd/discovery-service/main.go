@@ -1,7 +1,7 @@
 // Binary discovery-service implements the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 2.1
+// Version: 2.2
 package main
 
 import (
@@ -79,7 +79,6 @@ func main() {
         }
     }
 
-    // Step 5 Fix: Pass Cache handle to Broker for SSE reconnect rehydration filtering
     broker := disAPI.NewBroker(cache)
     eng := correlation.NewEngine(cache, broker)
     if st != nil {
@@ -135,8 +134,8 @@ func main() {
     orch := discovery.NewOrchestrator(cache, broker, primaries, fallback)
     eng.SetOrchestrator(orch)
     
-    // Network Engineer Fix: Wire the IdentityPromoter (Engine) to the Orchestrator
-    orch.SetIdentityPromoter(eng)
+    // Wire the DeviceManager (Engine) to the Orchestrator
+    orch.SetDeviceManager(eng)
 
     eng.Run(ctx, providers)
 
