@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 2.2 (Audited, Global Switch Drawer & Continuous Range Integration)
+// Version: 2.3 (Added UI warnings for empty schedules)
 
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
@@ -64,7 +64,7 @@ class App {
       this.showToast(`🟢 Device Online: ${pdid}${verifiedBadge}`);
     } else if (event.type === 'device.offline') {
       this.showToast(`🔴 Device Offline: ${pdid}`);
-    } else if (event.type === 'device.reidentified') { // GAP-L02: Handle reidentified event
+    } else if (event.type === 'device.reidentified') {
       const payload = event.payload || {};
       this.showToast(`🔄 Device identified: ${payload.new_pdid || 'device'} (promoted from ${payload.reason || 'tentative'})`);
     }
@@ -365,6 +365,14 @@ class App {
           const isInfra = p.target_id === 'infrastructure';
           const schedSummary = this.getScheduleSummary(p);
           const scheds = this.resolvePolicySchedules(p);
+          
+          // ENG REC 2: Warning for empty schedules
+          const isEmptySchedule = p.action === 'schedule' && scheds.length === 0;
+          const emptySchedWarning = isEmptySchedule ? `
+            <div class="hig-callout-warning" style="margin-top:8px; padding:8px 12px; font-size:12px;">
+              ⚠️ <strong>Warning:</strong> No schedules attached. Policy currently defaults to <strong>ALLOW ALL</strong>.
+            </div>
+          ` : '';
 
           return `
             <div class="card" style="margin-bottom:0;">
@@ -389,6 +397,7 @@ class App {
                   Action: <span style="color:${p.action === 'allow' ? 'var(--success)' : p.action === 'block' ? 'var(--danger)' : 'var(--accent)'}">${p.action.toUpperCase()}</span>
                   ${schedSummary ? `<div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">${schedSummary}</div>` : ''}
                 </div>
+                ${emptySchedWarning}
                 ${(p.action === 'schedule' && scheds.length > 0) ? this.renderWeeklyTimeline(scheds) : ''}
               `}
             </div>
@@ -707,10 +716,18 @@ class App {
       `;
     } else if (step === 3) {
       const selectedScheds = (policy.schedule_ids || []).map(id => this.schedules.find(s => s.id === id)).filter(Boolean);
+      const noSchedsSelected = (policy.schedule_ids || []).length === 0;
 
       bodyHtml += `
         <div style="display:flex; flex-direction:column; gap:16px;">
           <p style="font-size:13px; color:var(--text-secondary);">Select time schedules to attach to this policy:</p>
+          
+          ${noSchedsSelected ? `
+            <div class="hig-callout-warning" style="margin-top:0; margin-bottom:8px; padding:8px 12px; font-size:12px;">
+              ⚠️ <strong>Warning:</strong> No schedules selected. Saving this policy will default it to <strong>ALLOW ALL</strong> for the target.
+            </div>
+          ` : ''}
+
           <div style="max-height:180px; overflow-y:auto; display:flex; flex-direction:column; gap:8px;">
             ${this.schedules.map(s => {
               const checked = (policy.schedule_ids || []).includes(s.id);
@@ -888,8 +905,8 @@ class App {
           const selectedScheds = selected.map(id => this.schedules.find(s => s.id === id)).filter(Boolean);
           document.getElementById('wiz-timeline-container').innerHTML = this.renderWeeklyTimeline(selectedScheds);
           
-          // GAP-L05: Re-evaluate conflict state on checkbox change
-          this.updateWizardConflictState();
+          // Re-render step to show/hide empty schedule warning
+          this.renderPolicyWizardStep();
         });
       });
 
