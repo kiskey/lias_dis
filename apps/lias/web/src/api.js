@@ -1,7 +1,7 @@
 /**
  * LIAS REST API Client & Real-time EventSource Subscriber
  * File:    apps/lias/web/src/api.js
- * Version: 1.2
+ * Version: 1.3 (Validated production API wrapper)
  */
 
 export const API = {
