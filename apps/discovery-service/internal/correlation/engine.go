@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 3.7
+// Version: 3.8
 package correlation
 
 import (
@@ -64,7 +64,6 @@ func (e *Engine) SetStorage(store *storage.Storage) {
             }
         })
 
-        // GAP-D11: Load pending events for crash recovery
         if pending, err := store.LoadPendingEvents(); err == nil {
             correlationPending := make([]PendingEventRecord, len(pending))
             for i, p := range pending {
@@ -155,7 +154,6 @@ func (e *Engine) isDuplicateObservation(macStr, ipStr string, online bool) bool 
     return false
 }
 
-// GAP-D09: Provider Confidence Matrix Gates
 func canUpdateCurrentIP(source string) bool {
     switch source {
     case "netlink", "dhcp":
@@ -174,7 +172,6 @@ func canTriggerOnline(source string) bool {
     }
 }
 
-// GAP-D06: L2 + L3 Confirmation helper for Asymmetric Flap Fix
 func hasL2AndL3Confirmation(sources []string) bool {
     hasL2 := false
     hasL3 := false
@@ -206,8 +203,15 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     cleanHost := discovery.UnescapeHostname(obs.Hostname)
     canonicalHost := CanonicalizeHostname(cleanHost)
 
+    // Gap 4 Fix: Moved Pi-hole IP history gate BEFORE ghost prevention check
+    if obs.Source == "pihole" && ipStr != "" {
+        if existing := e.cache.GetByIP(ipStr); existing != nil {
+            existing.AddIP(ipStr)
+            return
+        }
+    }
+
     // Network Engineer Fix: Prevent ghost tentative devices.
-    // Do not create devices from observations lacking both MAC and canonical hostname.
     if macStr == "" && canonicalHost == "" {
         return
     }
@@ -216,21 +220,17 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         return
     }
 
-    // Step 6: Pi-hole cannot update CurrentIP (Confidence Matrix Gate)
-    if obs.Source == "pihole" && ipStr != "" {
-        if existing := e.cache.GetByIP(ipStr); existing != nil {
-            existing.AddIP(ipStr)
-            return
-        }
-    }
-
     // 1. Query Existing Device
     d := e.cache.GetByMACOrIP(macStr, ipStr)
+
+    // Gap 5 Fix: Update CurrentMAC if it's stale/empty but MAC is in cluster
+    if macStr != "" && d != nil && d.HasMAC(macStr) && d.CurrentMAC != macStr {
+        e.cache.SetCurrentMAC(d.PDID, macStr)
+    }
 
     // GAP-D01: MAC Rotation & IP-Claim Validation for existing devices
     if macStr != "" && d != nil && !d.HasMAC(macStr) {
         if d.CurrentIP == ipStr {
-            // MAC is new but IP matches - validate claim against d itself
             claimRes := ValidateIPClaim(obs, d)
             if claimRes == ClaimAttach {
                 oldMAC := d.CurrentMAC
@@ -247,7 +247,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                 d = nil
             }
         } else if ipStr != "" {
-            // Existing IP mismatch path
             if existingOnIP := e.cache.GetByIP(ipStr); existingOnIP != nil && existingOnIP.PDID != d.PDID {
                 claimRes := ValidateIPClaim(obs, existingOnIP)
                 if claimRes == ClaimAttach {
@@ -273,7 +272,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         }
     }
 
-    // Step 3: Hostname Ownership Lock check (FIX: Prevent nil pointer dereference)
+    // Step 3: Hostname Ownership Lock check
     if canonicalHost != "" {
         if d != nil {
             ownerPDID, exists := e.cache.GetHostnameOwner(canonicalHost)
@@ -286,7 +285,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                 }
             }
         } else {
-            // d == nil: new device. Check if hostname is actively owned by someone else.
             if e.cache.IsHostnameActivelyOwned(canonicalHost) {
                 slog.Debug("Hostname ownership lock rejected claim for new device", "host", canonicalHost, "claimant", obs.Source)
                 canonicalHost = ""
@@ -295,9 +293,8 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         }
     }
 
-    // 2. New Device Creation with Tiered Identity (Step 7)
+    // 2. New Device Creation
     if d == nil {
-        // GAP-D02: Use canonicalHost for L7 anchor derivation
         tier, anchor := inventory.DeriveTierAndAnchor(macStr, canonicalHost, obs.Vendor)
         pdid := inventory.GeneratePDID(tier, anchor)
 
@@ -336,8 +333,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         return
     }
 
-    // 3. Identity Promotion State Machine (Step 7)
-    // GAP-D02: Use canonicalHost for L7 anchor derivation
+    // 3. Identity Promotion State Machine
     newTier, newAnchor := inventory.DeriveTierAndAnchor(macStr, canonicalHost, obs.Vendor)
     if inventory.CanPromote(d.IdentityTier, newTier) {
         oldPDID := d.PDID
@@ -360,7 +356,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             _ = e.store.SaveDevice(d)
         }
 
-        // GAP-D08: Populate MigratedMACs in payload
         migratedMACs := make([]string, len(d.MACs))
         copy(migratedMACs, d.MACs)
 
@@ -374,7 +369,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         return
     }
 
-    // 4. Asymmetric Online Flap Fix (§8.1) & GAP-D06, GAP-D09
+    // 4. Asymmetric Online Flap Fix
     if !d.Online && obs.Online && canTriggerOnline(obs.Source) {
         d.PendingOnlineObs = append(d.PendingOnlineObs, obs.Source)
         if len(d.PendingOnlineObs) >= 2 || hasL2AndL3Confirmation(d.PendingOnlineObs) {
@@ -386,7 +381,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         }
     }
 
-    // 5. Update Record & Submit to Debouncer (§7.2, §7.3) & GAP-D09 (Confidence Matrix)
+    // 5. Update Record & Submit to Debouncer
     if cleanHost != "" && !HostnamesAreEquivalent(d.Hostname, cleanHost) {
         oldHost := d.Hostname
         if d.CanonicalHostname != "" {
@@ -426,14 +421,12 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 }
 
 // PromoteDeviceIdentity checks if a device's identity tier can be promoted based on current enrichment data.
-// Returns the updated device if promoted, or the original device if not.
 func (e *Engine) PromoteDeviceIdentity(pdid string) *models.Device {
     d := e.cache.Get(pdid)
     if d == nil {
         return nil
     }
 
-    // Recalculate tier and anchor based on current MAC/Hostname/Vendor
     newTier, newAnchor := inventory.DeriveTierAndAnchor(d.CurrentMAC, d.CanonicalHostname, d.Vendor)
     
     if inventory.CanPromote(d.IdentityTier, newTier) {
