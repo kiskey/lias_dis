@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 2.1 (Audited, Global Switch Drawer & Continuous Range Integration)
+// Version: 2.2 (Audited, Global Switch Drawer & Continuous Range Integration)
 
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
@@ -51,12 +51,22 @@ class App {
 
   handleRealtimeEvent(event) {
     const pdid = (event.payload && event.payload.pdid) || event.device_id || 'device';
+    
+    // GAP-L07: Extract confirmed_by array for verified badge
+    const confirmedBy = event.payload?.confirmed_by || [];
+    const verifiedBadge = confirmedBy.length > 0
+        ? ` <span class="verified-badge">✓ ${confirmedBy.length} sources</span>`
+        : '';
+
     if (event.type === 'device.added') {
-      this.showToast(`✨ New Device Discovered: ${pdid}`);
+      this.showToast(`✨ New Device Discovered: ${pdid}${verifiedBadge}`);
     } else if (event.type === 'device.online') {
-      this.showToast(`🟢 Device Online: ${pdid}`);
+      this.showToast(`🟢 Device Online: ${pdid}${verifiedBadge}`);
     } else if (event.type === 'device.offline') {
       this.showToast(`🔴 Device Offline: ${pdid}`);
+    } else if (event.type === 'device.reidentified') { // GAP-L02: Handle reidentified event
+      const payload = event.payload || {};
+      this.showToast(`🔄 Device identified: ${payload.new_pdid || 'device'} (promoted from ${payload.reason || 'tentative'})`);
     }
     this.loadData();
   }
@@ -540,9 +550,22 @@ class App {
     const colors = ['#0071e3', '#34c759', '#ff9500', '#af52de', '#5856d6', '#00c7be'];
     const conflicts = detectConflicts(schedules);
 
+    // GAP-L06: Timezone mismatch soft warning
+    const timezones = new Set(schedules.map(s => s.timezone).filter(Boolean));
+    let tzWarningHtml = '';
+    if (timezones.size > 1) {
+      tzWarningHtml = `
+        <div class="hig-callout-warning" style="margin-top:0; margin-bottom:8px;">
+          <strong>⚠️ Mixed Timezones</strong>
+          <p>Schedules in this bundle use different timezones (${[...timezones].join(', ')}). This can be confusing — consider aligning timezones.</p>
+        </div>
+      `;
+    }
+
     const days = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 
     let html = `<div class="weekly-timeline">`;
+    html += tzWarningHtml;
 
     if (conflicts.length > 0) {
       html += `
@@ -718,6 +741,25 @@ class App {
     this.openModal(title, bodyHtml, footerHtml);
     this.bindPolicyWizardEvents();
     if (step === 1) this.checkShadowPolicy();
+    
+    // GAP-L05: Disable Save button on load if conflicts exist
+    if (step === 3) {
+      this.updateWizardConflictState();
+    }
+  }
+
+  // GAP-L05: Helper to update save button state based on conflicts
+  updateWizardConflictState() {
+    const { policy } = this.wizardState;
+    const selectedScheds = (policy.schedule_ids || []).map(id => this.schedules.find(s => s.id === id)).filter(Boolean);
+    const conflicts = detectConflicts(selectedScheds);
+    
+    const saveBtn = document.getElementById('wiz-btn-save');
+    if (saveBtn) {
+        saveBtn.disabled = conflicts.length > 0;
+        saveBtn.style.opacity = conflicts.length > 0 ? '0.5' : '1';
+        saveBtn.style.cursor = conflicts.length > 0 ? 'not-allowed' : 'pointer';
+    }
   }
 
   checkShadowPolicy() {
@@ -845,6 +887,9 @@ class App {
 
           const selectedScheds = selected.map(id => this.schedules.find(s => s.id === id)).filter(Boolean);
           document.getElementById('wiz-timeline-container').innerHTML = this.renderWeeklyTimeline(selectedScheds);
+          
+          // GAP-L05: Re-evaluate conflict state on checkbox change
+          this.updateWizardConflictState();
         });
       });
 
@@ -915,6 +960,7 @@ class App {
   renderScheduleRuleRow(rule, idx) {
     const isOvernight = rule.start_time && rule.end_time && rule.end_time <= rule.start_time;
     const daysArr = (rule.days || []).map(d => d.toLowerCase().substring(0, 3));
+    const isAllDay = rule.start_time === '00:00' && rule.end_time === '23:59';
 
     return `
       <div class="card rule-row" data-idx="${idx}" style="padding:12px; margin-bottom:0; background:var(--bg-tertiary);">
@@ -948,17 +994,23 @@ class App {
         </div>
 
         <div style="display:flex; gap:8px; align-items:center;">
-          <input type="time" class="rule-start" value="${rule.start_time}" style="flex:1;">
+          <input type="time" class="rule-start" value="${rule.start_time}" style="flex:1;" ${isAllDay ? 'disabled' : ''}>
           <span>to</span>
-          <input type="time" class="rule-end" value="${rule.end_time}" style="flex:1;">
+          <input type="time" class="rule-end" value="${rule.end_time}" style="flex:1;" ${isAllDay ? 'disabled' : ''}>
           <select class="rule-action" style="flex:1;">
             <option value="block" ${rule.action === 'block' ? 'selected' : ''}>Block</option>
             <option value="allow" ${rule.action === 'allow' ? 'selected' : ''}>Allow</option>
           </select>
         </div>
 
-        <div class="overnight-container">
-          ${isOvernight ? `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${rule.end_time} the FOLLOWING day</div>` : ''}
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
+          <div class="overnight-container">
+            ${isOvernight && !isAllDay ? `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${rule.end_time} the FOLLOWING day</div>` : ''}
+          </div>
+          <!-- GAP-L08: Added All Day toggle -->
+          <label style="display:flex; align-items:center; gap:4px; font-size:11px; font-weight:600; color:var(--text-secondary);">
+            <input type="checkbox" class="rule-all-day" ${isAllDay ? 'checked' : ''}> All Day
+          </label>
         </div>
       </div>
     `;
@@ -988,11 +1040,35 @@ class App {
         const start = row.querySelector('.rule-start').value;
         const end = row.querySelector('.rule-end').value;
         const container = row.querySelector('.overnight-container');
+        const allDayChk = row.querySelector('.rule-all-day');
+
+        if (allDayChk && allDayChk.checked) return; // Skip if All Day is checked
 
         if (start && end && end <= start) {
           container.innerHTML = `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${end} the FOLLOWING day</div>`;
         } else {
           container.innerHTML = '';
+        }
+      });
+    });
+
+    // GAP-L08: Bind All Day toggle
+    document.querySelectorAll('.rule-all-day').forEach(chk => {
+      chk.addEventListener('change', (e) => {
+        const row = e.target.closest('.rule-row');
+        const startInput = row.querySelector('.rule-start');
+        const endInput = row.querySelector('.rule-end');
+        const overnightContainer = row.querySelector('.overnight-container');
+        
+        if (e.target.checked) {
+          startInput.value = '00:00';
+          endInput.value = '23:59';
+          startInput.disabled = true;
+          endInput.disabled = true;
+          overnightContainer.innerHTML = '';
+        } else {
+          startInput.disabled = false;
+          endInput.disabled = false;
         }
       });
     });
@@ -1149,7 +1225,7 @@ class App {
     const toast = document.createElement('div');
     toast.className = 'toast';
     if (type === 'danger') toast.style.backgroundColor = 'var(--danger)';
-    toast.textContent = msg;
+    toast.innerHTML = msg; // Use innerHTML to allow spans like verified-badge
     root.appendChild(toast);
     setTimeout(() => toast.remove(), 4000);
   }
