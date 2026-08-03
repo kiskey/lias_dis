@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/debounce.go
-// Version: 2.1
+// Version: 2.2
 package correlation
 
 import (
