@@ -174,15 +174,16 @@ func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
 
 	vendor := oui.Lookup(n.HardwareAddr.String())
 
-	obs := Observation{
-		Source:     p.Name(),
-		MAC:        n.HardwareAddr,
-		IP:         n.IP,
-		Vendor:     vendor,
-		Online:     isOnline,
-		Confidence: 0.95,
-		Timestamp:  time.Now(),
-	}
+obs := Observation{
+    Source:     p.Name(),
+    Group:      GroupA,
+    MAC:        n.HardwareAddr,
+    IP:         n.IP,
+    Vendor:     vendor,
+    Online:     isOnline,
+    Confidence: 0.95,
+    Timestamp:  time.Now(),
+}
 
 	select {
 	case p.events <- obs:
