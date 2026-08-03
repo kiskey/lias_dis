@@ -171,15 +171,16 @@ func (p *DHCPProvider) poll() {
             hostname = ""
         }
         
-        obs := Observation{
-            Source:     p.Name(),
-            MAC:        mac,
-            IP:         ip,
-            Hostname:   hostname,
-            Online:     true, // Explicitly mark as online
-            Confidence: 0.5,  // MEDIUM confidence per §3.2
-            Timestamp:  time.Now(),
-        }
+obs := Observation{
+    Source:     p.Name(),
+    Group:      GroupB,
+    MAC:        mac,
+    IP:         ip,
+    Hostname:   hostname,
+    Online:     true,
+    Confidence: 0.50,
+    Timestamp:  time.Now(),
+}
         
         select {
         case p.events <- obs:
