@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/cache.go
-// Version: 2.7
+// Version: 2.8
 package inventory
 
 import (
@@ -244,7 +244,7 @@ func (c *Cache) RemoveIPIndex(ipStr string) {
             }
         }
         delete(c.ipIndex, cleanIP)
-        slog.Info("Invalidated stale IP index mapping", "ip": cleanIP, "pdid": d.PDID)
+        slog.Info("Invalidated stale IP index mapping", "ip", cleanIP, "pdid", d.PDID) // FIXED SYNTAX
     }
 }
 
@@ -292,7 +292,7 @@ func (c *Cache) SetCurrentMAC(pdid, macStr string) {
     }
 
     if oldDev, exists := c.macIndex[cleanMAC]; exists && oldDev.PDID != pdid {
-        slog.Warn("MAC index collision during SetCurrentMAC", "mac": cleanMAC, "old_pdid": oldDev.PDID, "new_pdid": pdid)
+        slog.Warn("MAC index collision during SetCurrentMAC", "mac", cleanMAC, "old_pdid", oldDev.PDID, "new_pdid", pdid) // FIXED SYNTAX
     }
 
     d.AddMAC(cleanMAC)
@@ -420,7 +420,7 @@ func (c *Cache) purgeOffline() {
 
     for pdid, d := range c.devices {
         if !d.Online && now.Sub(d.LastSeen) > offlineTTL {
-            slog.Info("Purging offline device from cache", "pdid": pdid, "mac": d.CurrentMAC)
+            slog.Info("Purging offline device from cache", "pdid", pdid, "mac", d.CurrentMAC) // FIXED SYNTAX
             if cleanMAC := NormalizeMAC(d.CurrentMAC); cleanMAC != "" {
                 delete(c.macIndex, cleanMAC)
             }
