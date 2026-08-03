@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/cache.go
-// Version: 1.6
+// Version: 1.7 (Updated staleThreshold to 3 minutes for offline hysteresis)
 package inventory
 
 import (
@@ -15,7 +15,7 @@ import (
 
 const (
 	offlineTTL     = 24 * time.Hour
-	staleThreshold = 90 * time.Second
+	staleThreshold = 180 * time.Second // 3 Minutes hysteresis threshold
 )
 
 // Cache is a thread-safe in-memory store with O(1) MAC and IP index lookups.
@@ -40,7 +40,8 @@ func NewCache() *Cache {
 }
 
 // DemoteStale flips Online: true -> false for devices with no observation
-// within staleThreshold, serving as a safety net for missed L2 offline transitions.
+// within staleThreshold (3 minutes), serving as a deterministic threshold
+// for marking devices offline without transient flapping.
 // Returns the slice of PDIDs that transitioned offline.
 func (c *Cache) DemoteStale() []string {
 	c.mu.Lock()
