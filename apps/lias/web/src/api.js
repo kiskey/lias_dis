@@ -1,12 +1,13 @@
 /**
  * LIAS REST API Client & Real-time EventSource Subscriber
  * File:    apps/lias/web/src/api.js
- * Version: 1.3 (Validated production API wrapper)
+ * Version: 2.0 (Audited & Merged per Enhancement 3.0)
  */
 
 export const API = {
     /**
-     * Internal generic fetch helper handling JSON responses and status validation.
+     * Internal generic fetch helper handling JSON responses, status validation,
+     * and attaching 409 Conflict metadata to thrown errors.
      */
     async request(endpoint, options = {}) {
         const config = {
@@ -25,15 +26,28 @@ export const API = {
 
         if (!response.ok) {
             let errorMsg = `HTTP Error ${response.status}`;
+            let errData = null;
             try {
-                const errData = await response.json();
-                if (errData && errData.error) {
-                    errorMsg = errData.error;
+                errData = await response.json();
+                if (errData) {
+                    if (errData.message) {
+                        errorMsg = errData.message;
+                    } else if (errData.error) {
+                        errorMsg = errData.error;
+                    }
                 }
             } catch (e) {
                 // Ignore JSON parse errors on non-OK responses
             }
-            throw new Error(errorMsg);
+
+            const errorObj = new Error(errorMsg);
+            errorObj.status = response.status;
+            if (errData) {
+                errorObj.error = errData.error;
+                errorObj.message = errData.message;
+                errorObj.conflicts = errData.conflicts;
+            }
+            throw errorObj;
         }
 
         return await response.json();
@@ -60,17 +74,19 @@ export const API = {
         return await this.request('/api/v1/tags');
     },
 
-    async createTag(tagData) {
+    async createTag(tagData, colorHex) {
+        const payload = typeof tagData === 'string' ? { name: tagData, color: colorHex || '#0071e3' } : tagData;
         return await this.request('/api/v1/tags', {
             method: 'POST',
-            body: JSON.stringify(tagData)
+            body: JSON.stringify(payload)
         });
     },
 
-    async updateTag(id, tagData) {
+    async updateTag(id, tagData, colorHex) {
+        const payload = typeof tagData === 'string' ? { name: tagData, color: colorHex || '#0071e3' } : tagData;
         return await this.request(`/api/v1/tags/${encodeURIComponent(id)}`, {
             method: 'PUT',
-            body: JSON.stringify(tagData)
+            body: JSON.stringify(payload)
         });
     },
 
@@ -104,11 +120,20 @@ export const API = {
             try {
                 return await this.updatePolicy(policyData.id, policyData);
             } catch (err) {
+                // If update failed due to 409 Conflict, rethrow immediately
+                if (err.status === 409) throw err;
                 // Fall back to create if policy record doesn't exist yet
                 return await this.createPolicy(policyData);
             }
         }
         return await this.createPolicy(policyData);
+    },
+
+    async validatePolicy(scheduleIds) {
+        return await this.request('/api/v1/policies/validate', {
+            method: 'POST',
+            body: JSON.stringify({ schedule_ids: scheduleIds })
+        });
     },
 
     async deletePolicy(id) {
@@ -141,6 +166,7 @@ export const API = {
             try {
                 return await this.updateSchedule(scheduleData.id, scheduleData);
             } catch (err) {
+                if (err.status === 409) throw err;
                 return await this.createSchedule(scheduleData);
             }
         }
