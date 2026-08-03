@@ -1,7 +1,7 @@
 // Package nftables implements the isolated firewall controller for LIAS.
 //
 // File:    apps/lias/internal/nftables/builder.go
-// Version: 1.5 (Multi-MAC & Multi-IP set elements synchronization)
+// Version: 1.6 (Latched Block Set Invariant: Eliminates block-unblock oscillation loop)
 package nftables
 
 import (
@@ -29,6 +29,15 @@ func NewBuilder(cache *liasSync.Cache, controller *Controller) *Builder {
 }
 
 // Sync evaluates all devices in the local cache and applies updated sets to nftables.
+//
+// LATCHED BLOCK INVARIANT (CRITICAL FIX):
+// Devices evaluated to ActionBlock MUST have their MACs and IPs latched into blocked_macs
+// and blocked_ips REGARDLESS of whether d.Online is true or false.
+//
+// Rationale: Dropping a device's packets at the netdev hook causes L2 neighbor entries to fail,
+// causing DIS to report d.Online = false. If d.Online = false caused the block rule to be removed,
+// the device would instantly unblock, transmit a packet, get re-blocked, and loop infinitely.
+// Latching ActionBlock sets eliminates this positive feedback loop entirely.
 func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.ScheduleEvaluator) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -43,15 +52,16 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
 	for i := range devs {
 		d := &devs[i]
 
-		// Only apply rules to online devices
-		if !d.Online {
-			continue
-		}
-
+		// Evaluate effective policy action for device regardless of current online observation state
 		action := policyEngine.EvaluateAction(d, schedEngine)
 
 		switch action {
 		case models.ActionAllow:
+			// Allowed elements are populated only when the device is actively observed online
+			// to keep the @allowed sets minimal and performant.
+			if !d.Online {
+				continue
+			}
 			for _, ipStr := range d.IPs {
 				if ip := net.ParseIP(ipStr); ip != nil {
 					if ip4 := ip.To4(); ip4 != nil {
@@ -66,6 +76,9 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
 			}
 
 		case models.ActionBlock:
+			// LATCHED BLOCK INVARIANT:
+			// Block elements MUST be populated for all historical/current MACs and IPs
+			// EVEN IF d.Online is false!
 			for _, ipStr := range d.IPs {
 				if ip := net.ParseIP(ipStr); ip != nil {
 					if ip4 := ip.To4(); ip4 != nil {
