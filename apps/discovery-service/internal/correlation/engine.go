@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 3.8
+// Version: 3.9
 package correlation
 
 import (
@@ -206,7 +206,20 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     // Gap 4 Fix: Moved Pi-hole IP history gate BEFORE ghost prevention check
     if obs.Source == "pihole" && ipStr != "" {
         if existing := e.cache.GetByIP(ipStr); existing != nil {
-            existing.AddIP(ipStr)
+            // I/O Fix: Only save if the IP is actually new to the history
+            ipAlreadyKnown := false
+            for _, ip := range existing.IPs {
+                if ip == ipStr {
+                    ipAlreadyKnown = true
+                    break
+                }
+            }
+            if !ipAlreadyKnown {
+                existing.AddIP(ipStr)
+                if e.store != nil {
+                    _ = e.store.SaveDevice(existing)
+                }
+            }
             return
         }
     }
@@ -222,10 +235,12 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
     // 1. Query Existing Device
     d := e.cache.GetByMACOrIP(macStr, ipStr)
+    dirty := false
 
     // Gap 5 Fix: Update CurrentMAC if it's stale/empty but MAC is in cluster
     if macStr != "" && d != nil && d.HasMAC(macStr) && d.CurrentMAC != macStr {
         e.cache.SetCurrentMAC(d.PDID, macStr)
+        dirty = true
     }
 
     // GAP-D01: MAC Rotation & IP-Claim Validation for existing devices
@@ -242,6 +257,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                     OldMAC:    oldMAC,
                     Timestamp: time.Now(),
                 })
+                dirty = true
             } else {
                 e.cache.RemoveIPIndex(ipStr)
                 d = nil
@@ -253,17 +269,14 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                     oldMAC := existingOnIP.CurrentMAC
                     existingOnIP.AddMAC(macStr)
                     e.cache.SetCurrentMAC(existingOnIP.PDID, macStr)
-                    e.cache.Upsert(existingOnIP)
-                    if e.store != nil {
-                        _ = e.store.SaveDevice(existingOnIP)
-                    }
                     e.debouncer.Submit(existingOnIP.PDID, models.EventMACChanged, obs.Source, obs.Group, models.DeviceEventPayload{
                         PDID:      existingOnIP.PDID,
                         MAC:       macStr,
                         OldMAC:    oldMAC,
                         Timestamp: time.Now(),
                     })
-                    d = existingOnIP
+                    d = existingOnIP // Reassign d to the attached device
+                    dirty = true
                 } else {
                     e.cache.RemoveIPIndex(ipStr)
                     d = nil
@@ -324,6 +337,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             _ = e.cache.AcquireHostname(canonicalHost, d.PDID)
         }
 
+        // New devices are always dirty
         if e.store != nil {
             _ = e.store.SaveDevice(d)
         }
@@ -352,6 +366,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         d.CanonicalHostname = canonicalHost
 
         e.cache.Upsert(d)
+        // Promotions are always dirty
         if e.store != nil {
             _ = e.store.SaveDevice(d)
         }
@@ -400,6 +415,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             OldCanonicalHostname: CanonicalizeHostname(oldHost),
             Timestamp:            time.Now(),
         })
+        dirty = true
     }
 
     if ipStr != "" && canUpdateCurrentIP(obs.Source) && d.CurrentIP != ipStr {
@@ -411,11 +427,14 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             OldIP:     oldIP,
             Timestamp: time.Now(),
         })
+        dirty = true
     }
 
     d.Touch(time.Now())
     e.cache.Upsert(d)
-    if e.store != nil {
+
+    // Network Engineer Fix: Only persist to SQLite if material identity data changed
+    if dirty && e.store != nil {
         _ = e.store.SaveDevice(d)
     }
 }
@@ -466,6 +485,14 @@ func (e *Engine) PromoteDeviceIdentity(pdid string) *models.Device {
     return d
 }
 
+// PersistDevice saves the device state to storage.
+func (e *Engine) PersistDevice(pdid string) {
+    d := e.cache.Get(pdid)
+    if d != nil && e.store != nil {
+        _ = e.store.SaveDevice(d)
+    }
+}
+
 func (e *Engine) scheduleDeferredOnline(pdid string, delay time.Duration) {
     time.Sleep(delay)
     d := e.cache.Get(pdid)
@@ -473,9 +500,7 @@ func (e *Engine) scheduleDeferredOnline(pdid string, delay time.Duration) {
         d.Online = true
         d.PendingOnlineObs = nil
         e.cache.Upsert(d)
-        if e.store != nil {
-            _ = e.store.SaveDevice(d)
-        }
+        // Do not save here to avoid disk thrash on transient state; will be saved on next dirty event or staleness sweep
         e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
     }
 }
