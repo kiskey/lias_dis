@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 3.0
+// Version: 3.1
 package correlation
 
 import (
@@ -51,6 +51,18 @@ func (e *Engine) SetOrchestrator(orch EnrichmentOrchestrator) {
 
 func (e *Engine) SetStorage(store *storage.Storage) {
 	e.store = store
+	if store != nil {
+		if owners, err := store.LoadHostnameOwners(); err == nil {
+			e.cache.LoadHostnameOwners(owners)
+		}
+		e.cache.SetHostnameOwnerListener(func(host, pdid string, isDelete bool) {
+			if isDelete {
+				_ = store.DeleteHostnameOwner(host)
+			} else {
+				_ = store.SaveHostnameOwner(host, pdid)
+			}
+		})
+	}
 }
 
 func (e *Engine) Run(ctx context.Context, providers []discovery.DiscoveryProvider) {
@@ -254,22 +266,30 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		return
 	}
 
-	// 4. Asymmetric Online Flap Fix (Step 5)
+	// 4. Asymmetric Online Flap Fix (§8.1)
 	if !d.Online && obs.Online {
 		d.PendingOnlineObs = append(d.PendingOnlineObs, obs.Source)
 		if len(d.PendingOnlineObs) >= 2 || obs.Group == discovery.GroupA {
 			d.Online = true
 			d.PendingOnlineObs = nil
 			e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
+		} else {
+			go e.scheduleDeferredOnline(d.PDID, 30*time.Second)
 		}
 	}
 
-	// 5. Update Record & Submit to Debouncer (Step 4)
+	// 5. Update Record & Submit to Debouncer (§7.2, §7.3)
 	if cleanHost != "" && !HostnamesAreEquivalent(d.Hostname, cleanHost) {
 		oldHost := d.Hostname
+		if d.CanonicalHostname != "" {
+			e.cache.ReleaseHostname(d.CanonicalHostname, d.PDID)
+		}
 		d.Hostname = cleanHost
 		d.CanonicalHostname = canonicalHost
-		e.debouncer.Submit(d.PDID, models.EventHostnameChanged, obs.Source, models.DeviceEventPayload{
+		if canonicalHost != "" {
+			_ = e.cache.AcquireHostname(canonicalHost, d.PDID)
+		}
+		e.debouncer.Submit(d.PDID, models.EventHostnameChanged, obs.Source, obs.Group, models.DeviceEventPayload{
 			PDID:                 d.PDID,
 			Hostname:             cleanHost,
 			CanonicalHostname:    canonicalHost,
@@ -282,7 +302,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	if ipStr != "" && obs.Source != "pihole" && d.CurrentIP != ipStr {
 		oldIP := d.CurrentIP
 		e.cache.SetCurrentIP(d.PDID, ipStr)
-		e.debouncer.Submit(d.PDID, models.EventIPChanged, obs.Source, models.DeviceEventPayload{
+		e.debouncer.Submit(d.PDID, models.EventIPChanged, obs.Source, obs.Group, models.DeviceEventPayload{
 			PDID:      d.PDID,
 			IP:        ipStr,
 			OldIP:     oldIP,
@@ -294,6 +314,20 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	e.cache.Upsert(d)
 	if e.store != nil {
 		_ = e.store.SaveDevice(d)
+	}
+}
+
+func (e *Engine) scheduleDeferredOnline(pdid string, delay time.Duration) {
+	time.Sleep(delay)
+	d := e.cache.Get(pdid)
+	if d != nil && !d.Online && len(d.PendingOnlineObs) > 0 {
+		d.Online = true
+		d.PendingOnlineObs = nil
+		e.cache.Upsert(d)
+		if e.store != nil {
+			_ = e.store.SaveDevice(d)
+		}
+		e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
 	}
 }
 
