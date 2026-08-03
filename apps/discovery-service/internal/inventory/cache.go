@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/cache.go
-// Version: 2.5
+// Version: 2.6
 package inventory
 
 import (
@@ -359,6 +359,20 @@ func (c *Cache) Upsert(d *models.Device) {
 
     c.mu.Lock()
     defer c.mu.Unlock()
+
+    // Clean up old indices if updating an existing device
+    if old, exists := c.devices[d.PDID]; exists {
+        if oldMAC := NormalizeMAC(old.CurrentMAC); oldMAC != "" && oldMAC != NormalizeMAC(d.CurrentMAC) {
+            if idx, ok := c.macIndex[oldMAC]; ok && idx.PDID == d.PDID {
+                delete(c.macIndex, oldMAC)
+            }
+        }
+        if oldIP := strings.TrimSpace(old.CurrentIP); oldIP != "" && oldIP != strings.TrimSpace(d.CurrentIP) {
+            if idx, ok := c.ipIndex[oldIP]; ok && idx.PDID == d.PDID {
+                delete(c.ipIndex, oldIP)
+            }
+        }
+    }
 
     devCopy := *d
     c.devices[d.PDID] = &devCopy
