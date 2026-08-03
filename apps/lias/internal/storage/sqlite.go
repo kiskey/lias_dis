@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 1.6
+// Version: 1.7
 package storage
 
 import (
@@ -85,6 +85,7 @@ func (s *Storage) initSchema() error {
 		target_id TEXT,
 		action TEXT NOT NULL,
 		schedule_id TEXT,
+		schedule_ids TEXT NOT NULL DEFAULT '',
 		priority INTEGER NOT NULL,
 		data TEXT NOT NULL
 	);
@@ -92,6 +93,7 @@ func (s *Storage) initSchema() error {
 	CREATE TABLE IF NOT EXISTS schedules (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
+		mode TEXT NOT NULL DEFAULT '',
 		timezone TEXT NOT NULL,
 		rules TEXT NOT NULL
 	);
@@ -103,6 +105,11 @@ func (s *Storage) initSchema() error {
 	if err != nil {
 		return fmt.Errorf("failed to execute schema initialization: %w", err)
 	}
+
+	// Additive migrations for existing databases
+	_, _ = s.db.Exec("ALTER TABLE policies ADD COLUMN schedule_ids TEXT NOT NULL DEFAULT ''")
+	_, _ = s.db.Exec("ALTER TABLE schedules ADD COLUMN mode TEXT NOT NULL DEFAULT ''")
+
 	return nil
 }
 
@@ -113,7 +120,7 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 	deviceTags := make(map[string]string)
 	macTags := make(map[string]string)
 
-	// 1. Hydrate Tags - Preserves original restored tag ID and Precedence
+	// 1. Hydrate Tags
 	rows, err := s.db.Query("SELECT id, name, color, precedence, builtin FROM tags")
 	if err == nil {
 		defer rows.Close()
@@ -127,7 +134,7 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 		}
 	}
 
-	// Automatic DB Seeding: Ensure new built-in tags are persisted to SQLite
+	// Automatic DB Seeding: Ensure built-in tags are persisted to SQLite
 	for _, builtInTag := range tagMgr.List() {
 		if builtInTag.Builtin {
 			builtinInt := 1
@@ -142,7 +149,7 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 		}
 	}
 
-	// 2. Hydrate Device Tags (PDID and MAC Sticky Assignments)
+	// 2. Hydrate Device Tags
 	dtRows, err := s.db.Query("SELECT pdid, tag_id, mac FROM device_tags")
 	if err == nil {
 		defer dtRows.Close()
@@ -151,7 +158,7 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 			if err := dtRows.Scan(&pdid, &tagID, &mac); err == nil {
 				if pdid != "" {
 					deviceTags[pdid] = tagID
-					tagMgr.EnsureTagExists(tagID) // Ensure tag is in TagManager
+					tagMgr.EnsureTagExists(tagID)
 				}
 				if mac != "" {
 					macTags[mac] = tagID
@@ -160,7 +167,7 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 		}
 	}
 
-	// 3. Hydrate Policies
+	// 3. Hydrate Policies & Migrate legacy ScheduleID -> ScheduleIDs
 	pRows, err := s.db.Query("SELECT data FROM policies")
 	if err == nil {
 		defer pRows.Close()
@@ -169,21 +176,39 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 			if err := pRows.Scan(&dataStr); err == nil {
 				var p models.Policy
 				if err := json.Unmarshal([]byte(dataStr), &p); err == nil {
+					// Self-healing migration for legacy single schedule policies
+					if len(p.ScheduleIDs) == 0 && p.ScheduleID != nil && *p.ScheduleID != "" {
+						p.ScheduleIDs = []string{*p.ScheduleID}
+					}
 					polEng.UpsertPolicy(p)
 				}
 			}
 		}
 	}
 
-	// 4. Hydrate Schedules
-	sRows, err := s.db.Query("SELECT id, name, timezone, rules FROM schedules")
+	// 4. Hydrate Schedules & Backfill Mode
+	sRows, err := s.db.Query("SELECT id, name, mode, timezone, rules FROM schedules")
 	if err == nil {
 		defer sRows.Close()
 		for sRows.Next() {
 			var sch models.Schedule
 			var rulesJson string
-			if err := sRows.Scan(&sch.ID, &sch.Name, &sch.Timezone, &rulesJson); err == nil {
+			if err := sRows.Scan(&sch.ID, &sch.Name, &sch.Mode, &sch.Timezone, &rulesJson); err == nil {
 				if err := json.Unmarshal([]byte(rulesJson), &sch.Rules); err == nil {
+					if sch.Mode == "" {
+						hasAllow := false
+						for _, r := range sch.Rules {
+							if r.Action == models.ActionAllow {
+								hasAllow = true
+								break
+							}
+						}
+						if hasAllow {
+							sch.Mode = models.ScheduleModeWhitelist
+						} else {
+							sch.Mode = models.ScheduleModeDowntime
+						}
+					}
 					schedEng.UpsertSchedule(sch)
 				}
 			}
@@ -207,7 +232,6 @@ func (s *Storage) SaveDeviceTag(pdid, tagID, mac string) error {
 	return err
 }
 
-// UpdateDeviceTagMAC backfills a newly learned MAC address into existing device tag records.
 func (s *Storage) UpdateDeviceTagMAC(pdid, mac string) error {
 	if pdid == "" || mac == "" {
 		return nil
@@ -267,18 +291,21 @@ func (s *Storage) SavePolicy(p models.Policy) error {
 		schedID = *p.ScheduleID
 	}
 
+	schedIDsBytes, _ := json.Marshal(p.GetScheduleIDs())
+
 	_, err = s.db.Exec(`
-		INSERT INTO policies (id, name, type, target_id, action, schedule_id, priority, data)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO policies (id, name, type, target_id, action, schedule_id, schedule_ids, priority, data)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name,
 			type=excluded.type,
 			target_id=excluded.target_id,
 			action=excluded.action,
 			schedule_id=excluded.schedule_id,
+			schedule_ids=excluded.schedule_ids,
 			priority=excluded.priority,
 			data=excluded.data
-	`, p.ID, p.Name, p.Type, p.TargetID, p.Action, schedID, p.Priority, string(dataBytes))
+	`, p.ID, p.Name, p.Type, p.TargetID, p.Action, schedID, string(schedIDsBytes), p.Priority, string(dataBytes))
 
 	return err
 }
@@ -300,13 +327,14 @@ func (s *Storage) SaveSchedule(sch models.Schedule) error {
 	}
 
 	_, err = s.db.Exec(`
-		INSERT INTO schedules (id, name, timezone, rules)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO schedules (id, name, mode, timezone, rules)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name,
+			mode=excluded.mode,
 			timezone=excluded.timezone,
 			rules=excluded.rules
-	`, sch.ID, sch.Name, sch.Timezone, string(rulesBytes))
+	`, sch.ID, sch.Name, sch.Mode, sch.Timezone, string(rulesBytes))
 
 	return err
 }
