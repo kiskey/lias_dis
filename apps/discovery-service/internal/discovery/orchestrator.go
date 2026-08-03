@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/orchestrator.go
-// Version: 1.4
+// Version: 1.5
 package discovery
 
 import (
@@ -20,10 +20,13 @@ const (
     enrichmentCooldown = 1 * time.Hour
 )
 
-type IdentityPromoter interface {
+// DeviceManager allows the Orchestrator to trigger PDID promotion and persistence in the Engine.
+type DeviceManager interface {
     PromoteDeviceIdentity(pdid string) *models.Device
+    PersistDevice(pdid string)
 }
 
+// Orchestrator manages on-demand enrichment with concurrency locking and failure backoff per PDID.
 type Orchestrator struct {
     cache          *inventory.Cache
     broker         *disAPI.Broker
@@ -31,7 +34,7 @@ type Orchestrator struct {
     fallback       Enricher
     activeLocks    sync.Map
     lastAttemptMap sync.Map
-    promoter       IdentityPromoter
+    manager        DeviceManager
 }
 
 func NewOrchestrator(cache *inventory.Cache, broker *disAPI.Broker, primaries []Enricher, fallback Enricher) *Orchestrator {
@@ -43,8 +46,8 @@ func NewOrchestrator(cache *inventory.Cache, broker *disAPI.Broker, primaries []
     }
 }
 
-func (o *Orchestrator) SetIdentityPromoter(p IdentityPromoter) {
-    o.promoter = p
+func (o *Orchestrator) SetDeviceManager(m DeviceManager) {
+    o.manager = m
 }
 
 func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
@@ -92,7 +95,7 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
 
             res, err := enr.Enrich(ctx, dev)
             if err != nil {
-                slog.Debug("Primary enricher failed", "enricher": enr.Name(), "error": err)
+                slog.Debug("Primary enricher failed", "enricher", enr.Name(), "error", err)
                 return
             }
             if res != nil {
@@ -118,7 +121,7 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
         cancel()
 
         if err != nil {
-            slog.Debug("Fallback enricher failed", "enricher": o.fallback.Name(), "error": err)
+            slog.Debug("Fallback enricher failed", "enricher", o.fallback.Name(), "error", err)
         } else if res != nil {
             changed = applyEnrichment(dev, res) || changed
         }
@@ -126,20 +129,23 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
 
     if changed {
         dev.Touch(time.Now())
-        
-        // Gap 2 Fix: Upsert enriched device back to cache BEFORE promoting identity
         o.cache.Upsert(dev)
         
         var finalDev *models.Device = dev
-        if o.promoter != nil {
-            promotedDev := o.promoter.PromoteDeviceIdentity(dev.PDID)
+        if o.manager != nil {
+            promotedDev := o.manager.PromoteDeviceIdentity(dev.PDID)
             if promotedDev != nil {
                 finalDev = promotedDev
             }
         }
         
-        // Ensure final state is persisted
         o.cache.Upsert(finalDev)
+        
+        // I/O Fix: Persist enrichment data to SQLite
+        if o.manager != nil {
+            o.manager.PersistDevice(finalDev.PDID)
+        }
+        
         o.broker.Broadcast(models.NewEvent(models.EventFingerprintUpdated, finalDev.PDID, finalDev))
         slog.Info("Enrichment pipeline completed with device updates", "pdid", finalDev.PDID, "type", finalDev.DeviceType, "vendor", finalDev.Vendor)
     } else {
