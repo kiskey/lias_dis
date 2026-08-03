@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 3.6
+// Version: 3.7
 package correlation
 
 import (
@@ -203,16 +203,18 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         ipStr = strings.TrimSpace(obs.IP.String())
     }
 
-    if macStr == "" && ipStr == "" {
+    cleanHost := discovery.UnescapeHostname(obs.Hostname)
+    canonicalHost := CanonicalizeHostname(cleanHost)
+
+    // Network Engineer Fix: Prevent ghost tentative devices.
+    // Do not create devices from observations lacking both MAC and canonical hostname.
+    if macStr == "" && canonicalHost == "" {
         return
     }
 
     if e.isDuplicateObservation(macStr, ipStr, obs.Online) {
         return
     }
-
-    cleanHost := discovery.UnescapeHostname(obs.Hostname)
-    canonicalHost := CanonicalizeHostname(cleanHost)
 
     // Step 6: Pi-hole cannot update CurrentIP (Confidence Matrix Gate)
     if obs.Source == "pihole" && ipStr != "" {
@@ -421,6 +423,54 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     if e.store != nil {
         _ = e.store.SaveDevice(d)
     }
+}
+
+// PromoteDeviceIdentity checks if a device's identity tier can be promoted based on current enrichment data.
+// Returns the updated device if promoted, or the original device if not.
+func (e *Engine) PromoteDeviceIdentity(pdid string) *models.Device {
+    d := e.cache.Get(pdid)
+    if d == nil {
+        return nil
+    }
+
+    // Recalculate tier and anchor based on current MAC/Hostname/Vendor
+    newTier, newAnchor := inventory.DeriveTierAndAnchor(d.CurrentMAC, d.CanonicalHostname, d.Vendor)
+    
+    if inventory.CanPromote(d.IdentityTier, newTier) {
+        oldPDID := d.PDID
+        newPDID := inventory.GeneratePDID(newTier, newAnchor)
+
+        slog.Info("Promoting device identity tier via enrichment", "old_pdid", oldPDID, "new_pdid", newPDID, "from", d.IdentityTier, "to", newTier)
+
+        e.cache.Delete(oldPDID)
+        if e.store != nil {
+            _ = e.store.DeleteDevice(oldPDID)
+        }
+
+        d.PDID = newPDID
+        d.IdentityTier = newTier
+        d.IdentityAnchor = newAnchor
+
+        e.cache.Upsert(d)
+        if e.store != nil {
+            _ = e.store.SaveDevice(d)
+        }
+
+        migratedMACs := make([]string, len(d.MACs))
+        copy(migratedMACs, d.MACs)
+
+        e.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, d.PDID, models.DeviceReidentifiedPayload{
+            OldPDID:      oldPDID,
+            NewPDID:      newPDID,
+            Reason:       string(newTier) + "_observed_via_enrichment",
+            MigratedMACs: migratedMACs,
+            Timestamp:    time.Now(),
+        }))
+        
+        return d
+    }
+    
+    return d
 }
 
 func (e *Engine) scheduleDeferredOnline(pdid string, delay time.Duration) {
