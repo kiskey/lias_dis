@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 3.1
+// Version: 3.2
 package correlation
 
 import (
@@ -196,8 +196,8 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
 	// 2. New Device Creation with Tiered Identity (Step 7)
 	if d == nil {
-		tier, anchor := DeriveTierAndAnchor(macStr, cleanHost, obs.Vendor)
-		pdid := GeneratePDID(tier, anchor)
+		tier, anchor := inventory.DeriveTierAndAnchor(macStr, cleanHost, obs.Vendor)
+		pdid := inventory.GeneratePDID(tier, anchor)
 
 		d = &models.Device{
 			PDID:              pdid,
@@ -235,10 +235,10 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	}
 
 	// 3. Identity Promotion State Machine (Step 7)
-	newTier, newAnchor := DeriveTierAndAnchor(macStr, cleanHost, obs.Vendor)
-	if CanPromote(d.IdentityTier, newTier) {
+	newTier, newAnchor := inventory.DeriveTierAndAnchor(macStr, cleanHost, obs.Vendor)
+	if inventory.CanPromote(d.IdentityTier, newTier) {
 		oldPDID := d.PDID
-		newPDID := GeneratePDID(newTier, newAnchor)
+		newPDID := inventory.GeneratePDID(newTier, newAnchor)
 
 		slog.Info("Promoting device identity tier", "old_pdid", oldPDID, "new_pdid", newPDID, "from", d.IdentityTier, "to", newTier)
 
