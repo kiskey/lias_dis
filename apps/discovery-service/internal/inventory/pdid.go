@@ -1,49 +1,28 @@
-// Package inventory provides the in-memory device store and persistent identity helpers for DIS.
+// Package inventory provides identity helpers for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/pdid.go
-// Version: 1.3
+// Version: 2.0
 package inventory
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"net"
 	"strings"
 
-	"github.com/user/lias-dis/pkg/oui"
+	"github.com/user/lias-dis/shared/models"
 )
 
-// GeneratePDID creates a deterministic Persistent Device Identity (PDID).
+// GeneratePDID generates a tiered PDID using current canonical identity logic.
 func GeneratePDID(mac string, hostname string, vendor string) string {
 	cleanMAC := NormalizeMAC(mac)
 	cleanHost := strings.ToLower(strings.TrimSpace(hostname))
-	cleanVendor := strings.ToLower(strings.TrimSpace(vendor))
 
-	h := sha256.New()
-
-	// 1. Apple / Android Private MAC (LAA) Anchor
-	if cleanMAC != "" && oui.IsRandomizedMAC(cleanMAC) && cleanHost != "" {
-		h.Write([]byte("laa_v1:"))
-		h.Write([]byte(cleanHost))
-		h.Write([]byte(":"))
-		h.Write([]byte(cleanVendor))
-		return "pdid_" + hex.EncodeToString(h.Sum(nil))[:16]
-	}
-
-	// 2. Static Hardware MAC (BIA) Anchor
 	if cleanMAC != "" {
-		h.Write([]byte("mac_v1:"))
-		h.Write([]byte(cleanMAC))
-		return "pdid_" + hex.EncodeToString(h.Sum(nil))[:16]
+		return "pdid_bia_" + cleanMAC[:6]
 	}
-
-	// 3. Tentative identity seed for MAC-less observations
-	h.Write([]byte("tentative_v1:"))
-	h.Write([]byte(cleanHost))
-	h.Write([]byte(":"))
-	h.Write([]byte(cleanVendor))
-
-	return "pdid_" + hex.EncodeToString(h.Sum(nil))[:16]
+	if cleanHost != "" {
+		return "pdid_l7_" + cleanHost
+	}
+	return "pdid_tent_" + models.FormatMAC(net.HardwareAddr(mac))
 }
 
 // NormalizeMAC cleans and formats hardware addresses to colon-separated lowercase form.
