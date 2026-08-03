@@ -1,7 +1,7 @@
 /**
  * LIAS Control Center - Production Web Dashboard SPA Controller
  * File:    apps/lias/web/src/main.js
- * Version: 1.4 (Enforced Display Name Hierarchy & Quiet Status Indicator Transitions)
+ * Version: 1.5 (Apple HIG Dialog Compliance & Human-Readable Schedule Association)
  */
 
 import { API } from './api.js';
@@ -48,6 +48,42 @@ class AppController {
         if (dev.current_mac) return dev.current_mac;
         if (dev.pdid) return dev.pdid;
         return 'Unknown Device';
+    }
+
+    /**
+     * Resolves human-readable Schedule Name and Time Rules Summary for Policy rendering.
+     * Prevents displaying raw, cryptic database IDs like (sched_a1b2c3d4).
+     */
+    getScheduleSummary(scheduleId) {
+        if (!scheduleId) return '';
+        const sched = this.schedules.find(s => s.id === scheduleId);
+        if (!sched) {
+            return '⚠️ Missing Schedule (Fails Closed: BLOCK)';
+        }
+        const ruleSummaries = (sched.rules || []).map(r => {
+            const days = (r.days || []).map(d => d.toUpperCase()).join(',');
+            return `${days}: ${r.start_time}-${r.end_time} [${r.action.toUpperCase()}]`;
+        }).join(' | ');
+
+        return `${sched.name} (${ruleSummaries})`;
+    }
+
+    /**
+     * Resolves human-readable Policy Target Name for Tags and Devices.
+     */
+    getPolicyTargetLabel(policy) {
+        if (policy.type === 'global' || !policy.target_id) {
+            return 'Global Access Switch';
+        }
+        if (policy.type === 'tag') {
+            const tag = this.tags.find(t => t.id === policy.target_id);
+            return tag ? `Tag Group: ${tag.name}` : `Tag Group: ${policy.target_id}`;
+        }
+        if (policy.type === 'device') {
+            const dev = this.devices.find(d => d.pdid === policy.target_id);
+            return dev ? `Device: ${this.getDisplayName(dev)}` : `Device: ${policy.target_id}`;
+        }
+        return policy.target_id;
     }
 
     bindGlobalEvents() {
@@ -348,18 +384,28 @@ class AppController {
             });
         });
 
+        // Replaced Primitive confirm() with Apple HIG Sheet for Tag Deletion
         container.querySelectorAll('.btn-delete-tag').forEach(btn => {
-            btn.addEventListener('click', async (e) => {
+            btn.addEventListener('click', (e) => {
                 const tagId = e.currentTarget.dataset.tagId;
-                if (confirm(`Are you sure you want to delete tag group '${tagId}'?`)) {
-                    try {
-                        await API.deleteTag(tagId);
-                        this.showToast('Tag group deleted', 'info');
-                        await this.loadInitialData();
-                    } catch (err) {
-                        this.showToast(`Failed to delete tag: ${err.message}`, 'error');
+                const tag = this.tags.find(t => t.id === tagId);
+                const tagName = tag ? tag.name : tagId;
+
+                this.openConfirmModal({
+                    title: 'Delete Tag Group',
+                    message: `Are you sure you want to delete the tag group '${tagName}'? Any assigned devices will revert to Generic Devices.`,
+                    confirmText: 'Delete Group',
+                    confirmDanger: true,
+                    onConfirm: async () => {
+                        try {
+                            await API.deleteTag(tagId);
+                            this.showToast('Tag group deleted', 'info');
+                            await this.loadInitialData();
+                        } catch (err) {
+                            this.showToast(`Failed to delete tag: ${err.message}`, 'error');
+                        }
                     }
-                }
+                });
             });
         });
     }
@@ -538,18 +584,45 @@ class AppController {
             });
         });
 
+        // Replaced Primitive confirm() with Apple HIG Sheet & Impact Transparency for Schedule Deletion
         container.querySelectorAll('.btn-delete-sched').forEach(btn => {
-            btn.addEventListener('click', async (e) => {
+            btn.addEventListener('click', (e) => {
                 const schedId = e.currentTarget.dataset.schedId;
-                if (confirm('Are you sure you want to delete this schedule?')) {
-                    try {
-                        await API.deleteSchedule(schedId);
-                        this.showToast('Schedule deleted', 'info');
-                        await this.loadInitialData();
-                    } catch (err) {
-                        this.showToast(`Failed to delete schedule: ${err.message}`, 'error');
-                    }
+                const sched = this.schedules.find(s => s.id === schedId);
+                const schedName = sched ? sched.name : schedId;
+
+                // Query all active policies currently attached to this schedule
+                const affectedPolicies = this.policies.filter(p => p.schedule_id === schedId);
+
+                let impactHtml = '';
+                if (affectedPolicies.length > 0) {
+                    impactHtml = `
+                        <div class="hig-callout-warning">
+                            <strong>⚠️ Active Policy Impact Warning:</strong>
+                            <p style="margin-top:4px;">Deleting <strong>'${this.escapeHtml(schedName)}'</strong> will affect ${affectedPolicies.length} active policy rule(s):</p>
+                            <ul>
+                                ${affectedPolicies.map(p => `<li><strong>${this.escapeHtml(p.name)}</strong> (${this.escapeHtml(this.getPolicyTargetLabel(p))})</li>`).join('')}
+                            </ul>
+                            <p style="margin-top:6px; font-weight:600;">These policies will fail-closed (BLOCK ALL access) until reassigned to a new schedule.</p>
+                        </div>
+                    `;
                 }
+
+                this.openConfirmModal({
+                    title: 'Delete Schedule',
+                    message: `Are you sure you want to delete time schedule '${this.escapeHtml(schedName)}'? ${impactHtml}`,
+                    confirmText: 'Delete Schedule',
+                    confirmDanger: true,
+                    onConfirm: async () => {
+                        try {
+                            await API.deleteSchedule(schedId);
+                            this.showToast('Schedule deleted', 'info');
+                            await this.loadInitialData();
+                        } catch (err) {
+                            this.showToast(`Failed to delete schedule: ${err.message}`, 'error');
+                        }
+                    }
+                });
             });
         });
     }
@@ -728,44 +801,65 @@ class AppController {
                 </div>
                 <div>
                     ${this.policies.length === 0 ? '<p style="color:var(--text-secondary); font-size:14px;">No custom policies configured.</p>' : ''}
-                    ${this.policies.map(p => `
-                        <div class="card" style="box-shadow:none; border:1px solid var(--separator); margin-bottom:12px; padding:16px;">
-                            <div style="display:flex; justify-content:space-between; align-items:center;">
-                                <div>
-                                    <h4 style="font-size:15px; font-weight:700;">${this.escapeHtml(p.name)}</h4>
-                                    <div style="font-size:12px; color:var(--text-secondary); margin-top:2px;">
-                                        Type: <strong>${p.type.toUpperCase()}</strong> | Target: ${p.target_id || 'Global'} | Priority: ${p.priority}
+                    ${this.policies.map(p => {
+                        const targetLabel = this.getPolicyTargetLabel(p);
+                        const scheduleSummary = p.schedule_id ? this.getScheduleSummary(p.schedule_id) : '';
+                        const isMissingSched = p.action === 'schedule' && p.schedule_id && !this.schedules.some(s => s.id === p.schedule_id);
+
+                        return `
+                            <div class="card" style="box-shadow:none; border:1px solid var(--separator); margin-bottom:12px; padding:16px;">
+                                <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                                    <div>
+                                        <h4 style="font-size:15px; font-weight:700;">${this.escapeHtml(p.name)}</h4>
+                                        <div style="font-size:12px; color:var(--text-secondary); margin-top:3px;">
+                                            Type: <strong>${p.type.toUpperCase()}</strong> | Target: <strong>${this.escapeHtml(targetLabel)}</strong> | Priority: ${p.priority}
+                                        </div>
+                                        ${scheduleSummary ? `
+                                            <div style="font-size:12px; color:${isMissingSched ? 'var(--danger)' : 'var(--accent)'}; margin-top:6px; font-weight:600;">
+                                                📅 ${this.escapeHtml(scheduleSummary)}
+                                            </div>
+                                        ` : ''}
+                                    </div>
+                                    <div style="display:flex; align-items:center; gap:10px;">
+                                        <span class="group-tag-badge ${isMissingSched ? 'badge-missing-sched' : ''}" style="background-color:${p.action === 'allow' ? 'var(--success)' : (p.action === 'block' ? 'var(--danger)' : 'var(--accent)')};">
+                                            ${p.action.toUpperCase()}
+                                        </span>
+                                        ${p.id !== 'global_default' ? `
+                                            <button class="btn btn-danger btn-delete-policy" data-policy-id="${p.id}" style="padding:4px 8px; font-size:11px;">Delete</button>
+                                        ` : ''}
                                     </div>
                                 </div>
-                                <div style="display:flex; align-items:center; gap:10px;">
-                                    <span class="group-tag-badge" style="background-color:${p.action === 'allow' ? 'var(--success)' : (p.action === 'block' ? 'var(--danger)' : 'var(--accent)')};">
-                                        ${p.action.toUpperCase()} ${p.schedule_id ? `(${p.schedule_id})` : ''}
-                                    </span>
-                                    ${p.id !== 'global_default' ? `
-                                        <button class="btn btn-danger btn-delete-policy" data-policy-id="${p.id}" style="padding:4px 8px; font-size:11px;">Delete</button>
-                                    ` : ''}
-                                </div>
                             </div>
-                        </div>
-                    `).join('')}
+                        `;
+                    }).join('')}
                 </div>
             </div>
         `;
 
         document.getElementById('btn-create-policy').addEventListener('click', () => this.openPolicyModal());
 
+        // Replaced Primitive confirm() with Apple HIG Sheet for Policy Deletion
         container.querySelectorAll('.btn-delete-policy').forEach(btn => {
-            btn.addEventListener('click', async (e) => {
+            btn.addEventListener('click', (e) => {
                 const polId = e.currentTarget.dataset.policyId;
-                if (confirm('Are you sure you want to delete this policy rule?')) {
-                    try {
-                        await API.deletePolicy(polId);
-                        this.showToast('Policy deleted', 'info');
-                        await this.loadInitialData();
-                    } catch (err) {
-                        this.showToast(`Failed to delete policy: ${err.message}`, 'error');
+                const pol = this.policies.find(p => p.id === polId);
+                const polName = pol ? pol.name : polId;
+
+                this.openConfirmModal({
+                    title: 'Delete Policy Rule',
+                    message: `Are you sure you want to delete policy rule '${this.escapeHtml(polName)}'? Targets matching this rule will revert to global default policy.`,
+                    confirmText: 'Delete Policy',
+                    confirmDanger: true,
+                    onConfirm: async () => {
+                        try {
+                            await API.deletePolicy(polId);
+                            this.showToast('Policy deleted', 'info');
+                            await this.loadInitialData();
+                        } catch (err) {
+                            this.showToast(`Failed to delete policy: ${err.message}`, 'error');
+                        }
                     }
-                }
+                });
             });
         });
     }
@@ -801,7 +895,7 @@ class AppController {
                 <div style="margin-bottom:14px;" id="sched-select-container">
                     <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Select Schedule</label>
                     <select id="pol-sched-id" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
-                        ${this.schedules.map(s => `<option value="${s.id}">${this.escapeHtml(s.name)}</option>`).join('')}
+                        ${this.schedules.map(s => `<option value="${s.id}">${this.escapeHtml(s.name)} (${(s.rules || []).length} rules)</option>`).join('')}
                     </select>
                 </div>
             </form>
@@ -903,15 +997,22 @@ class AppController {
             </div>
         `;
 
-        document.getElementById('btn-flush-nftables').addEventListener('click', async () => {
-            if (confirm('Are you sure you want to flush the netdev lancontrol nftables table?')) {
-                try {
-                    await API.flushNftables();
-                    this.showToast('nftables table flushed successfully', 'info');
-                } catch (err) {
-                    this.showToast(`Failed to flush nftables: ${err.message}`, 'error');
+        // Replaced Primitive confirm() with Apple HIG Sheet for Firewall Flushing
+        document.getElementById('btn-flush-nftables').addEventListener('click', () => {
+            this.openConfirmModal({
+                title: 'Flush Firewall Table',
+                message: 'Are you sure you want to flush the netdev lancontrol nftables table? Active allowed and blocked kernel set elements will be wiped until the next 10-second sync loop.',
+                confirmText: 'Flush Firewall',
+                confirmDanger: true,
+                onConfirm: async () => {
+                    try {
+                        await API.flushNftables();
+                        this.showToast('nftables table flushed successfully', 'info');
+                    } catch (err) {
+                        this.showToast(`Failed to flush nftables: ${err.message}`, 'error');
+                    }
                 }
-            }
+            });
         });
 
         document.getElementById('btn-force-resync').addEventListener('click', async () => {
@@ -922,8 +1023,27 @@ class AppController {
     }
 
     // =========================================================================
-    // 5. MODAL & TOAST HELPERS
+    // 5. MODAL, HIG CONFIRMATION SHEET, & TOAST HELPERS
     // =========================================================================
+
+    /**
+     * Native Apple HIG Confirmation Sheet replacement for browser confirm() popups.
+     */
+    openConfirmModal({ title, message, confirmText, confirmDanger = false, onConfirm }) {
+        const bodyHtml = `<div style="font-size:14px; line-height:1.5; color:var(--text-primary);">${message}</div>`;
+        const footerHtml = `
+            <button class="btn btn-secondary" id="modal-confirm-cancel">Cancel</button>
+            <button class="btn ${confirmDanger ? 'btn-danger' : 'btn-primary'}" id="modal-confirm-ok">${this.escapeHtml(confirmText || 'Confirm')}</button>
+        `;
+
+        this.openModal(title, bodyHtml, footerHtml);
+
+        document.getElementById('modal-confirm-cancel').addEventListener('click', () => this.closeModal());
+        document.getElementById('modal-confirm-ok').addEventListener('click', async () => {
+            this.closeModal();
+            if (onConfirm) await onConfirm();
+        });
+    }
 
     openModal(title, bodyHtml, footerHtml) {
         const root = document.getElementById('modal-root');
