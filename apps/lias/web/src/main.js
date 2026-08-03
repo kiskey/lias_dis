@@ -1,1104 +1,1029 @@
-/**
- * LIAS Control Center - Production Web Dashboard SPA Controller
- * File:    apps/lias/web/src/main.js
- * Version: 1.5 (Apple HIG Dialog Compliance & Human-Readable Schedule Association)
- */
+// LIAS Dashboard SPA Controller
+//
+// File:    apps/lias/web/src/main.js
+// Version: 2.0
 
 import { API } from './api.js';
+import { projectSchedule, detectConflicts } from './scheduleConflict.js';
 
-class AppController {
-    constructor() {
-        this.currentView = 'dashboard';
-        this.devices = [];
-        this.tags = [];
-        this.policies = [];
-        this.schedules = [];
-        this.searchQuery = '';
-        this.sseSubscription = null;
+class App {
+  constructor() {
+    this.currentView = 'dashboard';
+    this.devices = [];
+    this.tags = [];
+    this.policies = [];
+    this.schedules = [];
+    this.searchQuery = '';
+    this.wizardState = {};
 
-        this.init();
+    this.initRouter();
+    this.initSSE();
+    this.loadData();
+  }
+
+  initRouter() {
+    document.querySelectorAll('.nav-item, .mob-nav-item').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const view = e.currentTarget.dataset.view;
+        this.navigateTo(view);
+      });
+    });
+
+    const searchInput = document.getElementById('global-search');
+    if (searchInput) {
+      searchInput.addEventListener('input', (e) => {
+        this.searchQuery = e.target.value.toLowerCase().trim();
+        this.renderCurrentView();
+      });
     }
 
-    async init() {
-        this.bindGlobalEvents();
-        await this.loadInitialData();
-        this.initRealtimeEvents();
+    const modalCloseX = document.getElementById('modal-close-x');
+    if (modalCloseX) {
+      modalCloseX.addEventListener('click', () => this.closeModal());
     }
+  }
 
-    /**
-     * Canonical Display Name Helper enforcing strict hierarchy:
-     * 1. Hostname (if non-empty)
-     * 2. Friendly Name (if Hostname is empty)
-     * 3. Vendor + Model / Vendor / Model (if Friendly Name is empty)
-     * 4. Current MAC / PDID (if metadata is empty)
-     */
-    getDisplayName(dev) {
-        if (!dev) return 'Unknown Device';
-        if (dev.hostname && dev.hostname.trim() !== '') {
-            return dev.hostname.trim();
-        }
-        if (dev.friendly_name && dev.friendly_name.trim() !== '') {
-            return dev.friendly_name.trim();
-        }
-        const vendor = (dev.vendor || '').trim();
-        const model = (dev.model || '').trim();
-        if (vendor && model) return `${vendor} ${model}`;
-        if (vendor) return vendor;
-        if (model) return model;
-        if (dev.current_mac) return dev.current_mac;
-        if (dev.pdid) return dev.pdid;
-        return 'Unknown Device';
+  initSSE() {
+    const es = new EventSource('/api/v1/events');
+    es.onmessage = (evt) => {
+      try {
+        const data = JSON.parse(evt.data);
+        this.handleRealtimeEvent(data);
+      } catch (err) {
+        console.error('SSE parse error', err);
+      }
+    };
+    es.onerror = () => {
+      console.warn('SSE disconnected, browser will auto-reconnect');
+    };
+  }
+
+  handleRealtimeEvent(event) {
+    if (event.type === 'device.added') {
+      this.showToast(`✨ New Device Discovered: ${event.device_id}`);
+    } else if (event.type === 'device.online') {
+      this.showToast(`🟢 Device Online: ${event.device_id}`);
+    } else if (event.type === 'device.offline') {
+      this.showToast(`🔴 Device Offline: ${event.device_id}`);
     }
+    this.loadData();
+  }
 
-    /**
-     * Resolves human-readable Schedule Name and Time Rules Summary for Policy rendering.
-     * Prevents displaying raw, cryptic database IDs like (sched_a1b2c3d4).
-     */
-    getScheduleSummary(scheduleId) {
-        if (!scheduleId) return '';
-        const sched = this.schedules.find(s => s.id === scheduleId);
-        if (!sched) {
-            return '⚠️ Missing Schedule (Fails Closed: BLOCK)';
-        }
-        const ruleSummaries = (sched.rules || []).map(r => {
-            const days = (r.days || []).map(d => d.toUpperCase()).join(',');
-            return `${days}: ${r.start_time}-${r.end_time} [${r.action.toUpperCase()}]`;
-        }).join(' | ');
+  async loadData() {
+    try {
+      const [devsResp, tags, policies, schedules] = await Promise.all([
+        API.getDevices(),
+        API.getTags(),
+        API.getPolicies(),
+        API.getSchedules()
+      ]);
+      this.devices = devsResp.devices || [];
+      this.tags = tags || [];
+      this.policies = policies || [];
+      this.schedules = schedules || [];
 
-        return `${sched.name} (${ruleSummaries})`;
+      this.renderCurrentView();
+    } catch (err) {
+      this.showToast(`Error loading data: ${err.message}`, 'danger');
     }
+  }
 
-    /**
-     * Resolves human-readable Policy Target Name for Tags and Devices.
-     */
-    getPolicyTargetLabel(policy) {
-        if (policy.type === 'global' || !policy.target_id) {
-            return 'Global Access Switch';
-        }
-        if (policy.type === 'tag') {
-            const tag = this.tags.find(t => t.id === policy.target_id);
-            return tag ? `Tag Group: ${tag.name}` : `Tag Group: ${policy.target_id}`;
-        }
-        if (policy.type === 'device') {
-            const dev = this.devices.find(d => d.pdid === policy.target_id);
-            return dev ? `Device: ${this.getDisplayName(dev)}` : `Device: ${policy.target_id}`;
-        }
-        return policy.target_id;
+  navigateTo(view) {
+    this.currentView = view;
+    document.querySelectorAll('.nav-item, .mob-nav-item').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.view === view);
+    });
+
+    const titleMap = {
+      dashboard: 'Dashboard',
+      devices: 'Tag Groups',
+      schedules: 'Schedules',
+      policies: 'Policies',
+      settings: 'Settings'
+    };
+    document.getElementById('view-title').textContent = titleMap[view] || 'Dashboard';
+
+    this.renderCurrentView();
+  }
+
+  renderCurrentView() {
+    const container = document.getElementById('view-container');
+    if (!container) return;
+
+    switch (this.currentView) {
+      case 'dashboard':
+        this.renderDashboardView(container);
+        break;
+      case 'devices':
+        this.renderTagGroupsView(container);
+        break;
+      case 'schedules':
+        this.renderSchedulesView(container);
+        break;
+      case 'policies':
+        this.renderPoliciesView(container);
+        break;
+      case 'settings':
+        this.renderSettingsView(container);
+        break;
+      default:
+        container.innerHTML = '<p>View not found</p>';
     }
+  }
 
-    bindGlobalEvents() {
-        // Desktop Sidebar Navigation
-        document.querySelectorAll('.sidebar-nav .nav-item').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const view = e.currentTarget.dataset.view;
-                this.switchView(view);
-            });
-        });
+  renderDashboardView(container) {
+    const total = this.devices.length;
+    const online = this.devices.filter(d => d.online).length;
+    const offline = total - online;
 
-        // Mobile Bottom Navigation Tab Bar
-        document.querySelectorAll('#mobile-nav .mob-nav-item').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const view = e.currentTarget.dataset.view;
-                this.switchView(view);
-            });
-        });
+    container.innerHTML = `
+      <div class="global-switch-banner">
+        <div>
+          <h3>Global Access Switch</h3>
+          <p style="font-size:13px; color:var(--text-secondary);">Master internet access control across all managed devices</p>
+        </div>
+        <div>${this.renderGlobalSwitchControls()}</div>
+      </div>
 
-        // Search Input Filter
-        const searchInput = document.getElementById('global-search');
-        if (searchInput) {
-            searchInput.addEventListener('input', (e) => {
-                this.searchQuery = e.target.value.toLowerCase().trim();
-                this.render();
-            });
-        }
+      <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:16px; margin-bottom:24px;">
+        <div class="card">
+          <div style="font-size:13px; color:var(--text-secondary); font-weight:600;">TOTAL DEVICES</div>
+          <div style="font-size:28px; font-weight:800; margin-top:4px;">${total}</div>
+        </div>
+        <div class="card">
+          <div style="font-size:13px; color:var(--success); font-weight:600;">ONLINE</div>
+          <div style="font-size:28px; font-weight:800; margin-top:4px; color:var(--success);">${online}</div>
+        </div>
+        <div class="card">
+          <div style="font-size:13px; color:var(--text-secondary); font-weight:600;">OFFLINE</div>
+          <div style="font-size:28px; font-weight:800; margin-top:4px;">${offline}</div>
+        </div>
+      </div>
 
-        // Modal Window Close Event Handlers
-        const closeBtn = document.getElementById('modal-close-x');
-        if (closeBtn) {
-            closeBtn.addEventListener('click', () => this.closeModal());
-        }
+      <h3>Recent Activity & Inventory</h3>
+      <div class="device-grid" style="margin-top:16px;">
+        ${this.devices.slice(0, 12).map(d => this.renderDeviceCard(d)).join('')}
+      </div>
+    `;
 
-        const modalBackdrop = document.getElementById('modal-root');
-        if (modalBackdrop) {
-            modalBackdrop.addEventListener('click', (e) => {
-                if (e.target === modalBackdrop) {
-                    this.closeModal();
-                }
-            });
-        }
+    this.bindGlobalSwitchEvents();
+  }
 
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') {
-                this.closeModal();
-            }
-        });
-    }
+  renderGlobalSwitchControls() {
+    const globalPol = this.policies.find(p => p.id === 'global_default') || { action: 'schedule' };
+    const act = globalPol.action;
 
-    switchView(view) {
-        this.currentView = view;
+    return `
+      <div class="segmented-control">
+        <button class="segmented-btn ${act === 'allow' ? 'active' : ''}" data-action="allow">Allow All</button>
+        <button class="segmented-btn ${act === 'schedule' ? 'active' : ''}" data-action="schedule">Schedule</button>
+        <button class="segmented-btn danger ${act === 'block' ? 'active' : ''}" data-action="block">Block All</button>
+      </div>
+    `;
+  }
 
-        document.querySelectorAll('.nav-item, .mob-nav-item').forEach(el => {
-            el.classList.toggle('active', el.dataset.view === view);
-        });
-
-        const titleMap = {
-            'dashboard': 'Dashboard',
-            'devices': 'Tag Groups',
-            'schedules': 'Schedules',
-            'policies': 'Policies',
-            'settings': 'Settings'
+  bindGlobalSwitchEvents() {
+    document.querySelectorAll('.global-switch-banner .segmented-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const action = e.currentTarget.dataset.action;
+        let globalPol = this.policies.find(p => p.id === 'global_default') || {
+          id: 'global_default',
+          name: 'Global Access Switch',
+          type: 'global',
+          target_id: '',
+          priority: 0
         };
 
-        const viewTitle = document.getElementById('view-title');
-        if (viewTitle) {
-            viewTitle.textContent = titleMap[view] || 'Dashboard';
-        }
-
-        this.render();
-    }
-
-    async loadInitialData() {
+        globalPol.action = action;
         try {
-            const [devsRes, tagsRes, polsRes, schedsRes] = await Promise.all([
-                API.getDevices(),
-                API.getTags(),
-                API.getPolicies(),
-                API.getSchedules()
-            ]);
-
-            this.devices = devsRes.devices || [];
-            this.tags = tagsRes || [];
-            this.policies = polsRes || [];
-            this.schedules = schedsRes || [];
-
-            this.render();
+          await API.savePolicy(globalPol);
+          this.showToast(`Global Switch set to: ${action.toUpperCase()}`);
+          this.loadData();
         } catch (err) {
-            this.showToast('Failed to load system state from LIAS server', 'error');
+          this.showToast(`Failed to update global switch: ${err.message}`, 'danger');
         }
+      });
+    });
+  }
+
+  renderTagGroupsView(container) {
+    const grouped = {};
+    this.tags.forEach(t => { grouped[t.id] = []; });
+
+    this.devices.forEach(d => {
+      const tagId = (d.tags && d.tags.length > 0) ? d.tags[0] : 'generic';
+      if (!grouped[tagId]) grouped[tagId] = [];
+      grouped[tagId].push(d);
+    });
+
+    let html = `
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+        <h3>Tag Groups (${this.tags.length})</h3>
+        <button class="btn btn-primary" id="btn-add-tag">+ New Tag Group</button>
+      </div>
+    `;
+
+    this.tags.forEach(t => {
+      const devs = (grouped[t.id] || []).filter(d => {
+        if (!this.searchQuery) return true;
+        return (d.hostname || '').toLowerCase().includes(this.searchQuery) ||
+               (d.current_mac || '').toLowerCase().includes(this.searchQuery) ||
+               (d.current_ip || '').toLowerCase().includes(this.searchQuery);
+      });
+
+      html += `
+        <div class="group-card" data-tag-id="${t.id}">
+          <div class="group-header">
+            <div class="group-header-title">
+              <span class="group-tag-badge" style="background:${t.color}">${t.name}</span>
+              ${t.id === 'infrastructure' ? '<span style="font-size:12px; font-weight:700; color:var(--text-secondary);">🔒 IMMUNE</span>' : ''}
+              <span class="group-count">(${devs.length} devices)</span>
+            </div>
+            <svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </div>
+          <div class="group-content">
+            <div class="device-grid">
+              ${devs.map(d => this.renderDeviceCard(d)).join('')}
+            </div>
+          </div>
+        </div>
+      `;
+    });
+
+    container.innerHTML = html;
+
+    document.querySelectorAll('.group-header').forEach(hdr => {
+      hdr.addEventListener('click', (e) => {
+        const card = e.currentTarget.closest('.group-card');
+        card.classList.toggle('collapsed');
+      });
+    });
+
+    const addBtn = document.getElementById('btn-add-tag');
+    if (addBtn) {
+      addBtn.addEventListener('click', () => this.openTagModal());
     }
 
-    async loadInitialDataSilently() {
+    this.bindDeviceTagDropdowns();
+  }
+
+  renderDeviceCard(d) {
+    const dispName = d.hostname || d.friendly_name || `${d.vendor || ''} ${d.model || ''}`.trim() || d.current_mac || d.pdid;
+    const tagId = (d.tags && d.tags.length > 0) ? d.tags[0] : 'generic';
+
+    return `
+      <div class="device-item">
+        <div>
+          <div class="device-item-header">
+            <div class="device-name">${dispName}</div>
+            <span class="status-indicator ${d.online ? 'online' : 'offline'}" title="${d.online ? 'Online' : 'Offline'}"></span>
+          </div>
+          <div class="device-meta">
+            <div>MAC: ${d.current_mac || 'N/A'}</div>
+            <div>IP: ${d.current_ip || 'N/A'}</div>
+            <div>Type: ${d.device_type || 'Unclassified'}</div>
+          </div>
+          ${(d.services && d.services.length > 0) ? `
+            <div class="service-pill-list">
+              ${d.services.map(s => `<span class="service-pill">${s}</span>`).join('')}
+            </div>
+          ` : ''}
+        </div>
+        <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center;">
+          <select class="device-tag-select" data-pdid="${d.pdid}">
+            ${this.tags.map(t => `<option value="${t.id}" ${t.id === tagId ? 'selected' : ''}>${t.name}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+    `;
+  }
+
+  bindDeviceTagDropdowns() {
+    document.querySelectorAll('.device-tag-select').forEach(sel => {
+      sel.addEventListener('change', async (e) => {
+        const pdid = e.currentTarget.dataset.pdid;
+        const tagId = e.currentTarget.value;
         try {
-            const [devsRes, tagsRes, polsRes, schedsRes] = await Promise.all([
-                API.getDevices(),
-                API.getTags(),
-                API.getPolicies(),
-                API.getSchedules()
-            ]);
-
-            this.devices = devsRes.devices || [];
-            this.tags = tagsRes || [];
-            this.policies = polsRes || [];
-            this.schedules = schedsRes || [];
-
-            this.render();
+          await API.assignDeviceTag(pdid, tagId);
+          this.showToast(`Tag reassigned successfully`);
+          this.loadData();
         } catch (err) {
-            // Silently absorb transport errors during background refresh
+          this.showToast(`Failed to assign tag: ${err.message}`, 'danger');
         }
-    }
+      });
+    });
+  }
 
-    initRealtimeEvents() {
-        if (this.sseSubscription) {
-            this.sseSubscription.close();
-        }
+  renderPoliciesView(container) {
+    const validPolicies = this.policies.filter(p => p.target_id !== 'infrastructure');
 
-        this.sseSubscription = API.subscribeEvents((evt) => {
-            // Re-fetch state silently to update green/gray status indicator dots and device cards
-            this.loadInitialDataSilently();
+    let html = `
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+        <h3>Access Policies (${validPolicies.length})</h3>
+        <button class="btn btn-primary" id="btn-add-policy">+ New Policy</button>
+      </div>
 
-            // Immediate Toast Alert ONLY when a completely new device is discovered
-            if (evt.type === 'device.added') {
-                let devName = 'New Device';
-                if (evt.payload) {
-                    devName = this.getDisplayName(evt.payload);
-                }
-                this.showToast(`🎉 New Device Discovered: ${devName}`, 'info');
-            }
-            // Routine 'device.online' and 'device.offline' events update UI status dots quietly
-        });
+      <div style="display:flex; flex-direction:column; gap:16px;">
+        ${validPolicies.map(p => {
+          const schedSummary = this.getScheduleSummary(p);
+          const scheds = this.resolvePolicySchedules(p);
 
-        // Defense-in-Depth (GAP-12): 20s backstop polling interval ensures the UI
-        // auto-corrects even if SSE connections drop or miss packets.
-        setInterval(() => this.loadInitialDataSilently(), 20000);
-    }
-
-    render() {
-        const container = document.getElementById('view-container');
-        if (!container) return;
-
-        switch (this.currentView) {
-            case 'dashboard':
-            case 'devices':
-                this.renderTagGroupsView(container);
-                break;
-            case 'schedules':
-                this.renderSchedulesView(container);
-                break;
-            case 'policies':
-                this.renderPoliciesView(container);
-                break;
-            case 'settings':
-                this.renderSettingsView(container);
-                break;
-            default:
-                container.innerHTML = '<div class="card"><p>View not found.</p></div>';
-        }
-    }
-
-    // =========================================================================
-    // 1. DASHBOARD & TAG GROUPS VIEW
-    // =========================================================================
-
-    renderTagGroupsView(container) {
-        let html = '';
-
-        const globalPolicy = this.policies.find(p => p.id === 'global_default') || { action: 'schedule' };
-        html += `
-            <div class="global-switch-banner">
+          return `
+            <div class="card" style="margin-bottom:0;">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                 <div>
-                    <h3 style="font-size:16px; font-weight:700; margin-bottom:4px;">Global Network Access</h3>
-                    <p style="font-size:13px; color:var(--text-secondary);">Master internet switch across all network devices</p>
+                  <div style="font-size:16px; font-weight:700;">${p.name}</div>
+                  <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
+                    Scope: <strong style="text-transform:capitalize;">${p.type}</strong> | Target: <strong>${p.target_id || 'Global'}</strong> | Priority: <strong>${p.priority}</strong>
+                  </div>
                 </div>
-                <div class="segmented-control">
-                    <button class="segmented-btn ${globalPolicy.action === 'allow' ? 'active' : ''}" data-act="allow">Allow All</button>
-                    <button class="segmented-btn ${globalPolicy.action === 'schedule' ? 'active' : ''}" data-act="schedule">Schedule</button>
-                    <button class="segmented-btn danger ${globalPolicy.action === 'block' ? 'active' : ''}" data-act="block">Block All</button>
+                <div style="display:flex; gap:8px;">
+                  <button class="btn btn-secondary btn-edit-policy" data-id="${p.id}">Edit</button>
+                  <button class="btn btn-danger btn-delete-policy" data-id="${p.id}">Delete</button>
                 </div>
+              </div>
+              <div style="margin-top:12px; font-size:13px; font-weight:600;">
+                Action: <span style="color:${p.action === 'allow' ? 'var(--success)' : p.action === 'block' ? 'var(--danger)' : 'var(--accent)'}">${p.action.toUpperCase()}</span>
+                ${schedSummary ? `<div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">${schedSummary}</div>` : ''}
+              </div>
+              ${(p.action === 'schedule' && scheds.length > 0) ? this.renderWeeklyTimeline(scheds) : ''}
             </div>
-        `;
+          `;
+        }).join('')}
+      </div>
+    `;
 
-        if (this.currentView === 'devices') {
-            html += `
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-                    <h3 style="font-size:18px; font-weight:700;">Configured Tag Groups</h3>
-                    <button class="btn btn-primary" id="btn-create-tag">+ Create Custom Tag Group</button>
-                </div>
-            `;
+    container.innerHTML = html;
+
+    const addBtn = document.getElementById('btn-add-policy');
+    if (addBtn) addBtn.addEventListener('click', () => this.openPolicyWizard());
+
+    document.querySelectorAll('.btn-edit-policy').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const id = e.currentTarget.dataset.id;
+        const p = this.policies.find(item => item.id === id);
+        if (p) this.openPolicyWizard(p);
+      });
+    });
+
+    document.querySelectorAll('.btn-delete-policy').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const id = e.currentTarget.dataset.id;
+        if (confirm('Are you sure you want to delete this policy?')) {
+          try {
+            await API.deletePolicy(id);
+            this.showToast('Policy deleted');
+            this.loadData();
+          } catch (err) {
+            this.showToast(`Failed to delete policy: ${err.message}`, 'danger');
+          }
         }
+      });
+    });
+  }
 
-        const tagMap = new Map();
-        this.tags.forEach(t => tagMap.set(t.id, { ...t, devices: [] }));
+  getScheduleSummary(p) {
+    if (p.action !== 'schedule') return '';
+    const schedIds = p.schedule_ids || (p.schedule_id ? [p.schedule_id] : []);
+    if (schedIds.length === 0) return '<span class="badge-missing-sched">⚠️ No Schedule Attached</span>';
 
-        this.devices.forEach(dev => {
-            if (this.searchQuery) {
-                const displayName = this.getDisplayName(dev).toLowerCase();
-                const match = displayName.includes(this.searchQuery) ||
-                              (dev.hostname || '').toLowerCase().includes(this.searchQuery) ||
-                              (dev.friendly_name || '').toLowerCase().includes(this.searchQuery) ||
-                              (dev.current_mac || '').toLowerCase().includes(this.searchQuery) ||
-                              (dev.current_ip || '').toLowerCase().includes(this.searchQuery) ||
-                              (dev.vendor || '').toLowerCase().includes(this.searchQuery) ||
-                              (dev.pdid || '').toLowerCase().includes(this.searchQuery);
-                if (!match) return;
-            }
+    const missing = [];
+    const names = [];
 
-            const assignedTag = (dev.tags && dev.tags[0]) ? dev.tags[0] : 'generic';
-            if (tagMap.has(assignedTag)) {
-                tagMap.get(assignedTag).devices.push(dev);
+    schedIds.forEach(id => {
+      const s = this.schedules.find(item => item.id === id);
+      if (s) {
+        names.push(s.name);
+      } else {
+        missing.push(id);
+      }
+    });
+
+    if (missing.length > 0) {
+      return `<span class="badge-missing-sched">⚠️ Missing Schedule(s): ${missing.join(', ')} (Fails Closed: BLOCK)</span>`;
+    }
+
+    return `Attached Schedules (${names.length}): ${names.join(', ')}`;
+  }
+
+  resolvePolicySchedules(p) {
+    const schedIds = p.schedule_ids || (p.schedule_id ? [p.schedule_id] : []);
+    return schedIds.map(id => this.schedules.find(s => s.id === id)).filter(Boolean);
+  }
+
+  renderSchedulesView(container) {
+    let html = `
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+        <h3>Time Schedules (${this.schedules.length})</h3>
+        <button class="btn btn-primary" id="btn-add-schedule">+ New Schedule</button>
+      </div>
+
+      <div style="display:flex; flex-direction:column; gap:16px;">
+        ${this.schedules.map(s => `
+          <div class="card" style="margin-bottom:0;">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+              <div>
+                <div style="font-size:16px; font-weight:700;">${s.name}</div>
+                <div style="font-size:12px; color:var(--text-secondary); margin-top:2px;">
+                  Mode: <strong style="text-transform:uppercase;">${s.mode || 'downtime'}</strong> | Timezone: <strong>${s.timezone}</strong>
+                </div>
+              </div>
+              <div style="display:flex; gap:8px;">
+                <button class="btn btn-secondary btn-edit-schedule" data-id="${s.id}">Edit</button>
+                <button class="btn btn-danger btn-delete-schedule" data-id="${s.id}">Delete</button>
+              </div>
+            </div>
+            ${this.renderWeeklyTimeline([s])}
+          </div>
+        `).join('')}
+      </div>
+    `;
+
+    container.innerHTML = html;
+
+    const addBtn = document.getElementById('btn-add-schedule');
+    if (addBtn) addBtn.addEventListener('click', () => this.openScheduleModal());
+
+    document.querySelectorAll('.btn-edit-schedule').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const id = e.currentTarget.dataset.id;
+        const s = this.schedules.find(item => item.id === id);
+        if (s) this.openScheduleModal(s);
+      });
+    });
+
+    document.querySelectorAll('.btn-delete-schedule').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const id = e.currentTarget.dataset.id;
+        this.confirmDeleteSchedule(id);
+      });
+    });
+  }
+
+  confirmDeleteSchedule(schedId) {
+    const impactedPolicies = this.policies.filter(p => {
+      const ids = p.schedule_ids || (p.schedule_id ? [p.schedule_id] : []);
+      return ids.includes(schedId);
+    });
+
+    let warningHtml = '';
+    if (impactedPolicies.length > 0) {
+      warningHtml = `
+        <div class="hig-callout-warning">
+          <strong>⚠️ Warning: Impacted Policies</strong>
+          <p style="margin-top:4px;">Deleting this schedule will impact ${impactedPolicies.length} policy/policies, causing them to fail closed (BLOCK):</p>
+          <ul>
+            ${impactedPolicies.map(p => `<li><strong>${p.name}</strong> (${p.target_id || 'Global'})</li>`).join('')}
+          </ul>
+        </div>
+      `;
+    }
+
+    this.openModal('Confirm Delete Schedule', `
+      <p>Are you sure you want to delete this schedule?</p>
+      ${warningHtml}
+    `, `
+      <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+      <button class="btn btn-danger" id="modal-confirm">Delete Schedule</button>
+    `);
+
+    document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
+    document.getElementById('modal-confirm').addEventListener('click', async () => {
+      try {
+        await API.deleteSchedule(schedId);
+        this.showToast('Schedule deleted');
+        this.closeModal();
+        this.loadData();
+      } catch (err) {
+        this.showToast(`Failed to delete schedule: ${err.message}`, 'danger');
+      }
+    });
+  }
+
+  renderWeeklyTimeline(schedules) {
+    if (!schedules || schedules.length === 0) return '';
+
+    const colors = ['#0071e3', '#34c759', '#ff9500', '#af52de', '#5856d6', '#00c7be'];
+    const conflicts = detectConflicts(schedules);
+
+    const days = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+    let html = `<div class="weekly-timeline">`;
+
+    if (conflicts.length > 0) {
+      html += `
+        <div class="hig-callout-warning" style="margin-top:0; margin-bottom:8px;">
+          <strong>⚠️ Schedule Contradiction Detected</strong>
+          <ul>
+            ${conflicts.map(c => `<li>${c.schedule_a_name} (${c.action_a.toUpperCase()}) vs ${c.schedule_b_name} (${c.action_b.toUpperCase()}) on ${c.day} ${c.overlap_start}-${c.overlap_end}</li>`).join('')}
+          </ul>
+        </div>
+      `;
+    }
+
+    days.forEach((day, dayIdx) => {
+      html += `
+        <div class="timeline-day-row">
+          <div class="timeline-day-label">${day}</div>
+          <div class="timeline-track">
+      `;
+
+      schedules.forEach((s, sIdx) => {
+        const color = colors[sIdx % colors.length];
+        (s.rules || []).forEach(rule => {
+          if ((rule.days || []).map(d => d.toLowerCase().substring(0, 3)).includes(day)) {
+            const startParts = (rule.start_time || '00:00').split(':');
+            const endParts = (rule.end_time || '23:59').split(':');
+
+            const startMin = parseInt(startParts[0], 10) * 60 + parseInt(startParts[1], 10);
+            const endMin = parseInt(endParts[0], 10) * 60 + parseInt(endParts[1], 10);
+
+            if (startMin < endMin) {
+              const leftPct = ((startMin / 1440) * 100).toFixed(1);
+              const widthPct = (((endMin - startMin) / 1440) * 100).toFixed(1);
+              html += `<div class="timeline-band" style="left:${leftPct}%; width:${widthPct}%; background:${color};" title="${s.name}: ${rule.start_time}-${rule.end_time} (${rule.action})"></div>`;
             } else {
-                if (!tagMap.has('generic')) {
-                    tagMap.set('generic', { id: 'generic', name: 'Generic Devices', color: '#636366', precedence: 0, devices: [] });
-                }
-                tagMap.get('generic').devices.push(dev);
+              const leftPct = ((startMin / 1440) * 100).toFixed(1);
+              const widthPct = (((1440 - startMin) / 1440) * 100).toFixed(1);
+              html += `<div class="timeline-band" style="left:${leftPct}%; width:${widthPct}%; background:${color};" title="${s.name}: ${rule.start_time}-Midnight (${rule.action})"></div>`;
             }
+          }
         });
+      });
 
-        tagMap.forEach(group => {
-            if (group.devices.length === 0 && this.searchQuery) return;
+      conflicts.forEach(c => {
+        if (c.day.substring(0, 3).toLowerCase() === day) {
+          const startParts = c.overlap_start.split(':');
+          const endParts = c.overlap_end.split(':');
+          const startMin = parseInt(startParts[0], 10) * 60 + parseInt(startParts[1], 10);
+          const endMin = parseInt(endParts[0], 10) * 60 + parseInt(endParts[1], 10);
 
-            html += `
-                <div class="group-card">
-                    <div class="group-header" data-tag-id="${group.id}">
-                        <div class="group-header-title">
-                            <span class="group-tag-badge" style="background-color:${group.color};">${this.escapeHtml(group.name)}</span>
-                            <span class="group-count">(${group.devices.length} ${group.devices.length === 1 ? 'device' : 'devices'})</span>
-                        </div>
-                        <div style="display:flex; align-items:center; gap:12px;">
-                            ${(this.currentView === 'devices' && !group.builtin) ? `
-                                <button class="btn btn-secondary btn-edit-tag" data-tag-id="${group.id}" style="padding:4px 10px; font-size:12px;">Edit</button>
-                                <button class="btn btn-danger btn-delete-tag" data-tag-id="${group.id}" style="padding:4px 10px; font-size:12px;">Delete</button>
-                            ` : ''}
-                            <svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
-                        </div>
-                    </div>
-                    <div class="group-content">
-                        ${group.devices.length === 0 ? '<p style="color:var(--text-secondary); font-size:13px;">No devices assigned to this group.</p>' : `
-                            <div class="device-grid">
-                                ${group.devices.map(d => this.renderDeviceCard(d)).join('')}
-                            </div>
-                        `}
-                    </div>
-                </div>
-            `;
-        });
-
-        container.innerHTML = html;
-
-        // Bind Global Access Switch Buttons
-        container.querySelectorAll('.global-switch-banner .segmented-btn').forEach(btn => {
-            btn.addEventListener('click', async (e) => {
-                const act = e.currentTarget.dataset.act;
-                try {
-                    await API.savePolicy({
-                        id: 'global_default',
-                        name: 'Global Access Switch',
-                        type: 'global',
-                        action: act,
-                        priority: 0
-                    });
-                    this.showToast(`Global access updated to ${act.toUpperCase()}`, 'info');
-                    await this.loadInitialDataSilently();
-                } catch (err) {
-                    this.showToast(`Failed to set global policy: ${err.message}`, 'error');
-                }
-            });
-        });
-
-        // Bind Collapsible Group Headers
-        container.querySelectorAll('.group-header').forEach(header => {
-            header.addEventListener('click', (e) => {
-                if (e.target.closest('button')) return;
-                header.parentElement.classList.toggle('collapsed');
-            });
-        });
-
-        // Bind Tag Reassignment Buttons on Devices
-        container.querySelectorAll('.btn-reassign-tag').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const pdid = e.currentTarget.dataset.pdid;
-                this.openAssignTagModal(pdid);
-            });
-        });
-
-        // Bind Tag Management Action Buttons
-        const createTagBtn = document.getElementById('btn-create-tag');
-        if (createTagBtn) {
-            createTagBtn.addEventListener('click', () => this.openTagModal());
+          const leftPct = ((startMin / 1440) * 100).toFixed(1);
+          const widthPct = (((endMin - startMin) / 1440) * 100).toFixed(1);
+          html += `<div class="timeline-band conflict" style="left:${leftPct}%; width:${widthPct}%;" title="CONFLICT: ${c.schedule_a_name} vs ${c.schedule_b_name} (${c.overlap_start}-${c.overlap_end})"></div>`;
         }
+      });
 
-        container.querySelectorAll('.btn-edit-tag').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const tagId = e.currentTarget.dataset.tagId;
-                const tag = this.tags.find(t => t.id === tagId);
-                if (tag) this.openTagModal(tag);
-            });
-        });
+      html += `</div></div>`;
+    });
 
-        // Replaced Primitive confirm() with Apple HIG Sheet for Tag Deletion
-        container.querySelectorAll('.btn-delete-tag').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const tagId = e.currentTarget.dataset.tagId;
-                const tag = this.tags.find(t => t.id === tagId);
-                const tagName = tag ? tag.name : tagId;
+    html += `</div>`;
+    return html;
+  }
 
-                this.openConfirmModal({
-                    title: 'Delete Tag Group',
-                    message: `Are you sure you want to delete the tag group '${tagName}'? Any assigned devices will revert to Generic Devices.`,
-                    confirmText: 'Delete Group',
-                    confirmDanger: true,
-                    onConfirm: async () => {
-                        try {
-                            await API.deleteTag(tagId);
-                            this.showToast('Tag group deleted', 'info');
-                            await this.loadInitialData();
-                        } catch (err) {
-                            this.showToast(`Failed to delete tag: ${err.message}`, 'error');
-                        }
-                    }
-                });
-            });
-        });
+  // Multi-Step Policy Wizard
+  openPolicyWizard(existingPolicy = null) {
+    this.wizardState = {
+      step: 1,
+      policy: existingPolicy ? JSON.parse(JSON.stringify(existingPolicy)) : {
+        name: '',
+        type: 'tag',
+        target_id: '',
+        action: 'schedule',
+        schedule_ids: [],
+        priority: 50
+      }
+    };
+
+    if (!this.wizardState.policy.schedule_ids && this.wizardState.policy.schedule_id) {
+      this.wizardState.policy.schedule_ids = [this.wizardState.policy.schedule_id];
     }
 
-    renderDeviceCard(dev) {
-        const isOnline = dev.online;
-        // Enforce strict display name hierarchy: Hostname -> Friendly Name -> Vendor/Model -> MAC/PDID
-        const displayName = this.getDisplayName(dev);
-        const services = dev.services || [];
-        const currentTag = (dev.tags && dev.tags[0]) ? dev.tags[0] : 'generic';
+    this.renderPolicyWizardStep();
+  }
 
-        return `
-            <div class="device-item">
-                <div>
-                    <div class="device-item-header">
-                        <span class="device-name" title="${this.escapeHtml(dev.pdid)}">${this.escapeHtml(displayName)}</span>
-                        <div class="status-indicator ${isOnline ? 'online' : 'offline'}" title="${isOnline ? 'Online' : 'Offline'}"></div>
-                    </div>
-                    <div class="device-meta">
-                        <div><strong>IP:</strong> ${dev.current_ip || 'N/A'}</div>
-                        <div><strong>MAC:</strong> ${dev.current_mac || 'N/A'}</div>
-                        <div><strong>Vendor:</strong> ${dev.vendor || 'Unknown'}</div>
-                        ${dev.model ? `<div><strong>Model:</strong> ${this.escapeHtml(dev.model)}</div>` : ''}
-                    </div>
-                    ${services.length > 0 ? `
-                        <div class="service-pill-list">
-                            ${services.map(s => `<span class="service-pill">${this.escapeHtml(s)}</span>`).join('')}
-                        </div>
-                    ` : ''}
-                </div>
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-top:12px; padding-top:10px; border-top:1px solid var(--separator);">
-                    <span class="last-seen-badge">${isOnline ? 'Active now' : (dev.last_seen ? new Date(dev.last_seen).toLocaleTimeString() : 'Offline')}</span>
-                    <button class="btn btn-secondary btn-reassign-tag" data-pdid="${dev.pdid}" style="padding:4px 8px; font-size:11px;">Tag: ${currentTag}</button>
-                </div>
-            </div>
-        `;
+  renderPolicyWizardStep() {
+    const { step, policy } = this.wizardState;
+    const title = policy.id ? 'Edit Access Policy' : 'New Access Policy Wizard';
+
+    let bodyHtml = `
+      <div class="wizard-steps">
+        <div class="wizard-step ${step === 1 ? 'active' : ''}">
+          <span class="wizard-step-num">1</span> Target
+        </div>
+        <div class="wizard-step ${step === 2 ? 'active' : ''}">
+          <span class="wizard-step-num">2</span> Enforcement
+        </div>
+        <div class="wizard-step ${step === 3 ? 'active' : ''}">
+          <span class="wizard-step-num">3</span> Schedules
+        </div>
+      </div>
+    `;
+
+    if (step === 1) {
+      bodyHtml += `
+        <div style="display:flex; flex-direction:column; gap:16px;">
+          <div>
+            <label style="font-size:12px; font-weight:700;">Policy Name</label>
+            <input type="text" id="wiz-name" value="${policy.name}" placeholder="e.g. Kids Bedtime & Homework" style="width:100%; margin-top:4px;">
+          </div>
+          <div>
+            <label style="font-size:12px; font-weight:700;">Scope / Type</label>
+            <select id="wiz-type" style="width:100%; margin-top:4px;">
+              <option value="tag" ${policy.type === 'tag' ? 'selected' : ''}>Tag Group</option>
+              <option value="device" ${policy.type === 'device' ? 'selected' : ''}>Single Device</option>
+              <option value="global" ${policy.type === 'global' ? 'selected' : ''}>Global Default</option>
+            </select>
+          </div>
+          <div id="wiz-target-container">
+            ${this.renderWizardTargetDropdown(policy.type, policy.target_id)}
+          </div>
+          <div id="wiz-shadow-warning"></div>
+        </div>
+      `;
+    } else if (step === 2) {
+      bodyHtml += `
+        <div style="display:flex; flex-direction:column; gap:16px;">
+          <div>
+            <label style="font-size:12px; font-weight:700;">Enforcement Action</label>
+            <select id="wiz-action" style="width:100%; margin-top:4px;">
+              <option value="schedule" ${policy.action === 'schedule' ? 'selected' : ''}>Schedule-Driven (Multi-Schedule)</option>
+              <option value="allow" ${policy.action === 'allow' ? 'selected' : ''}>Allow Always</option>
+              <option value="block" ${policy.action === 'block' ? 'selected' : ''}>Block Always</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:12px; font-weight:700;">Priority (Higher numbers win precedence)</label>
+            <input type="number" id="wiz-priority" value="${policy.priority || 50}" style="width:100%; margin-top:4px;">
+          </div>
+        </div>
+      `;
+    } else if (step === 3) {
+      const selectedScheds = (policy.schedule_ids || []).map(id => this.schedules.find(s => s.id === id)).filter(Boolean);
+      const conflicts = detectConflicts(selectedScheds);
+
+      bodyHtml += `
+        <div style="display:flex; flex-direction:column; gap:16px;">
+          <p style="font-size:13px; color:var(--text-secondary);">Select time schedules to attach to this policy:</p>
+          <div style="max-height:180px; overflow-y:auto; display:flex; flex-direction:column; gap:8px;">
+            ${this.schedules.map(s => {
+              const checked = (policy.schedule_ids || []).includes(s.id);
+              return `
+                <label style="display:flex; align-items:center; gap:10px; padding:8px 12px; background:var(--bg-tertiary); border-radius:8px; cursor:pointer;">
+                  <input type="checkbox" class="wiz-sched-checkbox" value="${s.id}" ${checked ? 'checked' : ''}>
+                  <div>
+                    <div style="font-size:14px; font-weight:700;">${s.name}</div>
+                    <div style="font-size:11px; color:var(--text-secondary);">${s.mode || 'downtime'} mode | ${s.timezone}</div>
+                  </div>
+                </label>
+              `;
+            }).join('')}
+          </div>
+          <div id="wiz-timeline-container">
+            ${this.renderWeeklyTimeline(selectedScheds)}
+          </div>
+        </div>
+      `;
     }
 
-    openAssignTagModal(pdid) {
-        const dev = this.devices.find(d => d.pdid === pdid);
-        if (!dev) return;
+    const footerHtml = `
+      ${step > 1 ? '<button class="btn btn-secondary" id="wiz-btn-back">Back</button>' : ''}
+      <button class="btn btn-secondary" id="wiz-btn-cancel">Cancel</button>
+      ${step < 3 ? '<button class="btn btn-primary" id="wiz-btn-next">Next</button>' : '<button class="btn btn-primary" id="wiz-btn-save">Save Policy</button>'}
+    `;
 
-        const currentTag = (dev.tags && dev.tags[0]) ? dev.tags[0] : 'generic';
-        const displayName = this.getDisplayName(dev);
+    this.openModal(title, bodyHtml, footerHtml);
+    this.bindPolicyWizardEvents();
+  }
 
-        let bodyHtml = `
-            <p style="font-size:14px; margin-bottom:16px;">Select tag group assignment for device <strong>${this.escapeHtml(displayName)}</strong>:</p>
-            <div style="display:flex; flex-direction:column; gap:8px;">
-                ${this.tags.map(t => `
-                    <label style="display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border:1px solid var(--separator); border-radius:10px; cursor:pointer; background:var(--bg-tertiary);">
-                        <div style="display:flex; align-items:center; gap:10px;">
-                            <span class="group-tag-badge" style="background-color:${t.color};">${this.escapeHtml(t.name)}</span>
-                        </div>
-                        <input type="radio" name="tag_selection" value="${t.id}" ${t.id === currentTag ? 'checked' : ''}>
-                    </label>
-                `).join('')}
-            </div>
-        `;
+  renderWizardTargetDropdown(type, selectedTarget) {
+    if (type === 'global') return '<p style="font-size:12px; color:var(--text-secondary);">Applies to all devices without specific policy</p>';
 
-        this.openModal('Assign Device Tag Group', bodyHtml, `
-            <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
-            <button class="btn btn-primary" id="modal-save-tag">Save Assignment</button>
-        `);
-
-        document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
-        document.getElementById('modal-save-tag').addEventListener('click', async () => {
-            const selected = document.querySelector('input[name="tag_selection"]:checked');
-            if (selected) {
-                try {
-                    await API.assignDeviceTag(pdid, selected.value);
-                    this.showToast('Device tag assigned successfully', 'info');
-                    this.closeModal();
-                    await this.loadInitialDataSilently();
-                } catch (err) {
-                    this.showToast(`Failed to assign tag: ${err.message}`, 'error');
-                }
-            }
-        });
+    if (type === 'tag') {
+      const filteredTags = this.tags.filter(t => t.id !== 'infrastructure');
+      return `
+        <label style="font-size:12px; font-weight:700;">Target Tag Group</label>
+        <select id="wiz-target" style="width:100%; margin-top:4px;">
+          ${filteredTags.map(t => `<option value="${t.id}" ${t.id === selectedTarget ? 'selected' : ''}>${t.name}</option>`).join('')}
+        </select>
+        <p style="font-size:11px; color:var(--text-secondary); margin-top:4px;">🔒 Infrastructure devices have unrestricted access and cannot be scheduled.</p>
+      `;
     }
 
-    openTagModal(tag = null) {
-        const isEdit = !!tag;
-        const bodyHtml = `
-            <form id="form-tag">
-                <div style="margin-bottom:16px;">
-                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:6px;">Tag Name</label>
-                    <input type="text" id="tag-name" value="${isEdit ? this.escapeHtml(tag.name) : ''}" placeholder="e.g. Kids Gaming" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary); font-family:inherit;" required>
-                </div>
-                <div style="margin-bottom:16px;">
-                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:6px;">Badge Color</label>
-                    <input type="color" id="tag-color" value="${isEdit ? tag.color : '#0071e3'}" style="width:100%; height:40px; border:none; border-radius:8px; cursor:pointer; background:transparent;">
-                </div>
-            </form>
-        `;
+    return `
+      <label style="font-size:12px; font-weight:700;">Target Device</label>
+      <select id="wiz-target" style="width:100%; margin-top:4px;">
+        ${this.devices.map(d => `<option value="${d.pdid}" ${d.pdid === selectedTarget ? 'selected' : ''}>${d.hostname || d.pdid}</option>`).join('')}
+      </select>
+    `;
+  }
 
-        this.openModal(isEdit ? 'Edit Custom Tag Group' : 'Create Custom Tag Group', bodyHtml, `
-            <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
-            <button class="btn btn-primary" id="modal-save-tag-def">${isEdit ? 'Update' : 'Create'}</button>
-        `);
+  bindPolicyWizardEvents() {
+    const { step, policy } = this.wizardState;
 
-        document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
-        document.getElementById('modal-save-tag-def').addEventListener('click', async () => {
-            const name = document.getElementById('tag-name').value.trim();
-            const color = document.getElementById('tag-color').value;
+    const cancelBtn = document.getElementById('wiz-btn-cancel');
+    if (cancelBtn) cancelBtn.addEventListener('click', () => this.closeModal());
 
-            if (!name) {
-                this.showToast('Tag name is required', 'warning');
-                return;
-            }
-
-            try {
-                if (isEdit) {
-                    await API.updateTag(tag.id, { name, color });
-                    this.showToast('Tag group updated', 'info');
-                } else {
-                    await API.createTag({ name, color });
-                    this.showToast('Tag group created', 'info');
-                }
-                this.closeModal();
-                await this.loadInitialData();
-            } catch (err) {
-                this.showToast(`Failed to save tag: ${err.message}`, 'error');
-            }
-        });
+    const backBtn = document.getElementById('wiz-btn-back');
+    if (backBtn) {
+      backBtn.addEventListener('click', () => {
+        this.wizardState.step--;
+        this.renderPolicyWizardStep();
+      });
     }
 
-    // =========================================================================
-    // 2. SCHEDULES VIEW & RULE BUILDER
-    // =========================================================================
-
-    renderSchedulesView(container) {
-        container.innerHTML = `
-            <div class="card">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-                    <div>
-                        <h3 style="font-size:18px; font-weight:700;">Time Schedules</h3>
-                        <p style="font-size:13px; color:var(--text-secondary);">Define automatic internet allowance and bedtime block windows</p>
-                    </div>
-                    <button class="btn btn-primary" id="btn-create-schedule">+ Create Schedule</button>
-                </div>
-                <div>
-                    ${this.schedules.length === 0 ? '<p style="color:var(--text-secondary); font-size:14px;">No schedules configured yet.</p>' : ''}
-                    ${this.schedules.map(s => `
-                        <div class="card" style="box-shadow:none; border:1px solid var(--separator); margin-bottom:14px; padding:16px;">
-                            <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">
-                                <div>
-                                    <h4 style="font-size:16px; font-weight:700;">${this.escapeHtml(s.name)}</h4>
-                                    <span style="font-size:12px; color:var(--text-secondary);">Timezone: ${this.escapeHtml(s.timezone || 'UTC')}</span>
-                                </div>
-                                <div style="display:flex; gap:8px;">
-                                    <button class="btn btn-secondary btn-edit-sched" data-sched-id="${s.id}" style="padding:6px 12px; font-size:12px;">Edit</button>
-                                    <button class="btn btn-danger btn-delete-sched" data-sched-id="${s.id}" style="padding:6px 12px; font-size:12px;">Delete</button>
-                                </div>
-                            </div>
-                            <div style="display:flex; flex-direction:column; gap:6px;">
-                                ${(s.rules || []).map(r => `
-                                    <div style="font-size:13px; background:var(--bg-tertiary); padding:8px 12px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;">
-                                        <span><strong>${(r.days || []).join(', ').toUpperCase()}:</strong> ${r.start_time} - ${r.end_time}</span>
-                                        <span class="group-tag-badge" style="background-color:${r.action === 'allow' ? 'var(--success)' : 'var(--danger)'}; padding:2px 8px; font-size:10px;">${r.action.toUpperCase()}</span>
-                                    </div>
-                                `).join('')}
-                            </div>
-                        </div>
-                    `).join('')}
-                </div>
-            </div>
-        `;
-
-        document.getElementById('btn-create-schedule').addEventListener('click', () => this.openScheduleModal());
-
-        container.querySelectorAll('.btn-edit-sched').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const schedId = e.currentTarget.dataset.schedId;
-                const sched = this.schedules.find(s => s.id === schedId);
-                if (sched) this.openScheduleModal(sched);
-            });
+    if (step === 1) {
+      const typeSel = document.getElementById('wiz-type');
+      if (typeSel) {
+        typeSel.addEventListener('change', (e) => {
+          policy.type = e.target.value;
+          document.getElementById('wiz-target-container').innerHTML = this.renderWizardTargetDropdown(policy.type, policy.target_id);
         });
+      }
 
-        // Replaced Primitive confirm() with Apple HIG Sheet & Impact Transparency for Schedule Deletion
-        container.querySelectorAll('.btn-delete-sched').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const schedId = e.currentTarget.dataset.schedId;
-                const sched = this.schedules.find(s => s.id === schedId);
-                const schedName = sched ? sched.name : schedId;
+      const nextBtn = document.getElementById('wiz-btn-next');
+      if (nextBtn) {
+        nextBtn.addEventListener('click', () => {
+          const nameInput = document.getElementById('wiz-name');
+          if (!nameInput.value.trim()) {
+            this.showToast('Please enter a policy name', 'danger');
+            return;
+          }
+          policy.name = nameInput.value.trim();
+          const targetSel = document.getElementById('wiz-target');
+          policy.target_id = targetSel ? targetSel.value : '';
 
-                // Query all active policies currently attached to this schedule
-                const affectedPolicies = this.policies.filter(p => p.schedule_id === schedId);
-
-                let impactHtml = '';
-                if (affectedPolicies.length > 0) {
-                    impactHtml = `
-                        <div class="hig-callout-warning">
-                            <strong>⚠️ Active Policy Impact Warning:</strong>
-                            <p style="margin-top:4px;">Deleting <strong>'${this.escapeHtml(schedName)}'</strong> will affect ${affectedPolicies.length} active policy rule(s):</p>
-                            <ul>
-                                ${affectedPolicies.map(p => `<li><strong>${this.escapeHtml(p.name)}</strong> (${this.escapeHtml(this.getPolicyTargetLabel(p))})</li>`).join('')}
-                            </ul>
-                            <p style="margin-top:6px; font-weight:600;">These policies will fail-closed (BLOCK ALL access) until reassigned to a new schedule.</p>
-                        </div>
-                    `;
-                }
-
-                this.openConfirmModal({
-                    title: 'Delete Schedule',
-                    message: `Are you sure you want to delete time schedule '${this.escapeHtml(schedName)}'? ${impactHtml}`,
-                    confirmText: 'Delete Schedule',
-                    confirmDanger: true,
-                    onConfirm: async () => {
-                        try {
-                            await API.deleteSchedule(schedId);
-                            this.showToast('Schedule deleted', 'info');
-                            await this.loadInitialData();
-                        } catch (err) {
-                            this.showToast(`Failed to delete schedule: ${err.message}`, 'error');
-                        }
-                    }
-                });
-            });
+          this.wizardState.step = 2;
+          this.renderPolicyWizardStep();
         });
+      }
+    } else if (step === 2) {
+      const nextBtn = document.getElementById('wiz-btn-next');
+      if (nextBtn) {
+        nextBtn.addEventListener('click', () => {
+          const actionSel = document.getElementById('wiz-action');
+          const prioInput = document.getElementById('wiz-priority');
+          policy.action = actionSel.value;
+          policy.priority = parseInt(prioInput.value, 10) || 50;
+
+          if (policy.action !== 'schedule') {
+            policy.schedule_ids = [];
+            this.savePolicyFromWizard();
+          } else {
+            this.wizardState.step = 3;
+            this.renderPolicyWizardStep();
+          }
+        });
+      }
+    } else if (step === 3) {
+      document.querySelectorAll('.wiz-sched-checkbox').forEach(chk => {
+        chk.addEventListener('change', () => {
+          const selected = Array.from(document.querySelectorAll('.wiz-sched-checkbox:checked')).map(c => c.value);
+          policy.schedule_ids = selected;
+
+          const selectedScheds = selected.map(id => this.schedules.find(s => s.id === id)).filter(Boolean);
+          document.getElementById('wiz-timeline-container').innerHTML = this.renderWeeklyTimeline(selectedScheds);
+        });
+      });
+
+      const saveBtn = document.getElementById('wiz-btn-save');
+      if (saveBtn) {
+        saveBtn.addEventListener('click', () => this.savePolicyFromWizard());
+      }
     }
+  }
 
-    openScheduleModal(schedule = null) {
-        const isEdit = !!schedule;
-        let rules = isEdit && schedule.rules ? JSON.parse(JSON.stringify(schedule.rules)) : [
-            { days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_time: '22:00', end_time: '06:00', action: 'block' }
-        ];
-
-        const renderRulesEditor = () => {
-            return rules.map((r, idx) => `
-                <div style="background:var(--bg-tertiary); padding:14px; border-radius:12px; border:1px solid var(--separator); margin-bottom:12px;">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                        <span style="font-size:12px; font-weight:700;">Rule #${idx + 1}</span>
-                        ${rules.length > 1 ? `<button type="button" class="btn btn-danger btn-remove-rule" data-idx="${idx}" style="padding:2px 6px; font-size:11px;">Remove</button>` : ''}
-                    </div>
-                    <div style="margin-bottom:8px;">
-                        <label style="display:block; font-size:11px; font-weight:600; margin-bottom:4px;">Days Active</label>
-                        <div class="day-chip-group">
-                            ${['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].map(day => `
-                                <div class="day-chip ${r.days.includes(day) ? 'selected' : ''}" data-rule-idx="${idx}" data-day="${day}">${day.toUpperCase()}</div>
-                            `).join('')}
-                        </div>
-                    </div>
-                    <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px; align-items:center;">
-                        <div>
-                            <label style="display:block; font-size:11px; font-weight:600; margin-bottom:2px;">Start Time</label>
-                            <input type="time" class="rule-start" data-rule-idx="${idx}" value="${r.start_time}" style="width:100%;">
-                        </div>
-                        <div>
-                            <label style="display:block; font-size:11px; font-weight:600; margin-bottom:2px;">End Time</label>
-                            <input type="time" class="rule-end" data-rule-idx="${idx}" value="${r.end_time}" style="width:100%;">
-                        </div>
-                        <div>
-                            <label style="display:block; font-size:11px; font-weight:600; margin-bottom:2px;">Action</label>
-                            <select class="rule-action" data-rule-idx="${idx}" style="width:100%; padding:9px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-secondary); color:var(--text-primary); font-size:13px;">
-                                <option value="block" ${r.action === 'block' ? 'selected' : ''}>BLOCK</option>
-                                <option value="allow" ${r.action === 'allow' ? 'selected' : ''}>ALLOW</option>
-                            </select>
-                        </div>
-                    </div>
-                </div>
-            `).join('');
-        };
-
-        const updateModalBody = () => {
-            const bodyHtml = `
-                <form id="form-schedule">
-                    <div style="margin-bottom:14px;">
-                        <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Schedule Name</label>
-                        <input type="text" id="sched-name" value="${isEdit ? this.escapeHtml(schedule.name) : ''}" placeholder="e.g. Bedtime Curfew" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);" required>
-                    </div>
-                    <div style="margin-bottom:14px;">
-                        <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Timezone</label>
-                        <select id="sched-tz" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
-                            <option value="UTC" ${isEdit && schedule.timezone === 'UTC' ? 'selected' : ''}>UTC</option>
-                            <option value="America/Los_Angeles" ${isEdit && schedule.timezone === 'America/Los_Angeles' ? 'selected' : ''}>America/Los_Angeles (PT)</option>
-                            <option value="America/New_York" ${isEdit && schedule.timezone === 'America/New_York' ? 'selected' : ''}>America/New_York (ET)</option>
-                            <option value="Europe/London" ${isEdit && schedule.timezone === 'Europe/London' ? 'selected' : ''}>Europe/London (GMT/BST)</option>
-                            <option value="Asia/Tokyo" ${isEdit && schedule.timezone === 'Asia/Tokyo' ? 'selected' : ''}>Asia/Tokyo (JST)</option>
-                        </select>
-                    </div>
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                        <label style="font-size:13px; font-weight:600;">Time Windows</label>
-                        <button type="button" class="btn btn-secondary" id="btn-add-rule-window" style="padding:4px 10px; font-size:11px;">+ Add Window</button>
-                    </div>
-                    <div id="rules-container">${renderRulesEditor()}</div>
-                </form>
-            `;
-
-            document.getElementById('modal-body').innerHTML = bodyHtml;
-            bindRuleEvents();
-        };
-
-        const bindRuleEvents = () => {
-            document.querySelectorAll('.day-chip').forEach(chip => {
-                chip.addEventListener('click', (e) => {
-                    const ruleIdx = parseInt(e.currentTarget.dataset.ruleIdx, 10);
-                    const day = e.currentTarget.dataset.day;
-
-                    if (rules[ruleIdx].days.includes(day)) {
-                        rules[ruleIdx].days = rules[ruleIdx].days.filter(d => d !== day);
-                    } else {
-                        rules[ruleIdx].days.push(day);
-                    }
-                    updateModalBody();
-                });
-            });
-
-            document.querySelectorAll('.rule-start').forEach(input => {
-                input.addEventListener('change', (e) => {
-                    const idx = parseInt(e.target.dataset.ruleIdx, 10);
-                    rules[idx].start_time = e.target.value;
-                });
-            });
-
-            document.querySelectorAll('.rule-end').forEach(input => {
-                input.addEventListener('change', (e) => {
-                    const idx = parseInt(e.target.dataset.ruleIdx, 10);
-                    rules[idx].end_time = e.target.value;
-                });
-            });
-
-            document.querySelectorAll('.rule-action').forEach(select => {
-                select.addEventListener('change', (e) => {
-                    const idx = parseInt(e.target.dataset.ruleIdx, 10);
-                    rules[idx].action = e.target.value;
-                });
-            });
-
-            document.querySelectorAll('.btn-remove-rule').forEach(btn => {
-                btn.addEventListener('click', (e) => {
-                    const idx = parseInt(e.currentTarget.dataset.idx, 10);
-                    rules.splice(idx, 1);
-                    updateModalBody();
-                });
-            });
-
-            const addWindowBtn = document.getElementById('btn-add-rule-window');
-            if (addWindowBtn) {
-                addWindowBtn.addEventListener('click', () => {
-                    rules.push({ days: ['sat', 'sun'], start_time: '12:00', end_time: '18:00', action: 'allow' });
-                    updateModalBody();
-                });
-            }
-        };
-
-        this.openModal(isEdit ? 'Edit Schedule' : 'Create Schedule', '', `
-            <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
-            <button class="btn btn-primary" id="modal-save-sched">${isEdit ? 'Update' : 'Create'}</button>
-        `);
-
-        updateModalBody();
-
-        document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
-        document.getElementById('modal-save-sched').addEventListener('click', async () => {
-            const name = document.getElementById('sched-name').value.trim();
-            const timezone = document.getElementById('sched-tz').value;
-
-            if (!name) {
-                this.showToast('Schedule name is required', 'warning');
-                return;
-            }
-
-            try {
-                const payload = {
-                    id: isEdit ? schedule.id : undefined,
-                    name,
-                    timezone,
-                    rules
-                };
-                await API.saveSchedule(payload);
-                this.showToast('Schedule saved successfully', 'info');
-                this.closeModal();
-                await this.loadInitialData();
-            } catch (err) {
-                this.showToast(`Failed to save schedule: ${err.message}`, 'error');
-            }
-        });
+  async savePolicyFromWizard() {
+    try {
+      await API.savePolicy(this.wizardState.policy);
+      this.showToast('Policy saved successfully');
+      this.closeModal();
+      this.loadData();
+    } catch (err) {
+      this.showToast(`Failed to save policy: ${err.message}`, 'danger');
     }
+  }
 
-    // =========================================================================
-    // 3. POLICIES VIEW
-    // =========================================================================
+  // Schedule Modal with Continuous Range & Overnight Chip
+  openScheduleModal(existingSchedule = null) {
+    const s = existingSchedule ? JSON.parse(JSON.stringify(existingSchedule)) : {
+      name: '',
+      mode: 'downtime',
+      timezone: 'UTC',
+      rules: [{ days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_time: '22:00', end_time: '06:00', action: 'block' }]
+    };
 
-    renderPoliciesView(container) {
-        container.innerHTML = `
-            <div class="card">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-                    <div>
-                        <h3 style="font-size:18px; font-weight:700;">Firewall Rule Policies</h3>
-                        <p style="font-size:13px; color:var(--text-secondary);">Manage Precedence Hierarchy (Infrastructure > Global > Device > Tag)</p>
-                    </div>
-                    <button class="btn btn-primary" id="btn-create-policy">+ Create Policy Rule</button>
-                </div>
-                <div>
-                    ${this.policies.length === 0 ? '<p style="color:var(--text-secondary); font-size:14px;">No custom policies configured.</p>' : ''}
-                    ${this.policies.map(p => {
-                        const targetLabel = this.getPolicyTargetLabel(p);
-                        const scheduleSummary = p.schedule_id ? this.getScheduleSummary(p.schedule_id) : '';
-                        const isMissingSched = p.action === 'schedule' && p.schedule_id && !this.schedules.some(s => s.id === p.schedule_id);
+    const bodyHtml = `
+      <div style="display:flex; flex-direction:column; gap:16px;">
+        <div>
+          <label style="font-size:12px; font-weight:700;">Schedule Name</label>
+          <input type="text" id="sched-name" value="${s.name}" placeholder="e.g. Bedtime Schedule" style="width:100%; margin-top:4px;">
+        </div>
+        <div>
+          <label style="font-size:12px; font-weight:700;">Schedule Mode</label>
+          <select id="sched-mode" style="width:100%; margin-top:4px;">
+            <option value="downtime" ${s.mode === 'downtime' ? 'selected' : ''}>Downtime Mode (Rules BLOCK, Default ALLOW)</option>
+            <option value="whitelist" ${s.mode === 'whitelist' ? 'selected' : ''}>Whitelist Mode (Rules ALLOW, Default BLOCK)</option>
+          </select>
+        </div>
+        <div>
+          <label style="font-size:12px; font-weight:700;">Timezone</label>
+          <input type="text" id="sched-tz" value="${s.timezone || 'UTC'}" placeholder="e.g. UTC, America/Los_Angeles" style="width:100%; margin-top:4px;">
+        </div>
 
-                        return `
-                            <div class="card" style="box-shadow:none; border:1px solid var(--separator); margin-bottom:12px; padding:16px;">
-                                <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                                    <div>
-                                        <h4 style="font-size:15px; font-weight:700;">${this.escapeHtml(p.name)}</h4>
-                                        <div style="font-size:12px; color:var(--text-secondary); margin-top:3px;">
-                                            Type: <strong>${p.type.toUpperCase()}</strong> | Target: <strong>${this.escapeHtml(targetLabel)}</strong> | Priority: ${p.priority}
-                                        </div>
-                                        ${scheduleSummary ? `
-                                            <div style="font-size:12px; color:${isMissingSched ? 'var(--danger)' : 'var(--accent)'}; margin-top:6px; font-weight:600;">
-                                                📅 ${this.escapeHtml(scheduleSummary)}
-                                            </div>
-                                        ` : ''}
-                                    </div>
-                                    <div style="display:flex; align-items:center; gap:10px;">
-                                        <span class="group-tag-badge ${isMissingSched ? 'badge-missing-sched' : ''}" style="background-color:${p.action === 'allow' ? 'var(--success)' : (p.action === 'block' ? 'var(--danger)' : 'var(--accent)')};">
-                                            ${p.action.toUpperCase()}
-                                        </span>
-                                        ${p.id !== 'global_default' ? `
-                                            <button class="btn btn-danger btn-delete-policy" data-policy-id="${p.id}" style="padding:4px 8px; font-size:11px;">Delete</button>
-                                        ` : ''}
-                                    </div>
-                                </div>
-                            </div>
-                        `;
-                    }).join('')}
-                </div>
-            </div>
-        `;
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
+          <label style="font-size:14px; font-weight:700;">Time Window Rules</label>
+          <button class="btn btn-secondary" id="btn-add-rule">+ Add Rule</button>
+        </div>
 
-        document.getElementById('btn-create-policy').addEventListener('click', () => this.openPolicyModal());
+        <div id="sched-rules-container" style="display:flex; flex-direction:column; gap:12px; max-height:240px; overflow-y:auto;">
+          ${s.rules.map((r, idx) => this.renderScheduleRuleRow(r, idx)).join('')}
+        </div>
+      </div>
+    `;
 
-        // Replaced Primitive confirm() with Apple HIG Sheet for Policy Deletion
-        container.querySelectorAll('.btn-delete-policy').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const polId = e.currentTarget.dataset.policyId;
-                const pol = this.policies.find(p => p.id === polId);
-                const polName = pol ? pol.name : polId;
+    this.openModal(s.id ? 'Edit Schedule' : 'New Schedule', bodyHtml, `
+      <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+      <button class="btn btn-primary" id="modal-save-sched">Save Schedule</button>
+    `);
 
-                this.openConfirmModal({
-                    title: 'Delete Policy Rule',
-                    message: `Are you sure you want to delete policy rule '${this.escapeHtml(polName)}'? Targets matching this rule will revert to global default policy.`,
-                    confirmText: 'Delete Policy',
-                    confirmDanger: true,
-                    onConfirm: async () => {
-                        try {
-                            await API.deletePolicy(polId);
-                            this.showToast('Policy deleted', 'info');
-                            await this.loadInitialData();
-                        } catch (err) {
-                            this.showToast(`Failed to delete policy: ${err.message}`, 'error');
-                        }
-                    }
-                });
-            });
-        });
-    }
+    this.bindScheduleModalEvents(s);
+  }
 
-    openPolicyModal() {
-        const bodyHtml = `
-            <form id="form-policy">
-                <div style="margin-bottom:14px;">
-                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Policy Name</label>
-                    <input type="text" id="pol-name" placeholder="e.g. Block Kids Gaming Bedtime" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);" required>
-                </div>
-                <div style="margin-bottom:14px;">
-                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Policy Type Scope</label>
-                    <select id="pol-type" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
-                        <option value="tag">Tag Group Policy</option>
-                        <option value="device">Single Device Policy</option>
-                    </select>
-                </div>
-                <div style="margin-bottom:14px;" id="target-container">
-                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Target Tag Group</label>
-                    <select id="pol-target" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
-                        ${this.tags.map(t => `<option value="${t.id}">${this.escapeHtml(t.name)}</option>`).join('')}
-                    </select>
-                </div>
-                <div style="margin-bottom:14px;">
-                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Enforcement Action</label>
-                    <select id="pol-action" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
-                        <option value="schedule">Schedule Driven</option>
-                        <option value="block">BLOCK Always</option>
-                        <option value="allow">ALLOW Always</option>
-                    </select>
-                </div>
-                <div style="margin-bottom:14px;" id="sched-select-container">
-                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Select Schedule</label>
-                    <select id="pol-sched-id" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
-                        ${this.schedules.map(s => `<option value="${s.id}">${this.escapeHtml(s.name)} (${(s.rules || []).length} rules)</option>`).join('')}
-                    </select>
-                </div>
-            </form>
-        `;
+  renderScheduleRuleRow(rule, idx) {
+    const isOvernight = rule.start_time && rule.end_time && rule.end_time <= rule.start_time;
 
-        this.openModal('Create Policy Rule', bodyHtml, `
-            <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
-            <button class="btn btn-primary" id="modal-save-pol">Create Policy</button>
-        `);
+    return `
+      <div class="card rule-row" data-idx="${idx}" style="padding:12px; margin-bottom:0; background:var(--bg-tertiary);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+          <strong style="font-size:12px;">Rule #${idx + 1}</strong>
+          <button class="btn btn-danger btn-remove-rule" data-idx="${idx}" style="padding:4px 8px; font-size:11px;">Remove</button>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+          <input type="time" class="rule-start" value="${rule.start_time}" style="flex:1;">
+          <span>to</span>
+          <input type="time" class="rule-end" value="${rule.end_time}" style="flex:1;">
+          <select class="rule-action" style="flex:1;">
+            <option value="block" ${rule.action === 'block' ? 'selected' : ''}>Block</option>
+            <option value="allow" ${rule.action === 'allow' ? 'selected' : ''}>Allow</option>
+          </select>
+        </div>
+        <div class="day-chip-group">
+          ${['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'].map(day => {
+            const sel = (rule.days || []).map(d => d.toLowerCase().substring(0, 3)).includes(day);
+            return `<div class="day-chip ${sel ? 'selected' : ''}" data-day="${day}">${day.toUpperCase()}</div>`;
+          }).join('')}
+        </div>
+        ${isOvernight ? `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${rule.end_time} the FOLLOWING day</div>` : ''}
+      </div>
+    `;
+  }
 
-        const typeSelect = document.getElementById('pol-type');
-        const targetContainer = document.getElementById('target-container');
+  bindScheduleModalEvents(s) {
+    document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
 
-        typeSelect.addEventListener('change', (e) => {
-            if (e.target.value === 'device') {
-                targetContainer.innerHTML = `
-                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Target Device</label>
-                    <select id="pol-target" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
-                        ${this.devices.map(d => `<option value="${d.pdid}">${this.escapeHtml(this.getDisplayName(d))}</option>`).join('')}
-                    </select>
-                `;
-            } else {
-                targetContainer.innerHTML = `
-                    <label style="display:block; font-size:13px; font-weight:600; margin-bottom:4px;">Target Tag Group</label>
-                    <select id="pol-target" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--separator); background:var(--bg-tertiary); color:var(--text-primary);">
-                        ${this.tags.map(t => `<option value="${t.id}">${this.escapeHtml(t.name)}</option>`).join('')}
-                    </select>
-                `;
-            }
-        });
+    document.querySelectorAll('.day-chip').forEach(chip => {
+      chip.addEventListener('click', (e) => {
+        e.currentTarget.classList.toggle('selected');
+      });
+    });
 
-        const actionSelect = document.getElementById('pol-action');
-        const schedContainer = document.getElementById('sched-select-container');
+    document.querySelectorAll('.rule-start, .rule-end').forEach(input => {
+      input.addEventListener('change', () => {
+        const row = input.closest('.rule-row');
+        const start = row.querySelector('.rule-start').value;
+        const end = row.querySelector('.rule-end').value;
+        let chip = row.querySelector('.overnight-chip');
 
-        actionSelect.addEventListener('change', (e) => {
-            schedContainer.style.display = e.target.value === 'schedule' ? 'block' : 'none';
-        });
-
-        document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
-        document.getElementById('modal-save-pol').addEventListener('click', async () => {
-            const name = document.getElementById('pol-name').value.trim();
-            const type = document.getElementById('pol-type').value;
-            const target_id = document.getElementById('pol-target').value;
-            const action = document.getElementById('pol-action').value;
-            const schedule_id = action === 'schedule' ? document.getElementById('pol-sched-id').value : undefined;
-
-            if (!name) {
-                this.showToast('Policy name is required', 'warning');
-                return;
-            }
-
-            try {
-                await API.savePolicy({
-                    name,
-                    type,
-                    target_id,
-                    action,
-                    schedule_id,
-                    priority: type === 'device' ? 80 : 50
-                });
-                this.showToast('Policy created', 'info');
-                this.closeModal();
-                await this.loadInitialData();
-            } catch (err) {
-                this.showToast(`Failed to create policy: ${err.message}`, 'error');
-            }
-        });
-    }
-
-    // =========================================================================
-    // 4. SETTINGS & MAINTENANCE VIEW
-    // =========================================================================
-
-    renderSettingsView(container) {
-        container.innerHTML = `
-            <div class="card">
-                <h3 style="font-size:18px; font-weight:700; margin-bottom:12px;">System Architecture & Status</h3>
-                <p style="font-size:13px; color:var(--text-secondary); margin-bottom:20px;">
-                    LIAS is operating in isolated Netdev Ingress mode on <strong>eth0</strong>. All firewall filtering is executed directly in kernel space without altering routing tables or system sing-box rules.
-                </p>
-
-                <div style="display:flex; flex-direction:column; gap:12px;">
-                    <div style="display:flex; justify-content:space-between; align-items:center; padding:12px; background:var(--bg-tertiary); border-radius:10px;">
-                        <div>
-                            <strong>Flush Nftables Kernel Sets</strong>
-                            <p style="font-size:12px; color:var(--text-secondary);">Removes all active allowed and blocked IP/MAC sets from netdev lancontrol table.</p>
-                        </div>
-                        <button class="btn btn-danger" id="btn-flush-nftables">Flush Table</button>
-                    </div>
-
-                    <div style="display:flex; justify-content:space-between; align-items:center; padding:12px; background:var(--bg-tertiary); border-radius:10px;">
-                        <div>
-                            <strong>Resync DIS Inventory</strong>
-                            <p style="font-size:12px; color:var(--text-secondary);">Force an immediate REST polling resync from Discovery Intelligence Service (:8080).</p>
-                        </div>
-                        <button class="btn btn-secondary" id="btn-force-resync">Force Resync</button>
-                    </div>
-                </div>
-            </div>
-        `;
-
-        // Replaced Primitive confirm() with Apple HIG Sheet for Firewall Flushing
-        document.getElementById('btn-flush-nftables').addEventListener('click', () => {
-            this.openConfirmModal({
-                title: 'Flush Firewall Table',
-                message: 'Are you sure you want to flush the netdev lancontrol nftables table? Active allowed and blocked kernel set elements will be wiped until the next 10-second sync loop.',
-                confirmText: 'Flush Firewall',
-                confirmDanger: true,
-                onConfirm: async () => {
-                    try {
-                        await API.flushNftables();
-                        this.showToast('nftables table flushed successfully', 'info');
-                    } catch (err) {
-                        this.showToast(`Failed to flush nftables: ${err.message}`, 'error');
-                    }
-                }
-            });
-        });
-
-        document.getElementById('btn-force-resync').addEventListener('click', async () => {
-            this.showToast('Triggering DIS inventory resync...', 'info');
-            await this.loadInitialData();
-            this.showToast('Inventory resync complete', 'info');
-        });
-    }
-
-    // =========================================================================
-    // 5. MODAL, HIG CONFIRMATION SHEET, & TOAST HELPERS
-    // =========================================================================
-
-    /**
-     * Native Apple HIG Confirmation Sheet replacement for browser confirm() popups.
-     */
-    openConfirmModal({ title, message, confirmText, confirmDanger = false, onConfirm }) {
-        const bodyHtml = `<div style="font-size:14px; line-height:1.5; color:var(--text-primary);">${message}</div>`;
-        const footerHtml = `
-            <button class="btn btn-secondary" id="modal-confirm-cancel">Cancel</button>
-            <button class="btn ${confirmDanger ? 'btn-danger' : 'btn-primary'}" id="modal-confirm-ok">${this.escapeHtml(confirmText || 'Confirm')}</button>
-        `;
-
-        this.openModal(title, bodyHtml, footerHtml);
-
-        document.getElementById('modal-confirm-cancel').addEventListener('click', () => this.closeModal());
-        document.getElementById('modal-confirm-ok').addEventListener('click', async () => {
-            this.closeModal();
-            if (onConfirm) await onConfirm();
-        });
-    }
-
-    openModal(title, bodyHtml, footerHtml) {
-        const root = document.getElementById('modal-root');
-        const titleEl = document.getElementById('modal-title');
-        const bodyEl = document.getElementById('modal-body');
-        const footerEl = document.getElementById('modal-footer');
-
-        if (!root || !titleEl || !bodyEl || !footerEl) return;
-
-        titleEl.textContent = title;
-        bodyEl.innerHTML = bodyHtml;
-        footerEl.innerHTML = footerHtml;
-
-        root.classList.remove('hidden');
-    }
-
-    closeModal() {
-        const root = document.getElementById('modal-root');
-        if (root) {
-            root.classList.add('hidden');
+        if (start && end && end <= start) {
+          if (!chip) {
+            chip = document.createElement('div');
+            chip.className = 'overnight-chip moon';
+            row.appendChild(chip);
+          }
+          chip.textContent = `🌙 Continues past midnight — ends ${end} the FOLLOWING day`;
+        } else if (chip) {
+          chip.remove();
         }
-    }
+      });
+    });
 
-    showToast(message, type = 'info') {
-        const root = document.getElementById('toast-root');
-        if (!root) return;
+    document.getElementById('modal-save-sched').addEventListener('click', async () => {
+      const name = document.getElementById('sched-name').value.trim();
+      if (!name) {
+        this.showToast('Schedule name is required', 'danger');
+        return;
+      }
 
-        const toast = document.createElement('div');
-        toast.className = 'toast';
-        if (type === 'error') {
-            toast.style.borderLeft = '4px solid var(--danger)';
-        } else if (type === 'warning') {
-            toast.style.borderLeft = '4px solid var(--warning)';
+      const mode = document.getElementById('sched-mode').value;
+      const timezone = document.getElementById('sched-tz').value.trim() || 'UTC';
+
+      const rules = [];
+      document.querySelectorAll('.rule-row').forEach(row => {
+        const start = row.querySelector('.rule-start').value;
+        const end = row.querySelector('.rule-end').value;
+        const action = row.querySelector('.rule-action').value;
+        const days = Array.from(row.querySelectorAll('.day-chip.selected')).map(c => c.dataset.day);
+
+        if (start && end && days.length > 0) {
+          rules.push({ days, start_time: start, end_time: end, action });
+        }
+      });
+
+      s.name = name;
+      s.mode = mode;
+      s.timezone = timezone;
+      s.rules = rules;
+
+      try {
+        await API.saveSchedule(s);
+        this.showToast('Schedule saved successfully');
+        this.closeModal();
+        this.loadData();
+      } catch (err) {
+        this.showToast(`Failed to save schedule: ${err.message}`, 'danger');
+      }
+    });
+  }
+
+  renderSettingsView(container) {
+    container.innerHTML = `
+      <div class="card">
+        <h3>System Maintenance</h3>
+        <p style="font-size:13px; color:var(--text-secondary); margin-top:4px;">Manage underlying netfilter tables and DIS service connections.</p>
+        <div style="margin-top:16px;">
+          <button class="btn btn-danger" id="btn-flush-nft">Flush Nftables Lancontrol Table</button>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('btn-flush-nft').addEventListener('click', async () => {
+      if (confirm('Are you sure you want to flush all nftables netdev rules? LIAS will rebuild them on next sync.')) {
+        try {
+          await API.flushNftables();
+          this.showToast('Nftables table flushed successfully');
+        } catch (err) {
+          this.showToast(`Flush failed: ${err.message}`, 'danger');
+        }
+      }
+    });
+  }
+
+  openTagModal(existingTag = null) {
+    const t = existingTag || { name: '', color: '#0071e3' };
+    this.openModal(existingTag ? 'Edit Tag Group' : 'New Tag Group', `
+      <div style="display:flex; flex-direction:column; gap:16px;">
+        <div>
+          <label style="font-size:12px; font-weight:700;">Tag Name</label>
+          <input type="text" id="tag-name" value="${t.name}" placeholder="e.g. Smart TVs" style="width:100%; margin-top:4px;">
+        </div>
+        <div>
+          <label style="font-size:12px; font-weight:700;">Badge Color</label>
+          <input type="color" id="tag-color" value="${t.color}" style="width:100%; height:40px; border:none; cursor:pointer; margin-top:4px;">
+        </div>
+      </div>
+    `, `
+      <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+      <button class="btn btn-primary" id="modal-save-tag">Save Tag</button>
+    `);
+
+    document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
+    document.getElementById('modal-save-tag').addEventListener('click', async () => {
+      const name = document.getElementById('tag-name').value.trim();
+      const color = document.getElementById('tag-color').value;
+      if (!name) {
+        this.showToast('Tag name required', 'danger');
+        return;
+      }
+
+      try {
+        if (existingTag) {
+          await API.updateTag(existingTag.id, name, color);
         } else {
-            toast.style.borderLeft = '4px solid var(--accent)';
+          await API.createTag(name, color);
         }
+        this.showToast('Tag saved');
+        this.closeModal();
+        this.loadData();
+      } catch (err) {
+        this.showToast(`Failed: ${err.message}`, 'danger');
+      }
+    });
+  }
 
-        toast.textContent = message;
-        root.appendChild(toast);
+  openModal(title, bodyHtml, footerHtml = '') {
+    document.getElementById('modal-title').textContent = title;
+    document.getElementById('modal-body').innerHTML = bodyHtml;
+    document.getElementById('modal-footer').innerHTML = footerHtml;
+    document.getElementById('modal-root').classList.remove('hidden');
+  }
 
-        setTimeout(() => {
-            toast.remove();
-        }, 3500);
-    }
+  closeModal() {
+    document.getElementById('modal-root').classList.add('hidden');
+  }
 
-    escapeHtml(str) {
-        if (!str) return '';
-        return String(str)
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;');
-    }
+  showToast(msg, type = 'info') {
+    const root = document.getElementById('toast-root');
+    if (!root) return;
+    const toast = document.createElement('div');
+    toast.className = 'toast';
+    if (type === 'danger') toast.style.backgroundColor = 'var(--danger)';
+    toast.textContent = msg;
+    root.appendChild(toast);
+    setTimeout(() => toast.remove(), 4000);
+  }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    window.app = new AppController();
+  window.app = new App();
 });
