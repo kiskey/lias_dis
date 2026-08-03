@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/debounce.go
-// Version: 2.3
+// Version: 2.4
 package correlation
 
 import (
@@ -17,13 +17,11 @@ import (
     "github.com/user/lias-dis/shared/models"
 )
 
-// PendingEventStore defines the interface for persisting pending events.
 type PendingEventStore interface {
     SavePendingEvent(pdid, eventType string, payload []byte, firstSeen, lastSeen time.Time, confirmations int, sources string) error
     DeletePendingEvent(pdid, eventType string) error
 }
 
-// PendingChange tracks a state change awaiting confirmation before broadcast.
 type PendingChange struct {
     PDID                  string
     EventType             models.EventType
@@ -37,17 +35,15 @@ type PendingChange struct {
     ConfirmedBy           []string
 }
 
-// Debouncer manages coalescing, confirmation windows, and revert suppression for events.
 type Debouncer struct {
     mu            sync.Mutex
     broker        *api.Broker
     store         PendingEventStore
-    pending       map[string]*PendingChange // Key: pdid + ":" + event_type
-    recentValues  map[string]string         // Key: pdid + ":" + field -> recent value for revert suppression
+    pending       map[string]*PendingChange
+    recentValues  map[string]string
     recentValTime map[string]time.Time
 }
 
-// NewDebouncer initializes the event debouncer.
 func NewDebouncer(broker *api.Broker) *Debouncer {
     return &Debouncer{
         broker:        broker,
@@ -57,14 +53,12 @@ func NewDebouncer(broker *api.Broker) *Debouncer {
     }
 }
 
-// SetStore attaches a storage backend for crash recovery.
 func (d *Debouncer) SetStore(store PendingEventStore) {
     d.mu.Lock()
     defer d.mu.Unlock()
     d.store = store
 }
 
-// LoadPending loads pending events from storage into memory on startup.
 func (d *Debouncer) LoadPending(records []PendingEventRecord) {
     d.mu.Lock()
     defer d.mu.Unlock()
@@ -77,7 +71,8 @@ func (d *Debouncer) LoadPending(records []PendingEventRecord) {
 
         reqConf := 1
         evtType := models.EventType(r.EventType)
-        if evtType == models.EventHostnameChanged || evtType == models.EventMACChanged || evtType == models.EventDeviceOnline {
+        // Gap 3 Fix: MAC Changed only requires 1 confirmation
+        if evtType == models.EventHostnameChanged || evtType == models.EventDeviceOnline {
             reqConf = 2
         }
 
@@ -105,8 +100,6 @@ func (d *Debouncer) LoadPending(records []PendingEventRecord) {
     }
 }
 
-// PendingEventRecord is duplicated here to avoid import cycles if storage imports correlation.
-// In practice, it's defined in storage and passed here.
 type PendingEventRecord struct {
     PDID          string
     EventType     string
@@ -117,7 +110,6 @@ type PendingEventRecord struct {
     Sources       string
 }
 
-// Run starts the 5-second coalescing flush loop.
 func (d *Debouncer) Run(ctx context.Context) {
     ticker := time.NewTicker(5 * time.Second)
     defer ticker.Stop()
@@ -132,7 +124,6 @@ func (d *Debouncer) Run(ctx context.Context) {
     }
 }
 
-// Submit receives a candidate state delta and applies confirmation/revert suppression rules (§7.2, §7.3).
 func (d *Debouncer) Submit(pdid string, eventType models.EventType, source string, group discovery.ProviderGroup, payload models.DeviceEventPayload) {
     d.mu.Lock()
     defer d.mu.Unlock()
@@ -140,7 +131,6 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
     now := time.Now()
     key := pdid + ":" + string(eventType)
 
-    // Revert Suppression check (§7.4)
     switch eventType {
     case models.EventHostnameChanged:
         valKey := pdid + ":hostname"
@@ -170,7 +160,8 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
     p, exists := d.pending[key]
     if !exists {
         reqConf := 1
-        if eventType == models.EventHostnameChanged || eventType == models.EventMACChanged || eventType == models.EventDeviceOnline {
+        // Gap 3 Fix: MAC Changed only requires 1 confirmation
+        if eventType == models.EventHostnameChanged || eventType == models.EventDeviceOnline {
             reqConf = 2
         }
 
@@ -205,7 +196,6 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
         p.Confirmations = len(p.Sources)
     }
 
-    // GAP-D11: Persist pending state for crash recovery
     if d.store != nil {
         payloadBytes, _ := json.Marshal(p.Payload)
         sourcesStr := strings.Join(p.ConfirmedBy, ",")
@@ -213,7 +203,6 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
     }
 }
 
-// Flush evaluates confirmed pending changes and broadcasts enriched events.
 func (d *Debouncer) Flush() {
     d.mu.Lock()
     defer d.mu.Unlock()
@@ -226,14 +215,12 @@ func (d *Debouncer) Flush() {
             d.broker.Broadcast(evt)
             delete(d.pending, key)
 
-            // GAP-D11: Remove from storage once broadcasted
             if d.store != nil {
                 _ = d.store.DeletePendingEvent(p.PDID, string(p.EventType))
             }
         }
     }
 
-    // Clean up stale revert suppression history
     for k, t := range d.recentValTime {
         if now.Sub(t) > 5*time.Minute {
             delete(d.recentValues, k)
