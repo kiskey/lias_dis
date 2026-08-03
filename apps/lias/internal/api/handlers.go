@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 2.0
+// Version: 2.1
 package api
 
 import (
@@ -302,6 +302,28 @@ type httpError struct {
 
 func (e httpError) Error() string { return e.msg }
 
+// toAPIConflicts converts scheduleconflict.Conflict to api.Conflict to satisfy the API response struct
+func toAPIConflicts(sc []scheduleconflict.Conflict) []api.Conflict {
+    if len(sc) == 0 {
+        return []api.Conflict{}
+    }
+    out := make([]api.Conflict, len(sc))
+    for i, c := range sc {
+        out[i] = api.Conflict{
+            ScheduleAID:   c.ScheduleAID,
+            ScheduleAName: c.ScheduleAName,
+            ScheduleBID:   c.ScheduleBID,
+            ScheduleBName: c.ScheduleBName,
+            Day:           c.Day,
+            OverlapStart:  c.OverlapStart,
+            OverlapEnd:    c.OverlapEnd,
+            ActionA:       c.ActionA,
+            ActionB:       c.ActionB,
+        }
+    }
+    return out
+}
+
 func (h *Handlers) ValidatePolicy(w http.ResponseWriter, r *http.Request) {
     var req api.PolicyValidateRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -327,12 +349,9 @@ func (h *Handlers) ValidatePolicy(w http.ResponseWriter, r *http.Request) {
     }
 
     _, conflicts, _ := scheduleconflict.MergeSchedules(scheds)
-    if conflicts == nil {
-        conflicts = []api.Conflict{}
-    }
 
     _ = json.NewEncoder(w).Encode(api.ConflictResponse{
-        Conflicts: conflicts,
+        Conflicts: toAPIConflicts(conflicts),
     })
 }
 
@@ -371,7 +390,7 @@ func (h *Handlers) CreatePolicy(w http.ResponseWriter, r *http.Request) {
         _ = json.NewEncoder(w).Encode(api.ConflictResponse{
             Error:     "schedule_conflict",
             Message:   "Attached schedules contain contradictory windows",
-            Conflicts: conflicts,
+            Conflicts: toAPIConflicts(conflicts),
         })
         return
     }
@@ -425,7 +444,7 @@ func (h *Handlers) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
         _ = json.NewEncoder(w).Encode(api.ConflictResponse{
             Error:     "schedule_conflict",
             Message:   "Attached schedules contain contradictory windows",
-            Conflicts: conflicts,
+            Conflicts: toAPIConflicts(conflicts),
         })
         return
     }
@@ -522,7 +541,7 @@ func (h *Handlers) CreateSchedule(w http.ResponseWriter, r *http.Request) {
         _ = json.NewEncoder(w).Encode(api.ConflictResponse{
             Error:     "schedule_conflict",
             Message:   "Schedule rules contain internal contradictory windows",
-            Conflicts: conflicts,
+            Conflicts: toAPIConflicts(conflicts),
         })
         return
     }
@@ -579,7 +598,7 @@ func (h *Handlers) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
         _ = json.NewEncoder(w).Encode(api.ConflictResponse{
             Error:     "schedule_conflict",
             Message:   "Schedule rules contain internal contradictory windows",
-            Conflicts: conflicts,
+            Conflicts: toAPIConflicts(conflicts),
         })
         return
     }
