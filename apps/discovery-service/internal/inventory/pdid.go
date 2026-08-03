@@ -1,28 +1,26 @@
 // Package inventory provides identity helpers for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/pdid.go
-// Version: 2.0
+// Version: 2.1
 package inventory
 
 import (
 	"net"
 	"strings"
 
+	"github.com/user/lias-dis/apps/discovery-service/internal/correlation"
 	"github.com/user/lias-dis/shared/models"
 )
 
-// GeneratePDID generates a tiered PDID using current canonical identity logic.
+// GeneratePDID generates a tiered PDID delegating to canonical tiered identity logic in correlation.
 func GeneratePDID(mac string, hostname string, vendor string) string {
-	cleanMAC := NormalizeMAC(mac)
-	cleanHost := strings.ToLower(strings.TrimSpace(hostname))
+	tier, anchor := correlation.DeriveTierAndAnchor(mac, hostname, vendor)
+	return correlation.GeneratePDID(tier, anchor)
+}
 
-	if cleanMAC != "" {
-		return "pdid_bia_" + cleanMAC[:6]
-	}
-	if cleanHost != "" {
-		return "pdid_l7_" + cleanHost
-	}
-	return "pdid_tent_" + models.FormatMAC(net.HardwareAddr(mac))
+// GenerateTieredPDID produces a tiered PDID directly using tier and anchor.
+func GenerateTieredPDID(tier models.IdentityTier, anchor string) string {
+	return correlation.GeneratePDID(tier, anchor)
 }
 
 // NormalizeMAC cleans and formats hardware addresses to colon-separated lowercase form.
