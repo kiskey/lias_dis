@@ -1,12 +1,11 @@
 // Package storage provides CGO-free SQLite persistence for DIS device state.
 //
 // File:    apps/discovery-service/internal/storage/sqlite.go
-// Version: 2.4
+// Version: 2.5
 package storage
 
 import (
     "database/sql"
-    "encoding/json"
     "fmt"
     "log/slog"
     "os"
