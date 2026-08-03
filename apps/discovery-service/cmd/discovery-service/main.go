@@ -1,7 +1,7 @@
 // Binary discovery-service implements the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 1.7
+// Version: 2.0
 package main
 
 import (
@@ -38,12 +38,10 @@ func main() {
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		// Fallback logger for load failure
 		slog.Error("Failed to load configuration", "error", err)
 		os.Exit(1)
 	}
 
-	// FIX: Wire slog handler AFTER parsing config settings
 	var level slog.Level
 	switch strings.ToLower(cfg.Logging.Level) {
 	case "debug":
@@ -68,7 +66,6 @@ func main() {
 	cache := inventory.NewCache()
 	defer cache.Stop()
 
-	// Initialize DIS SQLite storage engine
 	st, err := storage.NewStorage(cfg.Storage.Path)
 	if err != nil {
 		slog.Warn("DIS Storage initialization failed, running in memory-only mode", "error", err)
@@ -82,7 +79,8 @@ func main() {
 		}
 	}
 
-	broker := disAPI.NewBroker()
+	// Step 5 Fix: Pass Cache handle to Broker for SSE reconnect rehydration filtering
+	broker := disAPI.NewBroker(cache)
 	eng := correlation.NewEngine(cache, broker)
 	if st != nil {
 		eng.SetStorage(st)
@@ -156,7 +154,7 @@ func main() {
 		Addr:         cfg.HTTP.Listen,
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 0, // Unlimited write timeout for long-lived SSE streams
+		WriteTimeout: 0,
 		IdleTimeout:  120 * time.Second,
 	}
 
