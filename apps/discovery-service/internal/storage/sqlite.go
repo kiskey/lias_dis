@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for DIS device state.
 //
 // File:    apps/discovery-service/internal/storage/sqlite.go
-// Version: 2.0
+// Version: 2.1
 package storage
 
 import (
@@ -177,6 +177,57 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
 	return devices, nil
 }
 
+func (s *Storage) LoadHostnameOwners() (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query("SELECT canonical_hostname, pdid FROM hostname_owners")
+	if err != nil {
+		return nil, fmt.Errorf("failed to query hostname owners from DB: %w", err)
+	}
+	defer rows.Close()
+
+	owners := make(map[string]string)
+	for rows.Next() {
+		var host, pdid string
+		if err := rows.Scan(&host, &pdid); err == nil && host != "" {
+			owners[host] = pdid
+		}
+	}
+	return owners, nil
+}
+
+func (s *Storage) SaveHostnameOwner(canonicalHost, pdid string) error {
+	if canonicalHost == "" || pdid == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		INSERT INTO hostname_owners (canonical_hostname, pdid, acquired_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(canonical_hostname) DO UPDATE SET
+			pdid=excluded.pdid,
+			acquired_at=excluded.acquired_at
+	`, canonicalHost, pdid, time.Now())
+
+	return err
+}
+
+func (s *Storage) DeleteHostnameOwner(canonicalHost string) error {
+	if canonicalHost == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("DELETE FROM hostname_owners WHERE canonical_hostname = ?", canonicalHost)
+	return err
+}
+
 func (s *Storage) SaveDevice(d *models.Device) error {
 	if d == nil || d.PDID == "" {
 		return nil
@@ -239,6 +290,7 @@ func (s *Storage) DeleteDevice(pdid string) error {
 
 	_, _ = tx.Exec("DELETE FROM device_macs WHERE pdid = ?", pdid)
 	_, _ = tx.Exec("DELETE FROM device_ips WHERE pdid = ?", pdid)
+	_, _ = tx.Exec("DELETE FROM hostname_owners WHERE pdid = ?", pdid)
 	_, _ = tx.Exec("DELETE FROM devices WHERE pdid = ?", pdid)
 
 	return tx.Commit()
