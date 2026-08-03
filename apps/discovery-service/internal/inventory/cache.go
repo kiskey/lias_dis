@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/cache.go
-// Version: 2.0
+// Version: 2.1
 package inventory
 
 import (
@@ -27,6 +27,8 @@ const (
 	AcquireProvisional
 )
 
+type HostnameOwnerListener func(canonicalHost, pdid string, isDelete bool)
+
 // Cache is a thread-safe in-memory store with indexed lookups and hostname ownership locks.
 type Cache struct {
 	mu             sync.RWMutex
@@ -34,6 +36,7 @@ type Cache struct {
 	macIndex       map[string]*models.Device // Keyed by CurrentMAC only
 	ipIndex        map[string]*models.Device // Keyed by CurrentIP only
 	hostnameOwners map[string]string        // Canonical Hostname -> PDID
+	ownerListener  HostnameOwnerListener
 	stopCh         chan struct{}
 }
 
@@ -50,7 +53,21 @@ func NewCache() *Cache {
 	return c
 }
 
-// Hostname Ownership Methods
+func (c *Cache) SetHostnameOwnerListener(listener HostnameOwnerListener) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ownerListener = listener
+}
+
+func (c *Cache) LoadHostnameOwners(owners map[string]string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for host, pdid := range owners {
+		if host != "" && pdid != "" {
+			c.hostnameOwners[host] = pdid
+		}
+	}
+}
 
 // AcquireHostname attempts to lock canonicalHost for a target pdid.
 func (c *Cache) AcquireHostname(canonicalHost, pdid string) HostnameAcquisitionResult {
@@ -59,26 +76,40 @@ func (c *Cache) AcquireHostname(canonicalHost, pdid string) HostnameAcquisitionR
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	ownerPDID, exists := c.hostnameOwners[canonicalHost]
 	if !exists || ownerPDID == pdid {
 		c.hostnameOwners[canonicalHost] = pdid
+		listener := c.ownerListener
+		c.mu.Unlock()
+		if listener != nil {
+			listener(canonicalHost, pdid, false)
+		}
 		return AcquireSuccess
 	}
 
 	owner := c.devices[ownerPDID]
 	if owner == nil || (!owner.Online && time.Since(owner.LastSeen) > 24*time.Hour) {
 		c.hostnameOwners[canonicalHost] = pdid
+		listener := c.ownerListener
+		c.mu.Unlock()
+		if listener != nil {
+			listener(canonicalHost, pdid, false)
+		}
 		return AcquireSuccess
 	}
 
 	if owner.Online && time.Since(owner.LastSeen) < 5*time.Minute {
+		c.mu.Unlock()
 		return AcquireReject
 	}
 
 	// Grace window (5m to 24h)
 	c.hostnameOwners[canonicalHost] = pdid
+	listener := c.ownerListener
+	c.mu.Unlock()
+	if listener != nil {
+		listener(canonicalHost, pdid, false)
+	}
 	return AcquireProvisional
 }
 
@@ -89,11 +120,16 @@ func (c *Cache) ReleaseHostname(canonicalHost, pdid string) {
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if owner, exists := c.hostnameOwners[canonicalHost]; exists && owner == pdid {
 		delete(c.hostnameOwners, canonicalHost)
+		listener := c.ownerListener
+		c.mu.Unlock()
+		if listener != nil {
+			listener(canonicalHost, pdid, true)
+		}
+		return
 	}
+	c.mu.Unlock()
 }
 
 // GetHostnameOwner retrieves the PDID owning canonicalHost.
@@ -109,8 +145,7 @@ func (c *Cache) GetHostnameOwner(canonicalHost string) (string, bool) {
 	return pdid, exists
 }
 
-// DemoteStale flips Online: true -> false for devices with no observation
-// within staleThreshold (3 minutes).
+// DemoteStale flips Online: true -> false for devices with no observation within staleThreshold (3 minutes).
 func (c *Cache) DemoteStale() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -219,7 +254,6 @@ func (c *Cache) SetCurrentIP(pdid, ipStr string) {
 		return
 	}
 
-	// Clear previous index mapping if held by another
 	if oldDev, exists := c.ipIndex[cleanIP]; exists && oldDev.PDID != pdid {
 		oldDev.CurrentIP = ""
 	}
@@ -289,8 +323,7 @@ func (c *Cache) Upsert(d *models.Device) {
 // Delete removes a device and clears its associated index entries.
 func (c *Cache) Delete(pdid string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	var releasedHosts []string
 	if d, ok := c.devices[pdid]; ok {
 		if cleanMAC := NormalizeMAC(d.CurrentMAC); cleanMAC != "" {
 			delete(c.macIndex, cleanMAC)
@@ -301,9 +334,18 @@ func (c *Cache) Delete(pdid string) {
 		if d.CanonicalHostname != "" {
 			if owner, exists := c.hostnameOwners[d.CanonicalHostname]; exists && owner == pdid {
 				delete(c.hostnameOwners, d.CanonicalHostname)
+				releasedHosts = append(releasedHosts, d.CanonicalHostname)
 			}
 		}
 		delete(c.devices, pdid)
+	}
+	listener := c.ownerListener
+	c.mu.Unlock()
+
+	if listener != nil {
+		for _, host := range releasedHosts {
+			listener(host, pdid, true)
+		}
 	}
 }
 
@@ -328,9 +370,10 @@ func (c *Cache) purgeLoop() {
 
 func (c *Cache) purgeOffline() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	now := time.Now()
+	var releasedHosts []string
+	var releasedPDIDs []string
+
 	for pdid, d := range c.devices {
 		if !d.Online && now.Sub(d.LastSeen) > offlineTTL {
 			slog.Info("Purging offline device from cache", "pdid", pdid, "mac", d.CurrentMAC)
@@ -343,9 +386,19 @@ func (c *Cache) purgeOffline() {
 			if d.CanonicalHostname != "" {
 				if owner, exists := c.hostnameOwners[d.CanonicalHostname]; exists && owner == pdid {
 					delete(c.hostnameOwners, d.CanonicalHostname)
+					releasedHosts = append(releasedHosts, d.CanonicalHostname)
+					releasedPDIDs = append(releasedPDIDs, pdid)
 				}
 			}
 			delete(c.devices, pdid)
+		}
+	}
+	listener := c.ownerListener
+	c.mu.Unlock()
+
+	if listener != nil {
+		for i, host := range releasedHosts {
+			listener(host, releasedPDIDs[i], true)
 		}
 	}
 }
