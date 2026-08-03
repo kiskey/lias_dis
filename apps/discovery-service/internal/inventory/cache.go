@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/cache.go
-// Version: 1.7 (Updated staleThreshold to 3 minutes for offline hysteresis)
+// Version: 2.0
 package inventory
 
 import (
@@ -15,34 +15,102 @@ import (
 
 const (
 	offlineTTL     = 24 * time.Hour
-	staleThreshold = 180 * time.Second // 3 Minutes hysteresis threshold
+	staleThreshold = 180 * time.Second
 )
 
-// Cache is a thread-safe in-memory store with O(1) MAC and IP index lookups.
+// HostnameAcquisitionResult indicates the outcome of attempting to lock a hostname.
+type HostnameAcquisitionResult int
+
+const (
+	AcquireSuccess HostnameAcquisitionResult = iota
+	AcquireReject
+	AcquireProvisional
+)
+
+// Cache is a thread-safe in-memory store with indexed lookups and hostname ownership locks.
 type Cache struct {
-	mu       sync.RWMutex
-	devices  map[string]*models.Device // Keyed by PDID
-	macIndex map[string]*models.Device // Keyed by normalized MAC
-	ipIndex  map[string]*models.Device // Keyed by IP string
-	stopCh   chan struct{}
+	mu             sync.RWMutex
+	devices        map[string]*models.Device // Keyed by PDID
+	macIndex       map[string]*models.Device // Keyed by CurrentMAC only
+	ipIndex        map[string]*models.Device // Keyed by CurrentIP only
+	hostnameOwners map[string]string        // Canonical Hostname -> PDID
+	stopCh         chan struct{}
 }
 
 // NewCache initializes a new device cache and starts the TTL purger.
 func NewCache() *Cache {
 	c := &Cache{
-		devices:  make(map[string]*models.Device),
-		macIndex: make(map[string]*models.Device),
-		ipIndex:  make(map[string]*models.Device),
-		stopCh:   make(chan struct{}),
+		devices:        make(map[string]*models.Device),
+		macIndex:       make(map[string]*models.Device),
+		ipIndex:        make(map[string]*models.Device),
+		hostnameOwners: make(map[string]string),
+		stopCh:         make(chan struct{}),
 	}
 	go c.purgeLoop()
 	return c
 }
 
+// Hostname Ownership Methods
+
+// AcquireHostname attempts to lock canonicalHost for a target pdid.
+func (c *Cache) AcquireHostname(canonicalHost, pdid string) HostnameAcquisitionResult {
+	if canonicalHost == "" || pdid == "" {
+		return AcquireReject
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ownerPDID, exists := c.hostnameOwners[canonicalHost]
+	if !exists || ownerPDID == pdid {
+		c.hostnameOwners[canonicalHost] = pdid
+		return AcquireSuccess
+	}
+
+	owner := c.devices[ownerPDID]
+	if owner == nil || (!owner.Online && time.Since(owner.LastSeen) > 24*time.Hour) {
+		c.hostnameOwners[canonicalHost] = pdid
+		return AcquireSuccess
+	}
+
+	if owner.Online && time.Since(owner.LastSeen) < 5*time.Minute {
+		return AcquireReject
+	}
+
+	// Grace window (5m to 24h)
+	c.hostnameOwners[canonicalHost] = pdid
+	return AcquireProvisional
+}
+
+// ReleaseHostname releases ownership of canonicalHost if owned by pdid.
+func (c *Cache) ReleaseHostname(canonicalHost, pdid string) {
+	if canonicalHost == "" || pdid == "" {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if owner, exists := c.hostnameOwners[canonicalHost]; exists && owner == pdid {
+		delete(c.hostnameOwners, canonicalHost)
+	}
+}
+
+// GetHostnameOwner retrieves the PDID owning canonicalHost.
+func (c *Cache) GetHostnameOwner(canonicalHost string) (string, bool) {
+	if canonicalHost == "" {
+		return "", false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	pdid, exists := c.hostnameOwners[canonicalHost]
+	return pdid, exists
+}
+
 // DemoteStale flips Online: true -> false for devices with no observation
-// within staleThreshold (3 minutes), serving as a deterministic threshold
-// for marking devices offline without transient flapping.
-// Returns the slice of PDIDs that transitioned offline.
+// within staleThreshold (3 minutes).
 func (c *Cache) DemoteStale() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -58,7 +126,7 @@ func (c *Cache) DemoteStale() []string {
 	return changed
 }
 
-// GetByMAC performs an O(1) indexed lookup by MAC address.
+// GetByMAC performs an O(1) indexed lookup on CurrentMAC.
 func (c *Cache) GetByMAC(macStr string) *models.Device {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -73,7 +141,26 @@ func (c *Cache) GetByMAC(macStr string) *models.Device {
 	return nil
 }
 
-// GetByIP performs an O(1) indexed lookup by IP string.
+// GetByMACCluster performs a scan across all historical MAC clusters.
+func (c *Cache) GetByMACCluster(macStr string) *models.Device {
+	cleanMAC := NormalizeMAC(macStr)
+	if cleanMAC == "" {
+		return nil
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, d := range c.devices {
+		if d.HasMAC(cleanMAC) {
+			devCopy := *d
+			return &devCopy
+		}
+	}
+	return nil
+}
+
+// GetByIP performs an O(1) indexed lookup on CurrentIP.
 func (c *Cache) GetByIP(ipStr string) *models.Device {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -88,26 +175,7 @@ func (c *Cache) GetByIP(ipStr string) *models.Device {
 	return nil
 }
 
-// GetByHostname searches for an existing cached device record matching a clean, normalized hostname.
-func (c *Cache) GetByHostname(hostname string) *models.Device {
-	cleanHost := strings.ToLower(strings.TrimSpace(hostname))
-	if cleanHost == "" {
-		return nil
-	}
-
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	for _, d := range c.devices {
-		if strings.ToLower(strings.TrimSpace(d.Hostname)) == cleanHost {
-			devCopy := *d
-			return &devCopy
-		}
-	}
-	return nil
-}
-
-// RemoveIPIndex removes a stale IP index mapping when DHCP reassigns an IP to another MAC.
+// RemoveIPIndex clears the IP index and updates the owner device atomically.
 func (c *Cache) RemoveIPIndex(ipStr string) {
 	cleanIP := strings.TrimSpace(ipStr)
 	if cleanIP == "" {
@@ -132,8 +200,33 @@ func (c *Cache) RemoveIPIndex(ipStr string) {
 			}
 		}
 		delete(c.ipIndex, cleanIP)
-		slog.Info("Invalidated stale IP index mapping due to DHCP IP reassignment", "ip", cleanIP, "pdid", d.PDID)
+		slog.Info("Invalidated stale IP index mapping", "ip", cleanIP, "pdid", d.PDID)
 	}
+}
+
+// SetCurrentIP sets the device's CurrentIP and updates index atomically.
+func (c *Cache) SetCurrentIP(pdid, ipStr string) {
+	cleanIP := strings.TrimSpace(ipStr)
+	if pdid == "" || cleanIP == "" {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	d, found := c.devices[pdid]
+	if !found {
+		return
+	}
+
+	// Clear previous index mapping if held by another
+	if oldDev, exists := c.ipIndex[cleanIP]; exists && oldDev.PDID != pdid {
+		oldDev.CurrentIP = ""
+	}
+
+	d.AddIP(cleanIP)
+	d.CurrentIP = cleanIP
+	c.ipIndex[cleanIP] = d
 }
 
 // GetByMACOrIP performs an indexed lookup checking MAC first, falling back to IP.
@@ -141,10 +234,13 @@ func (c *Cache) GetByMACOrIP(macStr, ipStr string) *models.Device {
 	if d := c.GetByMAC(macStr); d != nil {
 		return d
 	}
+	if d := c.GetByMACCluster(macStr); d != nil {
+		return d
+	}
 	return c.GetByIP(ipStr)
 }
 
-// Get retrieves a device by PDID. Returns nil if not found.
+// Get retrieves a device by PDID.
 func (c *Cache) Get(pdid string) *models.Device {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -157,7 +253,7 @@ func (c *Cache) Get(pdid string) *models.Device {
 	return &devCopy
 }
 
-// List returns a slice containing copies of all cached devices.
+// List returns copies of all cached devices.
 func (c *Cache) List() []models.Device {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -169,7 +265,7 @@ func (c *Cache) List() []models.Device {
 	return list
 }
 
-// Upsert adds or updates a device record and refreshes secondary MAC and IP indices.
+// Upsert adds or updates a device record, indexing ONLY CurrentMAC and CurrentIP.
 func (c *Cache) Upsert(d *models.Device) {
 	if d == nil || d.PDID == "" {
 		return
@@ -181,18 +277,12 @@ func (c *Cache) Upsert(d *models.Device) {
 	devCopy := *d
 	c.devices[d.PDID] = &devCopy
 
-	for _, mac := range d.MACs {
-		cleanMAC := NormalizeMAC(mac)
-		if cleanMAC != "" {
-			c.macIndex[cleanMAC] = &devCopy
-		}
+	if cleanMAC := NormalizeMAC(d.CurrentMAC); cleanMAC != "" {
+		c.macIndex[cleanMAC] = &devCopy
 	}
 
-	for _, ip := range d.IPs {
-		cleanIP := strings.TrimSpace(ip)
-		if cleanIP != "" {
-			c.ipIndex[cleanIP] = &devCopy
-		}
+	if cleanIP := strings.TrimSpace(d.CurrentIP); cleanIP != "" {
+		c.ipIndex[cleanIP] = &devCopy
 	}
 }
 
@@ -202,11 +292,16 @@ func (c *Cache) Delete(pdid string) {
 	defer c.mu.Unlock()
 
 	if d, ok := c.devices[pdid]; ok {
-		for _, mac := range d.MACs {
-			delete(c.macIndex, NormalizeMAC(mac))
+		if cleanMAC := NormalizeMAC(d.CurrentMAC); cleanMAC != "" {
+			delete(c.macIndex, cleanMAC)
 		}
-		for _, ip := range d.IPs {
-			delete(c.ipIndex, strings.TrimSpace(ip))
+		if cleanIP := strings.TrimSpace(d.CurrentIP); cleanIP != "" {
+			delete(c.ipIndex, cleanIP)
+		}
+		if d.CanonicalHostname != "" {
+			if owner, exists := c.hostnameOwners[d.CanonicalHostname]; exists && owner == pdid {
+				delete(c.hostnameOwners, d.CanonicalHostname)
+			}
 		}
 		delete(c.devices, pdid)
 	}
@@ -239,11 +334,16 @@ func (c *Cache) purgeOffline() {
 	for pdid, d := range c.devices {
 		if !d.Online && now.Sub(d.LastSeen) > offlineTTL {
 			slog.Info("Purging offline device from cache", "pdid", pdid, "mac", d.CurrentMAC)
-			for _, mac := range d.MACs {
-				delete(c.macIndex, NormalizeMAC(mac))
+			if cleanMAC := NormalizeMAC(d.CurrentMAC); cleanMAC != "" {
+				delete(c.macIndex, cleanMAC)
 			}
-			for _, ip := range d.IPs {
-				delete(c.ipIndex, strings.TrimSpace(ip))
+			if cleanIP := strings.TrimSpace(d.CurrentIP); cleanIP != "" {
+				delete(c.ipIndex, cleanIP)
+			}
+			if d.CanonicalHostname != "" {
+				if owner, exists := c.hostnameOwners[d.CanonicalHostname]; exists && owner == pdid {
+					delete(c.hostnameOwners, d.CanonicalHostname)
+				}
 			}
 			delete(c.devices, pdid)
 		}
