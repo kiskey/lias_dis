@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 2.1
+// Version: 2.2
 package api
 
 import (
@@ -485,6 +485,15 @@ func (h *Handlers) ListSchedules(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(h.schedEng.ListSchedules())
 }
 
+// isSupportedTimezone ensures strict IANA timezone strings are used for DST atomicity.
+func isSupportedTimezone(tz string) bool {
+    if tz == "" {
+        return false
+    }
+    _, err := time.LoadLocation(tz)
+    return err == nil
+}
+
 // GAP-L04: V1-V3 Server-side validation for schedule rules
 func validateScheduleRules(s *models.Schedule) error {
     for i, rule := range s.Rules {
@@ -531,6 +540,11 @@ func (h *Handlers) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 
     if err := validateScheduleRules(&s); err != nil {
         http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+        return
+    }
+
+    if !isSupportedTimezone(s.Timezone) {
+        http.Error(w, `{"error":"unsupported or invalid timezone. must be a valid IANA timezone (e.g., America/Los_Angeles)"}`, http.StatusBadRequest)
         return
     }
 
@@ -588,6 +602,11 @@ func (h *Handlers) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 
     if err := validateScheduleRules(&s); err != nil {
         http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+        return
+    }
+
+    if !isSupportedTimezone(s.Timezone) {
+        http.Error(w, `{"error":"unsupported or invalid timezone. must be a valid IANA timezone (e.g., America/Los_Angeles)"}`, http.StatusBadRequest)
         return
     }
 
