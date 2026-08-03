@@ -155,26 +155,551 @@ logging:
 ## Dashboard
 
 The LIAS Web UI is embedded in the `lias` binary and accessible at `http://<lias-ip>:8081/`. It provides real-time device management, tag assignments, time schedule creation, and firewall rule status.
+
+# LIAS Multi-Schedule & Policy Management Guide
+
+This document provides a comprehensive guide on how to use the multi-schedule policy system in LIAS (LAN Internet Access Scheduler), along with a visual reference of the policy precedence tree.
+
+---
+
+# Part 1: Understanding Schedules and Policies
+
+LIAS decouples **Time Schedules** from **Access Policies**. This allows you to create modular time windows and attach them to different groups of devices.
+
+## 1.1 Schedule Modes
+
+When creating a schedule, you must choose a **Mode**. This determines the default behavior **outside** of the time windows you define.
+
+### Downtime Mode
+
+The rules you define act as **Block** windows.
+
+Outside of these windows, traffic is **Allowed**.
+
+**Example**
+
+- Schedule: Bedtime
+- Time: 22:00 → 06:00
+- Result:
+  - During the window → Internet **Blocked**
+  - Outside the window → Internet **Allowed**
+
+### Whitelist Mode
+
+The rules you define act as **Allow** windows.
+
+Outside of these windows, traffic is **Blocked**.
+
+**Example**
+
+- Schedule: Homework
+- Time: 15:00 → 17:00
+- Result:
+  - During the window → Internet **Allowed**
+  - Outside the window → Internet **Blocked**
+
+---
+
+## 1.2 The Multi-Schedule Advantage
+
+Instead of trying to fit unrelated rules into a single schedule, LIAS allows multiple independent schedules to be attached to the same policy.
+
+This provides several advantages:
+
+- Modular schedules
+- Easier maintenance
+- Reusable schedules
+- Automatic conflict detection
+- Timeline preview before saving
+
+The scheduler internally combines all attached schedules into one composite evaluation while ensuring conflicting rules cannot be saved.
+
+---
+
+# Part 2: Examples & Walkthroughs
+
+## Example 1 — Kids Tag Group
+
+Desired behavior:
+
+1. Block Internet every night from **22:00–06:00**
+2. Allow Internet only from **15:00–17:00** on weekdays
+
+---
+
+### Step 1 — Create Schedule A
+
+**Name**
+
+```
+Bedtime
+```
+
+**Mode**
+
+```
+Downtime
+```
+
+**Days**
+
+```
+Mon Tue Wed Thu Fri Sat Sun
+```
+
+**Time**
+
+```
+22:00 → 06:00
+```
+
+**Action**
+
+```
+Block
 ```
 
 ---
 
-### Final Remediation & Validation Summary
+### Step 2 — Create Schedule B
 
-| Issue / Gap ID | Severity | File(s) Affected | Status |
-|---|---|---|---|
-| **GAP-01** | CRITICAL | `apps/lias/web/src/main.js`, `api.js` | ✅ **RESOLVED** (Batch 8) — Implemented complete SPA controller, router, and real-time toast alerts. |
-| **GAP-02** | CRITICAL | `apps/lias/internal/sync/dis_client.go` | ✅ **RESOLVED** (Batch 4) — Real-time SSE parser extracts `pdid`/`device_id` from event payloads. |
-| **GAP-03** | CRITICAL | `apps/lias/internal/nftables/controller.go` | ✅ **RESOLVED** (Batch 6) — Corrected Source MAC payload offset to `Offset: 6`. |
-| **GAP-04** | CRITICAL | `apps/lias/internal/nftables/controller.go` | ✅ **RESOLVED** (Batch 6) — Restored mandatory `Device: eth0` interface binding on netdev ingress chain. |
-| **GAP-05** | CRITICAL | `apps/lias/internal/storage/sqlite.go`, `cmd/lias/main.go` | ✅ **RESOLVED** (Batch 7 & 9) — CGO-free pure-Go SQLite engine persists Tags, Policies, and Schedules. |
-| **GAP-06** | CRITICAL | `apps/discovery-service/internal/inventory/pdid.go` | ✅ **RESOLVED** (Batch 1) — Removed `UnixNano()` seed to guarantee deterministic PDID hashes. |
-| **GAP-07** | HIGH | `apps/lias/internal/schedule/parser.go` | ✅ **RESOLVED** (Batch 5) — Cross-midnight time rules (22:00–06:00) supported cleanly. |
-| **GAP-08** | HIGH | `apps/lias/internal/schedule/parser.go` | ✅ **RESOLVED** (Batch 5) — Replaced 10,080 minute loop with direct transition calculations. |
-| **GAP-09** | HIGH | `apps/discovery-service/internal/discovery/netlink_provider.go` | ✅ **RESOLVED** (Batch 1) — Cached interface indices and added `unix.NUD_*` neighbor state filters. |
-| **GAP-10** | HIGH | `apps/lias/internal/nftables/controller.go` | ✅ **RESOLVED** (Batch 6) — Added `FlushChain` call prior to appending netfilter rules. |
-| **OUI-01** | HIGH | `pkg/oui/oui.go` | ✅ **RESOLVED** (Batch 1 & 7) — Implemented embedded IEEE OUI vendor database. |
-| **MOD-01** | MEDIUM | `shared/go.mod` | ✅ **RESOLVED** (Batch 4) — Defined proper module boundary for `shared`. |
-| **MAKE-01** | LOW | `Makefile` | ✅ **RESOLVED** (Batch 8) — Removed `go mod tidy` state mutation from build targets. |
+**Name**
 
-**Project Status:** All critical, high, and medium priority failures, gaps, and specification bugs have been systematically refactored, tested, and validated. The repository is fully ready for static build (`CGO_ENABLED=0`) and production deployment.
+```
+Homework Allowance
+```
+
+**Mode**
+
+```
+Whitelist
+```
+
+**Days**
+
+```
+Mon Tue Wed Thu Fri
+```
+
+**Time**
+
+```
+15:00 → 17:00
+```
+
+**Action**
+
+```
+Allow
+```
+
+---
+
+### Step 3 — Create Policy
+
+Navigate to:
+
+```
+Policies
+```
+
+Click:
+
+```
++ New Policy
+```
+
+### Step 1 — Target
+
+Target Type
+
+```
+Tag Group
+```
+
+Tag
+
+```
+kids
+```
+
+Policy Name
+
+```
+Kids Internet Rules
+```
+
+---
+
+### Step 2 — Enforcement
+
+Action
+
+```
+Schedule-Driven
+```
+
+---
+
+### Step 3 — Schedules
+
+Attach
+
+- Bedtime
+- Homework Allowance
+
+The UI automatically displays a merged timeline preview.
+
+If any conflicting windows exist, the Save button remains disabled until the conflict is resolved.
+
+Save the policy.
+
+---
+
+# Example 2 — IoT Tag Group
+
+Desired behavior:
+
+Completely block all IoT devices except for a firmware update window every night.
+
+---
+
+### Step 1 — Create Schedule
+
+Name
+
+```
+IoT Update Window
+```
+
+Mode
+
+```
+Whitelist
+```
+
+Days
+
+```
+Sun Mon Tue Wed Thu Fri Sat
+```
+
+Time
+
+```
+02:00 → 02:30
+```
+
+Action
+
+```
+Allow
+```
+
+---
+
+### Step 2 — Create Policy
+
+Target
+
+```
+Tag Group
+```
+
+Tag
+
+```
+iot
+```
+
+Enforcement
+
+```
+Schedule-Driven
+```
+
+Attach
+
+```
+IoT Update Window
+```
+
+Save.
+
+Because the schedule is Whitelist mode:
+
+- Allowed for **30 minutes**
+- Blocked for the remaining **23.5 hours**
+
+---
+
+# Part 3: Empty Schedule Safety Behavior
+
+If a policy uses
+
+```
+Schedule-Driven
+```
+
+but **no schedules are attached**, LIAS defaults to:
+
+```
+ALLOW
+```
+
+This intentional **Default Open** behavior prevents accidental lockouts during initial installation.
+
+Example:
+
+- Install LIAS
+- Global Policy = Schedule
+- No schedules exist yet
+
+Result:
+
+```
+Internet continues to work normally.
+```
+
+As soon as schedules are attached, normal enforcement begins.
+
+---
+
+# Part 4: Policy Precedence Tree
+
+LIAS evaluates every packet using a strict precedence hierarchy.
+
+The **first matching rule wins.**
+
+```mermaid
+flowchart TD
+    Start([Packet Arrives from Device]) --> CheckInfra{"Device tagged 'infrastructure'?"}
+
+    %% 1. Infrastructure Immunity
+    CheckInfra -- "YES" --> InfraAllow["EVAL: ALLOW (Immune)"]
+
+    %% 2. Global Toggles
+    CheckInfra -- "NO" --> CheckGlobal{"Evaluate 'global_default' policy"}
+
+    CheckGlobal -- "Action == BLOCK" --> GlobalBlock["EVAL: BLOCK (Kill-Switch)"]
+    CheckGlobal -- "Action == ALLOW" --> GlobalAllow["EVAL: ALLOW (Global Override)"]
+
+    %% 3. Fallthrough
+    CheckGlobal -- "Action == SCHEDULE" --> CheckDevice{"Device-specific policy exists?"}
+
+    CheckDevice -- "YES" --> EvalDevice["Evaluate highest-priority Device Policy"]
+    CheckDevice -- "NO" --> CheckTag{"Tag-specific policy exists?"}
+
+    CheckTag -- "YES" --> EvalTag["Evaluate ALL matching Tag Policies\n(Fail-Closed OR: If ANY tag says BLOCK, drop it)"]
+    CheckTag -- "NO" --> EvalGlobalSched["Evaluate Global Schedule Bundle"]
+
+    %% Schedule evaluation
+    EvalDevice --> SchedCheck{"Action == SCHEDULE ?"}
+    EvalTag --> SchedCheck
+    EvalGlobalSched --> SchedCheck
+
+    SchedCheck -- "Action == ALLOW/BLOCK" --> FinalAction["EVAL: ALLOW / BLOCK"]
+
+    SchedCheck -- "Action == SCHEDULE" --> EvalBundle["Call schedEval.EvaluateBundle(scheduleIDs)"]
+
+    EvalBundle --> SchedEmpty{"Is scheduleIDs empty?"}
+
+    SchedEmpty -- "YES (Empty)" --> AllowEmpty["EVAL: ALLOW\n(Default Open: No restriction)"]
+
+    SchedEmpty -- "NO" --> SchedExist{"Are schedules valid & conflict-free?"}
+
+    SchedExist -- "Missing or Conflicting" --> FailClosed["EVAL: BLOCK\n(Fail-closed for safety)"]
+
+    SchedExist -- "Valid" --> EvalTime["Evaluate time rules against Current Time"]
+
+    EvalTime --> FinalAction
+
+    %% Styling
+    classDef infra fill:#d4edda,stroke:#28a745,stroke-width:2px;
+    classDef block fill:#f8d7da,stroke:#dc3545,stroke-width:2px;
+    classDef allow fill:#d1ecf1,stroke:#17a2b8,stroke-width:2px;
+
+    class InfraAllow infra;
+    class GlobalBlock,FailClosed block;
+    class GlobalAllow,AllowEmpty allow;
+```
+
+---
+
+# Breakdown of the Precedence Rules
+
+## 1. Infrastructure Immunity (Super-Immutable)
+
+If a device carries the **infrastructure** tag, evaluation immediately returns:
+
+```
+ALLOW
+```
+
+No global switch, tag policy, device policy, or schedule is evaluated.
+
+Infrastructure devices can never be accidentally disconnected.
+
+Examples include:
+
+- Router
+- Firewall
+- DNS Server
+- DHCP Server
+- VPN Gateway
+- Switch Management
+
+---
+
+## 2. Global Kill-Switch (BLOCK)
+
+If the Global Policy is set to:
+
+```
+BLOCK
+```
+
+Every non-infrastructure device is immediately:
+
+```
+BLOCKED
+```
+
+No additional policy evaluation occurs.
+
+---
+
+## 3. Global Allow Override
+
+If the Global Policy is:
+
+```
+ALLOW
+```
+
+Every non-infrastructure device is immediately:
+
+```
+ALLOWED
+```
+
+All schedules and tag/device rules are bypassed.
+
+---
+
+## 4. Global Schedule Mode
+
+If the Global Policy is:
+
+```
+SCHEDULE
+```
+
+Evaluation proceeds in the following order.
+
+### Device Policy
+
+If a policy exists for the specific PDID:
+
+```
+Highest Priority Device Policy
+```
+
+is evaluated.
+
+---
+
+### Tag Policy
+
+If no device policy exists:
+
+Evaluate **all matching tag policies**.
+
+Conflict rule:
+
+```
+If ANY tag evaluates to BLOCK
+→ BLOCK
+```
+
+This is a fail-closed OR model.
+
+---
+
+### Global Fallback
+
+If neither device nor tag policies apply:
+
+Evaluate the schedules attached to:
+
+```
+global_default
+```
+
+---
+
+## 5. Schedule Evaluation
+
+### Empty Schedule Bundle
+
+Policy Action
+
+```
+Schedule
+```
+
+Attached Schedules
+
+```
+None
+```
+
+Result
+
+```
+ALLOW
+```
+
+This prevents lockouts.
+
+---
+
+### Missing or Conflicting Schedules
+
+Examples:
+
+- Deleted schedule still referenced
+- Invalid bundle
+- Conflicting merged timeline
+
+Result
+
+```
+BLOCK
+```
+
+The engine fails closed for safety.
+
+---
+
+### Valid Schedule Bundle
+
+If schedules are valid:
+
+1. Merge all schedules.
+2. Build a weekly composite timeline.
+3. Determine the current active rule.
+4. Return either:
+
+```
+ALLOW
+```
+
+or
+
+```
+BLOCK
+```
+based on the active time window.
+
+
