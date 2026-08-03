@@ -2,7 +2,7 @@
 // Discovery Intelligence Service (DIS) and the LAN Internet Access Scheduler (LIAS).
 //
 // File:    shared/models/device.go
-// Version: 1.3
+// Version: 1.4 (Added strict DisplayName hierarchy helper)
 package models
 
 import (
@@ -76,6 +76,38 @@ type Enrichment struct {
 	Confidence   float64                `json:"confidence"`
 	Source       string                 `json:"source"`
 	Raw          map[string]interface{} `json:"raw,omitempty"`
+}
+
+// DisplayName returns the canonical display name enforcing strict precedence:
+// Hostname -> Friendly Name -> Vendor + Model -> Current MAC -> PDID.
+func (d *Device) DisplayName() string {
+	if d == nil {
+		return "Unknown Device"
+	}
+	if h := strings.TrimSpace(d.Hostname); h != "" {
+		return h
+	}
+	if f := strings.TrimSpace(d.FriendlyName); f != "" {
+		return f
+	}
+	v := strings.TrimSpace(d.Vendor)
+	m := strings.TrimSpace(d.Model)
+	if v != "" && m != "" {
+		return v + " " + m
+	}
+	if v != "" {
+		return v
+	}
+	if m != "" {
+		return m
+	}
+	if d.CurrentMAC != "" {
+		return d.CurrentMAC
+	}
+	if d.PDID != "" {
+		return d.PDID
+	}
+	return "Unknown Device"
 }
 
 // FormatMAC normalizes a HardwareAddr to colon-separated lowercase form.
