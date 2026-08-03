@@ -1,8 +1,7 @@
-// Package discovery implements the core observation, enrichment, and
-// correlation logic for the Discovery Intelligence Service.
+// Package discovery implements observation, enrichment, and correlation for DIS.
 //
 // File:    apps/discovery-service/internal/discovery/provider.go
-// Version: 1.2
+// Version: 2.0
 package discovery
 
 import (
@@ -13,6 +12,17 @@ import (
 	"time"
 
 	"github.com/user/lias-dis/shared/models"
+)
+
+// ProviderGroup identifies the observation layer for provider-independence checks.
+type ProviderGroup string
+
+const (
+	GroupA ProviderGroup = "L2_netlink"
+	GroupB ProviderGroup = "L3_dhcp"
+	GroupC ProviderGroup = "L3_pihole"
+	GroupD ProviderGroup = "L7_name"
+	GroupE ProviderGroup = "L7_active"
 )
 
 // Provider is the base interface for all discovery and enrichment modules.
@@ -37,15 +47,16 @@ type Enricher interface {
 // Observation represents a single raw data point from a DiscoveryProvider.
 type Observation struct {
 	Source     string
+	Group      ProviderGroup
 	MAC        net.HardwareAddr
 	IP         net.IP
 	Hostname   string
 	Vendor     string
 	Model      string
 	Services   []string
-	Confidence float64 // 0.0 - 1.0
+	Confidence float64
 	Timestamp  time.Time
-	Online     bool // Explicit online/offline flag
+	Online     bool
 }
 
 // UnescapeHostname converts raw octal escape sequences (\058 -> :) and cleans mDNS hostnames.
