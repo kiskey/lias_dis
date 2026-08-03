@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 1.8
+// Version: 1.9
 package api
 
 import (
@@ -15,6 +15,7 @@ import (
 	liasNftables "github.com/user/lias-dis/apps/lias/internal/nftables"
 	"github.com/user/lias-dis/apps/lias/internal/policy"
 	"github.com/user/lias-dis/apps/lias/internal/schedule"
+	"github.com/user/lias-dis/apps/lias/internal/scheduleconflict"
 	"github.com/user/lias-dis/apps/lias/internal/storage"
 	liasSync "github.com/user/lias-dis/apps/lias/internal/sync"
 	"github.com/user/lias-dis/apps/lias/internal/tags"
@@ -67,6 +68,7 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/v1/policies", h.ListPolicies)
 	mux.HandleFunc("POST /api/v1/policies", h.CreatePolicy)
+	mux.HandleFunc("POST /api/v1/policies/validate", h.ValidatePolicy)
 	mux.HandleFunc("PUT /api/v1/policies/{id}", h.UpdatePolicy)
 	mux.HandleFunc("DELETE /api/v1/policies/{id}", h.DeletePolicy)
 
@@ -76,12 +78,9 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/v1/schedules/{id}", h.DeleteSchedule)
 
 	mux.HandleFunc("POST /api/v1/nftables/flush", h.FlushNftables)
-
-	// FIX: Register SSE event stream on LIAS port :8081 for browser dashboard clients
 	mux.HandleFunc("GET /api/v1/events", h.StreamEvents)
 }
 
-// StreamEvents handles real-time SSE stream connections on LIAS port :8081.
 func (h *Handlers) StreamEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -271,6 +270,70 @@ func (h *Handlers) ListPolicies(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(h.polEng.ListPolicies())
 }
 
+func (h *Handlers) validateAndMergePolicySchedules(p *models.Policy) ([]scheduleconflict.Conflict, error) {
+	if p.Action != models.ActionSchedule {
+		return nil, nil
+	}
+
+	schedIDs := p.GetScheduleIDs()
+	if len(schedIDs) == 0 {
+		return nil, nil
+	}
+
+	var scheds []models.Schedule
+	for _, sid := range schedIDs {
+		sch, ok := h.schedEng.GetSchedule(sid)
+		if !ok {
+			return nil, httpError{status: http.StatusBadRequest, msg: "referenced schedule '" + sid + "' does not exist"}
+		}
+		scheds = append(scheds, sch)
+	}
+
+	_, conflicts, err := scheduleconflict.MergeSchedules(scheds)
+	return conflicts, err
+}
+
+type httpError struct {
+	status int
+	msg    string
+}
+
+func (e httpError) Error() string { return e.msg }
+
+func (h *Handlers) ValidatePolicy(w http.ResponseWriter, r *http.Request) {
+	var req api.PolicyValidateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if len(req.ScheduleIDs) == 0 {
+		_ = json.NewEncoder(w).Encode(api.ConflictResponse{Conflicts: []api.Conflict{}})
+		return
+	}
+
+	var scheds []models.Schedule
+	for _, sid := range req.ScheduleIDs {
+		sch, ok := h.schedEng.GetSchedule(sid)
+		if !ok {
+			http.Error(w, `{"error":"referenced schedule '`+sid+`' does not exist"}`, http.StatusBadRequest)
+			return
+		}
+		scheds = append(scheds, sch)
+	}
+
+	_, conflicts, _ := scheduleconflict.MergeSchedules(scheds)
+	if conflicts == nil {
+		conflicts = []api.Conflict{}
+	}
+
+	_ = json.NewEncoder(w).Encode(api.ConflictResponse{
+		Conflicts: conflicts,
+	})
+}
+
 func (h *Handlers) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	var p models.Policy
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
@@ -280,6 +343,31 @@ func (h *Handlers) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	if p.ID == "" {
 		p.ID = "pol_" + generateID()
 	}
+
+	// Reject creation targeting infrastructure tag (Defense-In-Depth V7)
+	if p.Type == models.PolicyTypeTag && p.TargetID == "infrastructure" {
+		http.Error(w, `{"error":"infrastructure tag cannot be scheduled or overridden"}`, http.StatusBadRequest)
+		return
+	}
+
+	conflicts, err := h.validateAndMergePolicySchedules(&p)
+	if err != nil && conflicts == nil {
+		if hErr, ok := err.(httpError); ok {
+			http.Error(w, `{"error":"`+hErr.msg+`"}`, hErr.status)
+			return
+		}
+	}
+	if len(conflicts) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(api.ConflictResponse{
+			Error:     "schedule_conflict",
+			Message:   "Attached schedules contain contradictory windows",
+			Conflicts: conflicts,
+		})
+		return
+	}
+
 	h.polEng.UpsertPolicy(p)
 
 	if h.store != nil {
@@ -304,6 +392,30 @@ func (h *Handlers) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.ID = id
+
+	if p.Type == models.PolicyTypeTag && p.TargetID == "infrastructure" {
+		http.Error(w, `{"error":"infrastructure tag cannot be scheduled or overridden"}`, http.StatusBadRequest)
+		return
+	}
+
+	conflicts, err := h.validateAndMergePolicySchedules(&p)
+	if err != nil && conflicts == nil {
+		if hErr, ok := err.(httpError); ok {
+			http.Error(w, `{"error":"`+hErr.msg+`"}`, hErr.status)
+			return
+		}
+	}
+	if len(conflicts) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(api.ConflictResponse{
+			Error:     "schedule_conflict",
+			Message:   "Attached schedules contain contradictory windows",
+			Conflicts: conflicts,
+		})
+		return
+	}
+
 	h.polEng.UpsertPolicy(p)
 
 	if h.store != nil {
@@ -349,6 +461,34 @@ func (h *Handlers) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 	if s.ID == "" {
 		s.ID = "sched_" + generateID()
 	}
+
+	if s.Mode == "" {
+		hasAllow := false
+		for _, r := range s.Rules {
+			if r.Action == models.ActionAllow {
+				hasAllow = true
+				break
+			}
+		}
+		if hasAllow {
+			s.Mode = models.ScheduleModeWhitelist
+		} else {
+			s.Mode = models.ScheduleModeDowntime
+		}
+	}
+
+	_, conflicts, err := scheduleconflict.MergeSchedules([]models.Schedule{s})
+	if err != nil || len(conflicts) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(api.ConflictResponse{
+			Error:     "schedule_conflict",
+			Message:   "Schedule rules contain internal contradictory windows",
+			Conflicts: conflicts,
+		})
+		return
+	}
+
 	h.schedEng.UpsertSchedule(s)
 
 	if h.store != nil {
@@ -373,6 +513,34 @@ func (h *Handlers) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.ID = id
+
+	if s.Mode == "" {
+		hasAllow := false
+		for _, r := range s.Rules {
+			if r.Action == models.ActionAllow {
+				hasAllow = true
+				break
+			}
+		}
+		if hasAllow {
+			s.Mode = models.ScheduleModeWhitelist
+		} else {
+			s.Mode = models.ScheduleModeDowntime
+		}
+	}
+
+	_, conflicts, err := scheduleconflict.MergeSchedules([]models.Schedule{s})
+	if err != nil || len(conflicts) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(api.ConflictResponse{
+			Error:     "schedule_conflict",
+			Message:   "Schedule rules contain internal contradictory windows",
+			Conflicts: conflicts,
+		})
+		return
+	}
+
 	h.schedEng.UpsertSchedule(s)
 
 	if h.store != nil {
