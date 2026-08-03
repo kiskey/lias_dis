@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/debounce.go
-// Version: 2.0
+// Version: 2.1
 package correlation
 
 import (
@@ -121,7 +121,6 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
 
 	p.LastSeen = now
 
-	// Track layer independence across provider groups (§7.3)
 	if group != "" {
 		p.SourceGroups[group] = true
 	}
@@ -131,7 +130,6 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
 		p.ConfirmedBy = append(p.ConfirmedBy, source)
 	}
 
-	// Confirmations count unique independent provider groups (§7.3)
 	if len(p.SourceGroups) > 0 {
 		p.Confirmations = len(p.SourceGroups)
 	} else {
