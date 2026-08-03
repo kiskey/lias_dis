@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/debounce.go
-// Version: 1.0
+// Version: 2.0
 package correlation
 
 import (
@@ -25,6 +25,7 @@ type PendingChange struct {
 	Confirmations         int
 	RequiredConfirmations int
 	Sources               map[string]bool
+	SourceGroups          map[discovery.ProviderGroup]bool
 	ConfirmedBy           []string
 }
 
@@ -62,15 +63,15 @@ func (d *Debouncer) Run(ctx context.Context) {
 	}
 }
 
-// Submit Change receives a candidate state delta and applies confirmation/revert suppression rules.
-func (d *Debouncer) Submit(pdid string, eventType models.EventType, source string, payload models.DeviceEventPayload) {
+// Submit receives a candidate state delta and applies confirmation/revert suppression rules (§7.2, §7.3).
+func (d *Debouncer) Submit(pdid string, eventType models.EventType, source string, group discovery.ProviderGroup, payload models.DeviceEventPayload) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	now := time.Now()
 	key := pdid + ":" + string(eventType)
 
-	// Revert Suppression check
+	// Revert Suppression check (§7.4)
 	switch eventType {
 	case models.EventHostnameChanged:
 		valKey := pdid + ":hostname"
@@ -100,7 +101,7 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
 	p, exists := d.pending[key]
 	if !exists {
 		reqConf := 1
-		if eventType == models.EventHostnameChanged || eventType == models.EventMACChanged {
+		if eventType == models.EventHostnameChanged || eventType == models.EventMACChanged || eventType == models.EventDeviceOnline {
 			reqConf = 2
 		}
 
@@ -113,15 +114,28 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
 			Confirmations:         0,
 			RequiredConfirmations: reqConf,
 			Sources:               make(map[string]bool),
+			SourceGroups:          make(map[discovery.ProviderGroup]bool),
 		}
 		d.pending[key] = p
 	}
 
 	p.LastSeen = now
+
+	// Track layer independence across provider groups (§7.3)
+	if group != "" {
+		p.SourceGroups[group] = true
+	}
+
 	if !p.Sources[source] {
 		p.Sources[source] = true
-		p.Confirmations++
 		p.ConfirmedBy = append(p.ConfirmedBy, source)
+	}
+
+	// Confirmations count unique independent provider groups (§7.3)
+	if len(p.SourceGroups) > 0 {
+		p.Confirmations = len(p.SourceGroups)
+	} else {
+		p.Confirmations = len(p.Sources)
 	}
 }
 
@@ -133,6 +147,7 @@ func (d *Debouncer) Flush() {
 	now := time.Now()
 	for key, p := range d.pending {
 		if p.Confirmations >= p.RequiredConfirmations || now.Sub(p.FirstSeen) > 10*time.Second {
+			p.Payload.ConfirmedBy = p.ConfirmedBy
 			evt := models.NewEvent(p.EventType, p.PDID, p.Payload)
 			d.broker.Broadcast(evt)
 			delete(d.pending, key)
