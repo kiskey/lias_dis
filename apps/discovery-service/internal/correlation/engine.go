@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 3.2
+// Version: 3.3
 package correlation
 
 import (
@@ -17,7 +17,6 @@ import (
 	"github.com/user/lias-dis/apps/discovery-service/internal/discovery"
 	"github.com/user/lias-dis/apps/discovery-service/internal/inventory"
 	"github.com/user/lias-dis/apps/discovery-service/internal/storage"
-	"github.com/user/lias-dis/pkg/oui"
 	"github.com/user/lias-dis/shared/models"
 )
 
@@ -186,7 +185,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		ownerPDID, exists := e.cache.GetHostnameOwner(canonicalHost)
 		if exists && (d == nil || ownerPDID != d.PDID) {
 			acqRes := e.cache.AcquireHostname(canonicalHost, d.PDID)
-			if acqRes == AcquireReject {
+			if acqRes == inventory.AcquireReject {
 				slog.Debug("Hostname ownership lock rejected claim", "host", canonicalHost, "claimant", obs.Source)
 				canonicalHost = ""
 				cleanHost = ""
