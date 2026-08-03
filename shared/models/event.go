@@ -1,5 +1,5 @@
 // File:    shared/models/event.go
-// Version: 1.0
+// Version: 2.1
 package models
 
 import (
@@ -7,9 +7,6 @@ import (
     "time"
 )
 
-// EventType enumerates the device lifecycle events emitted by DIS and proxied
-// by LIAS to connected dashboard clients. Values are stable wire identifiers
-// and must never be renamed across versions — new events get new constants.
 type EventType string
 
 const (
@@ -21,11 +18,9 @@ const (
     EventFingerprintUpdated EventType = "device.fingerprint_updated"
     EventIPChanged          EventType = "device.ip_changed"
     EventMACChanged         EventType = "device.mac_changed"
+    EventDeviceReidentified EventType = "device.reidentified"
 )
 
-// Event is the canonical envelope for every state change in the system. The
-// Payload is intentionally json.RawMessage so producers can encode typed
-// payloads while consumers can decode lazily or forward verbatim over SSE.
 type Event struct {
     Type      EventType       `json:"type"`
     Timestamp time.Time       `json:"timestamp"`
@@ -33,25 +28,30 @@ type Event struct {
     Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
-// DeviceEventPayload is the canonical payload shape for events that carry
-// device state deltas (online/offline/ip_changed/mac_changed/hostname_changed).
-// Old* fields are populated only for *_changed events and are omitted on the
-// wire when empty.
 type DeviceEventPayload struct {
-    PDID      string    `json:"pdid,omitempty"`
-    MAC       string    `json:"mac,omitempty"`
-    IP        string    `json:"ip,omitempty"`
-    Hostname  string    `json:"hostname,omitempty"`
-    OldMAC    string    `json:"old_mac,omitempty"`
-    OldIP     string    `json:"old_ip,omitempty"`
-    OldHost   string    `json:"old_hostname,omitempty"`
-    Timestamp time.Time `json:"timestamp"`
+    PDID                 string    `json:"pdid,omitempty"`
+    MAC                  string    `json:"mac,omitempty"`
+    IP                   string    `json:"ip,omitempty"`
+    Hostname             string    `json:"hostname,omitempty"`
+    CanonicalHostname    string    `json:"canonical_hostname,omitempty"`
+    OldMAC               string    `json:"old_mac,omitempty"`
+    OldIP                string    `json:"old_ip,omitempty"`
+    OldHost              string    `json:"old_hostname,omitempty"`
+    OldCanonicalHostname string    `json:"old_canonical_hostname,omitempty"`
+    ConfirmedBy          []string  `json:"confirmed_by,omitempty"`
+    Timestamp            time.Time `json:"timestamp"`
 }
 
-// NewEvent constructs an Event with the supplied type, device id, and JSON-
-// encoded payload. If payload marshalling fails, the event is still returned
-// with an empty payload so event emission never blocks the discovery pipeline.
-// The returned timestamp is UTC-normalized for stable ordering across nodes.
+// DeviceReidentifiedPayload represents the event payload when a PDID is promoted.
+type DeviceReidentifiedPayload struct {
+    OldPDID          string    `json:"old_pdid"`
+    NewPDID          string    `json:"new_pdid"`
+    Reason           string    `json:"reason"`
+    MigratedTags     []string  `json:"migrated_tags,omitempty"`
+    MigratedMACs     []string  `json:"migrated_macs,omitempty"` // NEW: GAP-D08
+    Timestamp        time.Time `json:"timestamp"`
+}
+
 func NewEvent(t EventType, deviceID string, payload interface{}) Event {
     ts := time.Now().UTC()
     var raw json.RawMessage
@@ -68,11 +68,6 @@ func NewEvent(t EventType, deviceID string, payload interface{}) Event {
     }
 }
 
-// SSEFrame renders the Event in the Server-Sent Events wire format expected by
-// both the LIAS backend EventSource client and the dashboard EventSource. The
-// id field is derived from the Unix-nano timestamp so reconnecting clients can
-// send `Last-Event-ID` to DIS for at-least-once replay (implemented in a later
-// version of the SSE broker).
 func (e Event) SSEFrame() string {
     var b []byte
     b = append(b, "event: "...)
@@ -90,9 +85,6 @@ func (e Event) SSEFrame() string {
     return string(b)
 }
 
-// itoa is a small allocation-free int64-to-string helper used by SSEFrame so
-// the hot event-broadcast path does not pull in fmt or strconv's heavier
-// formatting machinery.
 func itoa(n int64) string {
     if n == 0 {
         return "0"

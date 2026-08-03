@@ -1,7 +1,7 @@
 // Package schedule implements time-based rule parsing and evaluation for LIAS.
 //
 // File:    apps/lias/internal/schedule/parser.go
-// Version: 1.4
+// Version: 1.5
 package schedule
 
 import (
@@ -104,7 +104,7 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
 	}
 
 	// 2. DYNAMIC DEFAULT FALLBACK (When outside all configured windows):
-	// Check if the schedule contains any ALLOW rules (Scheduled Whitelist Mode)
+	// Check if the schedule contains any ALLOW rules or explicitly declares Whitelist Mode
 	hasAllowRules := false
 	for _, r := range s.Rules {
 		if r.Action == models.ActionAllow {
@@ -113,14 +113,12 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
 		}
 	}
 
-	// If schedule is a Whitelist (e.g., Weekend Gaming 12:00-18:00 ALLOW):
-	// Default state outside the window is BLOCK.
-	if hasAllowRules {
+	// If schedule is Whitelist Mode: default state outside window is BLOCK.
+	if hasAllowRules || s.Mode == models.ScheduleModeWhitelist {
 		return models.ActionBlock, nil
 	}
 
-	// If schedule is a Blacklist (e.g., Bedtime 22:00-06:00 BLOCK):
-	// Default state outside the window is ALLOW.
+	// If schedule is Downtime Mode: default state outside window is ALLOW.
 	return models.ActionAllow, nil
 }
 

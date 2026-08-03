@@ -1,8 +1,7 @@
-// Package models defines canonical data structures shared between the
-// Discovery Intelligence Service (DIS) and the LAN Internet Access Scheduler (LIAS).
+// Package models defines canonical data structures shared between DIS and LIAS.
 //
 // File:    shared/models/device.go
-// Version: 1.4 (Added strict DisplayName hierarchy helper)
+// Version: 2.0
 package models
 
 import (
@@ -13,27 +12,40 @@ import (
 
 const maxHistoricalMACs = 32
 
+// IdentityTier enumerates the immutability tier of a Device identity.
+type IdentityTier string
+
+const (
+	TierTentative IdentityTier = "tentative"
+	TierL7        IdentityTier = "l7"
+	TierBIA       IdentityTier = "bia"
+)
+
 // Device is the canonical network device record exchanged between DIS and LIAS.
 type Device struct {
-	PDID         string                `json:"pdid"`
-	MACs         []string              `json:"macs"`
-	CurrentMAC   string                `json:"current_mac"`
-	IPs          []string              `json:"ips"`
-	CurrentIP    string                `json:"current_ip"`
-	Hostname     string                `json:"hostname"`
-	FriendlyName string                `json:"friendly_name"`
-	Manufacturer string                `json:"manufacturer"`
-	Vendor       string                `json:"vendor"`
-	Model        string                `json:"model"`
-	DeviceType   string                `json:"device_type"`
-	Services     []string              `json:"services"`
-	Online       bool                  `json:"online"`
-	IsTentative  bool                  `json:"is_tentative,omitempty"` // Explicitly tracks if PDID was generated without a MAC
-	FirstSeen    time.Time             `json:"first_seen"`
-	LastSeen     time.Time             `json:"last_seen"`
-	Confidence   float64               `json:"confidence"`
-	Tags         []string              `json:"tags"`
-	SourceInfo   map[string]SourceMeta `json:"source_info,omitempty"`
+	PDID              string                `json:"pdid"`
+	IdentityTier      IdentityTier          `json:"identity_tier"`
+	IdentityAnchor    string                `json:"identity_anchor"`
+	CanonicalHostname string                `json:"canonical_hostname,omitempty"`
+	CurrentMAC        string                `json:"current_mac"`
+	MACs              []string              `json:"macs"`
+	CurrentIP         string                `json:"current_ip"`
+	IPs               []string              `json:"ips"`
+	Hostname          string                `json:"hostname"`
+	FriendlyName      string                `json:"friendly_name"`
+	Manufacturer      string                `json:"manufacturer"`
+	Vendor            string                `json:"vendor"`
+	Model             string                `json:"model"`
+	DeviceType        string                `json:"device_type"`
+	Services          []string              `json:"services"`
+	Online            bool                  `json:"online"`
+	PendingOnlineObs  []string              `json:"pending_online_obs,omitempty"`
+	IsTentative       bool                  `json:"is_tentative,omitempty"`
+	FirstSeen         time.Time             `json:"first_seen"`
+	LastSeen          time.Time             `json:"last_seen"`
+	Confidence        float64               `json:"confidence"`
+	Tags              []string              `json:"tags"`
+	SourceInfo        map[string]SourceMeta `json:"source_info,omitempty"`
 }
 
 // SourceMeta records per-source provenance for an observed field on a Device.
@@ -42,26 +54,6 @@ type SourceMeta struct {
 	Confidence float64                `json:"confidence"`
 	Timestamp  time.Time              `json:"timestamp"`
 	Raw        map[string]interface{} `json:"raw,omitempty"`
-}
-
-// PDIDRecord aggregates all known identity observations for a Persistent Device Identity.
-type PDIDRecord struct {
-	ID         string       `json:"id"`
-	PrimaryMAC string       `json:"primary_mac"`
-	KnownMACs  []string     `json:"known_macs"`
-	KnownIPs   []string     `json:"known_ips"`
-	Hostnames  []string     `json:"hostnames"`
-	MergeLog   []MergeEvent `json:"merge_log,omitempty"`
-	Confidence float64      `json:"confidence"`
-}
-
-// MergeEvent records a single correlation merge decision in the PDID history.
-type MergeEvent struct {
-	Timestamp  time.Time `json:"timestamp"`
-	Reason     string    `json:"reason"`
-	FromMAC    string    `json:"from_mac"`
-	ToPDID     string    `json:"to_pdid"`
-	Confidence float64   `json:"confidence"`
 }
 
 // Enrichment represents the structured output of an Enricher invocation.
@@ -78,8 +70,7 @@ type Enrichment struct {
 	Raw          map[string]interface{} `json:"raw,omitempty"`
 }
 
-// DisplayName returns the canonical display name enforcing strict precedence:
-// Hostname -> Friendly Name -> Vendor + Model -> Current MAC -> PDID.
+// DisplayName returns the canonical display name enforcing strict precedence.
 func (d *Device) DisplayName() string {
 	if d == nil {
 		return "Unknown Device"
@@ -110,16 +101,7 @@ func (d *Device) DisplayName() string {
 	return "Unknown Device"
 }
 
-// FormatMAC normalizes a HardwareAddr to colon-separated lowercase form.
-func FormatMAC(mac net.HardwareAddr) string {
-	if mac == nil {
-		return ""
-	}
-	return strings.ToLower(mac.String())
-}
-
-// AddMAC appends a MAC address to the device's known list if not present, keeping CurrentMAC updated.
-// Bounded to retain at most maxHistoricalMACs (32) to prevent unbounded memory growth on rotating MAC devices.
+// AddMAC appends a MAC address to known list, keeping CurrentMAC updated and history bounded.
 func (d *Device) AddMAC(mac string) {
 	if d == nil || mac == "" {
 		return
@@ -140,13 +122,12 @@ func (d *Device) AddMAC(mac string) {
 	d.MACs = append(d.MACs, cleanMAC)
 	d.CurrentMAC = cleanMAC
 
-	// Bound history to prevent unbounded growth
 	if len(d.MACs) > maxHistoricalMACs {
 		d.MACs = d.MACs[len(d.MACs)-maxHistoricalMACs:]
 	}
 }
 
-// AddIP appends an IP address to the device's known list if not present, keeping CurrentIP updated.
+// AddIP appends an IP address to known list, keeping CurrentIP updated.
 func (d *Device) AddIP(ip string) {
 	if d == nil || ip == "" {
 		return
@@ -195,7 +176,7 @@ func (d *Device) AddService(svc string) {
 	d.Services = append(d.Services, cleanSvc)
 }
 
-// Touch updates LastSeen timestamp and sets FirstSeen if uninitialized.
+// Touch updates LastSeen timestamp.
 func (d *Device) Touch(ts time.Time) {
 	if d == nil {
 		return
@@ -206,7 +187,7 @@ func (d *Device) Touch(ts time.Time) {
 	}
 }
 
-// HasTag reports whether the device currently carries the specified tag.
+// HasTag reports whether the device carries a specific tag.
 func (d *Device) HasTag(tag string) bool {
 	if d == nil || tag == "" {
 		return false

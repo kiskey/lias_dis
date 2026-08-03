@@ -1,386 +1,534 @@
-// Package correlation implements the engine that merges raw observations
-// from multiple providers into canonical device records.
+// Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 2.4 (Deferred offline demotion to 3-min staleness sweep to eliminate L2 flapping)
+// Version: 3.9
 package correlation
 
 import (
-	"context"
-	"fmt"
-	"log/slog"
-	"net"
-	"strings"
-	"sync"
-	"time"
+    "context"
+    "fmt"
+    "log/slog"
+    "net"
+    "strings"
+    "sync"
+    "time"
 
-	"github.com/user/lias-dis/apps/discovery-service/internal/api"
-	"github.com/user/lias-dis/apps/discovery-service/internal/discovery"
-	"github.com/user/lias-dis/apps/discovery-service/internal/inventory"
-	"github.com/user/lias-dis/apps/discovery-service/internal/storage"
-	"github.com/user/lias-dis/pkg/oui"
-	"github.com/user/lias-dis/shared/models"
+    "github.com/user/lias-dis/apps/discovery-service/internal/api"
+    "github.com/user/lias-dis/apps/discovery-service/internal/discovery"
+    "github.com/user/lias-dis/apps/discovery-service/internal/inventory"
+    "github.com/user/lias-dis/apps/discovery-service/internal/storage"
+    "github.com/user/lias-dis/shared/models"
 )
 
 type EnrichmentOrchestrator interface {
-	TriggerEnrichment(pdid string, force bool)
+    TriggerEnrichment(pdid string, force bool)
 }
 
 type Engine struct {
-	cache       *inventory.Cache
-	broker      *api.Broker
-	store       *storage.Storage
-	orch        EnrichmentOrchestrator
-	dedupMu     sync.Mutex
-	lastSeenObs map[string]time.Time
+    cache       *inventory.Cache
+    broker      *api.Broker
+    debouncer   *Debouncer
+    store       *storage.Storage
+    orch        EnrichmentOrchestrator
+    dedupMu     sync.Mutex
+    lastSeenObs map[string]time.Time
 }
 
 func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
-	return &Engine{
-		cache:       cache,
-		broker:      broker,
-		lastSeenObs: make(map[string]time.Time),
-	}
+    deb := NewDebouncer(broker)
+    return &Engine{
+        cache:       cache,
+        broker:      broker,
+        debouncer:   deb,
+        lastSeenObs: make(map[string]time.Time),
+    }
 }
 
 func (e *Engine) SetOrchestrator(orch EnrichmentOrchestrator) {
-	e.orch = orch
+    e.orch = orch
 }
 
 func (e *Engine) SetStorage(store *storage.Storage) {
-	e.store = store
+    e.store = store
+    e.debouncer.SetStore(store)
+
+    if store != nil {
+        if owners, err := store.LoadHostnameOwners(); err == nil {
+            e.cache.LoadHostnameOwners(owners)
+        }
+        e.cache.SetHostnameOwnerListener(func(host, pdid string, isDelete bool) {
+            if isDelete {
+                _ = store.DeleteHostnameOwner(host)
+            } else {
+                _ = store.SaveHostnameOwner(host, pdid)
+            }
+        })
+
+        if pending, err := store.LoadPendingEvents(); err == nil {
+            correlationPending := make([]PendingEventRecord, len(pending))
+            for i, p := range pending {
+                correlationPending[i] = PendingEventRecord{
+                    PDID:          p.PDID,
+                    EventType:     p.EventType,
+                    Payload:       p.Payload,
+                    FirstSeen:     p.FirstSeen,
+                    LastSeen:      p.LastSeen,
+                    Confirmations: p.Confirmations,
+                    Sources:       p.Sources,
+                }
+            }
+            e.debouncer.LoadPending(correlationPending)
+            if len(correlationPending) > 0 {
+                slog.Info("Loaded pending events from storage for recovery", "count", len(correlationPending))
+            }
+        }
+    }
 }
 
 func (e *Engine) Run(ctx context.Context, providers []discovery.DiscoveryProvider) {
-	for _, p := range providers {
-		go e.consume(ctx, p.Events())
-	}
-	go e.runStalenessSweep(ctx)
+    go e.debouncer.Run(ctx)
+    for _, p := range providers {
+        go e.consume(ctx, p.Events())
+    }
+    go e.runStalenessSweep(ctx)
 }
 
 func (e *Engine) runStalenessSweep(ctx context.Context) {
-	ticker := time.NewTicker(20 * time.Second)
-	defer ticker.Stop()
+    ticker := time.NewTicker(20 * time.Second)
+    defer ticker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			changedPDIDs := e.cache.DemoteStale()
-			for _, pdid := range changedPDIDs {
-				d := e.cache.Get(pdid)
-				if d == nil {
-					continue
-				}
-				if e.store != nil {
-					_ = e.store.SaveDevice(d)
-				}
-				e.broker.Broadcast(models.NewEvent(models.EventDeviceOffline, d.PDID, models.DeviceEventPayload{
-					PDID:      d.PDID,
-					MAC:       d.CurrentMAC,
-					IP:        d.CurrentIP,
-					Timestamp: time.Now(),
-				}))
-				slog.Info("Device transitioned offline via 3-min staleness sweep", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", d.CurrentIP)
-			}
-		}
-	}
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            changedPDIDs := e.cache.DemoteStale()
+            for _, pdid := range changedPDIDs {
+                d := e.cache.Get(pdid)
+                if d == nil {
+                    continue
+                }
+                if e.store != nil {
+                    _ = e.store.SaveDevice(d)
+                }
+                e.broker.Broadcast(models.NewEvent(models.EventDeviceOffline, d.PDID, models.DeviceEventPayload{
+                    PDID:      d.PDID,
+                    MAC:       d.CurrentMAC,
+                    IP:        d.CurrentIP,
+                    Timestamp: time.Now(),
+                }))
+                slog.Info("Device transitioned offline via staleness sweep", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", d.CurrentIP)
+            }
+        }
+    }
 }
 
 func (e *Engine) consume(ctx context.Context, ch <-chan discovery.Observation) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case obs, ok := <-ch:
-			if !ok {
-				return
-			}
-			e.processObservation(obs)
-		}
-	}
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case obs, ok := <-ch:
+            if !ok {
+                return
+            }
+            e.processObservation(obs)
+        }
+    }
 }
 
 func (e *Engine) isDuplicateObservation(macStr, ipStr string, online bool) bool {
-	key := fmt.Sprintf("%s|%s|%t", macStr, ipStr, online)
-	now := time.Now()
+    key := fmt.Sprintf("%s|%s|%t", macStr, ipStr, online)
+    now := time.Now()
 
-	e.dedupMu.Lock()
-	defer e.dedupMu.Unlock()
+    e.dedupMu.Lock()
+    defer e.dedupMu.Unlock()
 
-	if last, found := e.lastSeenObs[key]; found {
-		if now.Sub(last) < 2*time.Second {
-			return true
-		}
-	}
+    if last, found := e.lastSeenObs[key]; found {
+        if now.Sub(last) < 2*time.Second {
+            return true
+        }
+    }
 
-	e.lastSeenObs[key] = now
+    e.lastSeenObs[key] = now
+    return false
+}
 
-	if len(e.lastSeenObs) > 1000 {
-		for k, t := range e.lastSeenObs {
-			if now.Sub(t) > 10*time.Second {
-				delete(e.lastSeenObs, k)
-			}
-		}
-	}
+func canUpdateCurrentIP(source string) bool {
+    switch source {
+    case "netlink", "dhcp":
+        return true
+    default:
+        return false
+    }
+}
 
-	return false
+func canTriggerOnline(source string) bool {
+    switch source {
+    case "netlink", "dhcp":
+        return true
+    default:
+        return false
+    }
+}
+
+func hasL2AndL3Confirmation(sources []string) bool {
+    hasL2 := false
+    hasL3 := false
+    for _, s := range sources {
+        switch s {
+        case "netlink":
+            hasL2 = true
+        case "dhcp", "pihole":
+            hasL3 = true
+        }
+    }
+    return hasL2 && hasL3
 }
 
 func (e *Engine) processObservation(obs discovery.Observation) {
-	if discovery.IsMulticastOrBroadcast(obs.MAC, obs.IP) {
-		return
-	}
+    if discovery.IsMulticastOrBroadcast(obs.MAC, obs.IP) {
+        return
+    }
 
-	macStr := ""
-	if obs.MAC != nil {
-		macStr = inventory.NormalizeMAC(obs.MAC.String())
-	}
-	ipStr := ""
-	if obs.IP != nil {
-		ipStr = strings.TrimSpace(obs.IP.String())
-	}
+    macStr := ""
+    if obs.MAC != nil {
+        macStr = inventory.NormalizeMAC(obs.MAC.String())
+    }
+    ipStr := ""
+    if obs.IP != nil {
+        ipStr = strings.TrimSpace(obs.IP.String())
+    }
 
-	if macStr == "" && ipStr == "" {
-		return
-	}
+    cleanHost := discovery.UnescapeHostname(obs.Hostname)
+    canonicalHost := CanonicalizeHostname(cleanHost)
 
-	if e.isDuplicateObservation(macStr, ipStr, obs.Online) {
-		return
-	}
+    // Gap 4 Fix: Moved Pi-hole IP history gate BEFORE ghost prevention check
+    if obs.Source == "pihole" && ipStr != "" {
+        if existing := e.cache.GetByIP(ipStr); existing != nil {
+            // I/O Fix: Only save if the IP is actually new to the history
+            ipAlreadyKnown := false
+            for _, ip := range existing.IPs {
+                if ip == ipStr {
+                    ipAlreadyKnown = true
+                    break
+                }
+            }
+            if !ipAlreadyKnown {
+                existing.AddIP(ipStr)
+                if e.store != nil {
+                    _ = e.store.SaveDevice(existing)
+                }
+            }
+            return
+        }
+    }
 
-	cleanHost := discovery.UnescapeHostname(obs.Hostname)
+    // Network Engineer Fix: Prevent ghost tentative devices.
+    if macStr == "" && canonicalHost == "" {
+        return
+    }
 
-	// 1. QUERY EXISTING DEVICE
-	d := e.cache.GetByMACOrIP(macStr, ipStr)
+    if e.isDuplicateObservation(macStr, ipStr, obs.Online) {
+        return
+    }
 
-	// Handle offline observation: Defer offline state change to 3-minute staleness sweep.
-	// This suppresses transient L2 neighbor ARP state changes (e.g. Wi-Fi power-save) from flapping UI notifications.
-	if !obs.Online {
-		slog.Debug("Received transient offline observation, deferring offline transition to 3-min staleness sweep",
-			"mac", macStr, "ip", ipStr, "source", obs.Source)
-		return
-	}
+    // 1. Query Existing Device
+    d := e.cache.GetByMACOrIP(macStr, ipStr)
+    dirty := false
 
-	// 2. PROVIDER CONFIDENCE GUARD
-	if d != nil && !d.Online && obs.Confidence < 0.8 {
-		slog.Debug("Ignoring Online: true from low-confidence background provider for L2-offline device",
-			"pdid", d.PDID, "source", obs.Source, "confidence", obs.Confidence)
+    // Gap 5 Fix: Update CurrentMAC if it's stale/empty but MAC is in cluster
+    if macStr != "" && d != nil && d.HasMAC(macStr) && d.CurrentMAC != macStr {
+        e.cache.SetCurrentMAC(d.PDID, macStr)
+        dirty = true
+    }
 
-		if cleanHost != "" && d.Hostname != cleanHost {
-			d.Hostname = cleanHost
-			e.cache.Upsert(d)
-			if e.store != nil {
-				_ = e.store.SaveDevice(d)
-			}
-		}
-		return
-	}
+    // GAP-D01: MAC Rotation & IP-Claim Validation for existing devices
+    if macStr != "" && d != nil && !d.HasMAC(macStr) {
+        if d.CurrentIP == ipStr {
+            claimRes := ValidateIPClaim(obs, d)
+            if claimRes == ClaimAttach {
+                oldMAC := d.CurrentMAC
+                d.AddMAC(macStr)
+                e.cache.SetCurrentMAC(d.PDID, macStr)
+                e.debouncer.Submit(d.PDID, models.EventMACChanged, obs.Source, obs.Group, models.DeviceEventPayload{
+                    PDID:      d.PDID,
+                    MAC:       macStr,
+                    OldMAC:    oldMAC,
+                    Timestamp: time.Now(),
+                })
+                dirty = true
+            } else {
+                e.cache.RemoveIPIndex(ipStr)
+                d = nil
+            }
+        } else if ipStr != "" {
+            if existingOnIP := e.cache.GetByIP(ipStr); existingOnIP != nil && existingOnIP.PDID != d.PDID {
+                claimRes := ValidateIPClaim(obs, existingOnIP)
+                if claimRes == ClaimAttach {
+                    oldMAC := existingOnIP.CurrentMAC
+                    existingOnIP.AddMAC(macStr)
+                    e.cache.SetCurrentMAC(existingOnIP.PDID, macStr)
+                    e.debouncer.Submit(existingOnIP.PDID, models.EventMACChanged, obs.Source, obs.Group, models.DeviceEventPayload{
+                        PDID:      existingOnIP.PDID,
+                        MAC:       macStr,
+                        OldMAC:    oldMAC,
+                        Timestamp: time.Now(),
+                    })
+                    d = existingOnIP // Reassign d to the attached device
+                    dirty = true
+                } else {
+                    e.cache.RemoveIPIndex(ipStr)
+                    d = nil
+                }
+            }
+        }
+    }
 
-	// 3. DHCP IP-REUSE GUARD & PRIVATE-MAC CONTINUITY
-	if ipStr != "" && macStr != "" {
-		if ipMatch := e.cache.GetByIP(ipStr); ipMatch != nil {
-			if !ipMatch.HasMAC(macStr) {
-				if oui.IsRandomizedMAC(macStr) && !ipMatch.Online {
-					slog.Info("Observed Private MAC rotation on same IP",
-						"pdid", ipMatch.PDID, "ip", ipStr, "new_mac", macStr)
-					ipMatch.AddMAC(macStr)
-					ipMatch.Online = true
-					ipMatch.Touch(time.Now())
-					e.cache.Upsert(ipMatch)
-					if e.store != nil {
-						_ = e.store.SaveDevice(ipMatch)
-					}
-					e.broker.Broadcast(models.NewEvent(models.EventMACChanged, ipMatch.PDID, models.DeviceEventPayload{
-						PDID:      ipMatch.PDID,
-						MAC:       macStr,
-						IP:        ipStr,
-						Timestamp: time.Now(),
-					}))
-					return
-				}
+    // Step 3: Hostname Ownership Lock check
+    if canonicalHost != "" {
+        if d != nil {
+            ownerPDID, exists := e.cache.GetHostnameOwner(canonicalHost)
+            if exists && ownerPDID != d.PDID {
+                acqRes := e.cache.AcquireHostname(canonicalHost, d.PDID)
+                if acqRes == inventory.AcquireReject {
+                    slog.Debug("Hostname ownership lock rejected claim", "host", canonicalHost, "claimant", obs.Source)
+                    canonicalHost = ""
+                    cleanHost = ""
+                }
+            }
+        } else {
+            if e.cache.IsHostnameActivelyOwned(canonicalHost) {
+                slog.Debug("Hostname ownership lock rejected claim for new device", "host", canonicalHost, "claimant", obs.Source)
+                canonicalHost = ""
+                cleanHost = ""
+            }
+        }
+    }
 
-				slog.Info("DHCP IP reassignment detected, invalidating stale IP binding",
-					"ip", ipStr, "old_pdid", ipMatch.PDID, "new_mac", macStr)
-				e.cache.RemoveIPIndex(ipStr)
-			}
-		}
-	}
+    // 2. New Device Creation
+    if d == nil {
+        tier, anchor := inventory.DeriveTierAndAnchor(macStr, canonicalHost, obs.Vendor)
+        pdid := inventory.GeneratePDID(tier, anchor)
 
-	// 4. PRIVATE MAC HOSTNAME FALLBACK
-	if d == nil && macStr != "" && oui.IsRandomizedMAC(macStr) && cleanHost != "" {
-		if hostMatch := e.cache.GetByHostname(cleanHost); hostMatch != nil {
-			slog.Info("Linked rotated Private MAC address to existing device record by L7 Hostname",
-				"pdid", hostMatch.PDID, "new_mac", macStr, "hostname", cleanHost)
-			d = hostMatch
-		}
-	}
+        d = &models.Device{
+            PDID:              pdid,
+            IdentityTier:      tier,
+            IdentityAnchor:    anchor,
+            CanonicalHostname: canonicalHost,
+            Hostname:          cleanHost,
+            Vendor:            obs.Vendor,
+            Model:             obs.Model,
+            Online:            false,
+            Confidence:        obs.Confidence,
+            SourceInfo:        make(map[string]models.SourceMeta),
+        }
+        d.AddMAC(macStr)
+        if obs.Source != "pihole" {
+            d.AddIP(ipStr)
+        }
+        for _, svc := range obs.Services {
+            d.AddService(svc)
+        }
+        d.Touch(time.Now())
 
-	// Handle new device discovery
-	if d == nil {
-		pdid := inventory.GeneratePDID(macStr, cleanHost, obs.Vendor)
-		isTentative := macStr == ""
-		d = &models.Device{
-			PDID:        pdid,
-			Hostname:    cleanHost,
-			Vendor:      obs.Vendor,
-			Model:       obs.Model,
-			Online:      true,
-			IsTentative: isTentative,
-			Confidence:  obs.Confidence,
-			SourceInfo:  make(map[string]models.SourceMeta),
-		}
-		d.AddMAC(macStr)
-		d.AddIP(ipStr)
-		for _, svc := range obs.Services {
-			d.AddService(svc)
-		}
-		d.Touch(time.Now())
+        e.cache.Upsert(d)
+        if canonicalHost != "" {
+            _ = e.cache.AcquireHostname(canonicalHost, d.PDID)
+        }
 
-		ApplySmartClassifications(d)
+        // New devices are always dirty
+        if e.store != nil {
+            _ = e.store.SaveDevice(d)
+        }
 
-		e.cache.Upsert(d)
-		if e.store != nil {
-			if err := e.store.SaveDevice(d); err != nil {
-				slog.Error("Failed to persist new device record to SQLite", "pdid", d.PDID, "error", err)
-			}
-		}
+        slog.Info("New tiered device correlated", "pdid", pdid, "tier", tier, "mac", macStr, "ip", ipStr)
+        e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
+        return
+    }
 
-		slog.Info("New device correlated", "pdid", pdid, "mac", macStr, "ip", ipStr, "vendor", d.Vendor, "type", d.DeviceType)
-		e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
+    // 3. Identity Promotion State Machine
+    newTier, newAnchor := inventory.DeriveTierAndAnchor(macStr, canonicalHost, obs.Vendor)
+    if inventory.CanPromote(d.IdentityTier, newTier) {
+        oldPDID := d.PDID
+        newPDID := inventory.GeneratePDID(newTier, newAnchor)
 
-		if e.orch != nil {
-			go e.orch.TriggerEnrichment(d.PDID, false)
-		}
-		return
-	}
+        slog.Info("Promoting device identity tier", "old_pdid", oldPDID, "new_pdid", newPDID, "from", d.IdentityTier, "to", newTier)
 
-	// 5. TENTATIVE PDID PROMOTION
-	if d.IsTentative && macStr != "" {
-		oldPDID := d.PDID
-		newPDID := inventory.GeneratePDID(macStr, cleanHost, d.Vendor)
+        e.cache.Delete(oldPDID)
+        if e.store != nil {
+            _ = e.store.DeleteDevice(oldPDID)
+        }
 
-		slog.Info("Promoting tentative PDID to deterministic MAC-seeded PDID",
-			"old_pdid", oldPDID, "new_pdid", newPDID, "mac", macStr)
+        d.PDID = newPDID
+        d.IdentityTier = newTier
+        d.IdentityAnchor = newAnchor
+        d.CanonicalHostname = canonicalHost
 
-		e.cache.Delete(oldPDID)
-		if e.store != nil {
-			_ = e.store.DeleteDevice(oldPDID)
-		}
+        e.cache.Upsert(d)
+        // Promotions are always dirty
+        if e.store != nil {
+            _ = e.store.SaveDevice(d)
+        }
 
-		d.PDID = newPDID
-		d.IsTentative = false
-		d.AddMAC(macStr)
-		d.AddIP(ipStr)
-		for _, svc := range obs.Services {
-			d.AddService(svc)
-		}
-		d.Touch(time.Now())
-		ApplySmartClassifications(d)
+        migratedMACs := make([]string, len(d.MACs))
+        copy(migratedMACs, d.MACs)
 
-		e.cache.Upsert(d)
-		if e.store != nil {
-			_ = e.store.SaveDevice(d)
-		}
+        e.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, d.PDID, models.DeviceReidentifiedPayload{
+            OldPDID:      oldPDID,
+            NewPDID:      newPDID,
+            Reason:       string(newTier) + "_observed",
+            MigratedMACs: migratedMACs,
+            Timestamp:    time.Now(),
+        }))
+        return
+    }
 
-		e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
-		e.broker.Broadcast(models.NewEvent(models.EventDeviceRemoved, oldPDID, nil))
-		return
-	}
+    // 4. Asymmetric Online Flap Fix
+    if !d.Online && obs.Online && canTriggerOnline(obs.Source) {
+        d.PendingOnlineObs = append(d.PendingOnlineObs, obs.Source)
+        if len(d.PendingOnlineObs) >= 2 || hasL2AndL3Confirmation(d.PendingOnlineObs) {
+            d.Online = true
+            d.PendingOnlineObs = nil
+            e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
+        } else {
+            go e.scheduleDeferredOnline(d.PDID, 30*time.Second)
+        }
+    }
 
-	// 6. UPDATE EXISTING DEVICE RECORD
-	changed := false
-	var eventTypes []models.EventType
-	payload := models.DeviceEventPayload{
-		PDID:      d.PDID,
-		Timestamp: time.Now(),
-	}
+    // 5. Update Record & Submit to Debouncer
+    if cleanHost != "" && !HostnamesAreEquivalent(d.Hostname, cleanHost) {
+        oldHost := d.Hostname
+        if d.CanonicalHostname != "" {
+            e.cache.ReleaseHostname(d.CanonicalHostname, d.PDID)
+        }
+        d.Hostname = cleanHost
+        d.CanonicalHostname = canonicalHost
+        if canonicalHost != "" {
+            _ = e.cache.AcquireHostname(canonicalHost, d.PDID)
+        }
+        e.debouncer.Submit(d.PDID, models.EventHostnameChanged, obs.Source, obs.Group, models.DeviceEventPayload{
+            PDID:                 d.PDID,
+            Hostname:             cleanHost,
+            CanonicalHostname:    canonicalHost,
+            OldHost:              oldHost,
+            OldCanonicalHostname: CanonicalizeHostname(oldHost),
+            Timestamp:            time.Now(),
+        })
+        dirty = true
+    }
 
-	if !d.Online {
-		d.Online = true
-		changed = true
-		eventTypes = append(eventTypes, models.EventDeviceOnline)
-	}
+    if ipStr != "" && canUpdateCurrentIP(obs.Source) && d.CurrentIP != ipStr {
+        oldIP := d.CurrentIP
+        e.cache.SetCurrentIP(d.PDID, ipStr)
+        e.debouncer.Submit(d.PDID, models.EventIPChanged, obs.Source, obs.Group, models.DeviceEventPayload{
+            PDID:      d.PDID,
+            IP:        ipStr,
+            OldIP:     oldIP,
+            Timestamp: time.Now(),
+        })
+        dirty = true
+    }
 
-	if macStr != "" && d.CurrentMAC != macStr {
-		payload.OldMAC = d.CurrentMAC
-		d.AddMAC(macStr)
-		payload.MAC = macStr
-		changed = true
-		eventTypes = append(eventTypes, models.EventMACChanged)
-	}
+    d.Touch(time.Now())
+    e.cache.Upsert(d)
 
-	if ipStr != "" && d.CurrentIP != ipStr {
-		payload.OldIP = d.CurrentIP
-		d.AddIP(ipStr)
-		payload.IP = ipStr
-		changed = true
-		eventTypes = append(eventTypes, models.EventIPChanged)
-	}
+    // Network Engineer Fix: Only persist to SQLite if material identity data changed
+    if dirty && e.store != nil {
+        _ = e.store.SaveDevice(d)
+    }
+}
 
-	if cleanHost != "" && d.Hostname != cleanHost {
-		payload.OldHost = d.Hostname
-		d.Hostname = cleanHost
-		payload.Hostname = cleanHost
-		changed = true
-		eventTypes = append(eventTypes, models.EventHostnameChanged)
-	}
+// PromoteDeviceIdentity checks if a device's identity tier can be promoted based on current enrichment data.
+func (e *Engine) PromoteDeviceIdentity(pdid string) *models.Device {
+    d := e.cache.Get(pdid)
+    if d == nil {
+        return nil
+    }
 
-	if obs.Vendor != "" && (d.Vendor == "" || obs.Confidence >= d.Confidence) {
-		if d.Vendor != obs.Vendor {
-			d.Vendor = obs.Vendor
-			changed = true
-			eventTypes = append(eventTypes, models.EventFingerprintUpdated)
-		}
-	}
+    newTier, newAnchor := inventory.DeriveTierAndAnchor(d.CurrentMAC, d.CanonicalHostname, d.Vendor)
+    
+    if inventory.CanPromote(d.IdentityTier, newTier) {
+        oldPDID := d.PDID
+        newPDID := inventory.GeneratePDID(newTier, newAnchor)
 
-	for _, svc := range obs.Services {
-		d.AddService(svc)
-	}
+        slog.Info("Promoting device identity tier via enrichment", "old_pdid", oldPDID, "new_pdid", newPDID, "from", d.IdentityTier, "to", newTier)
 
-	ApplySmartClassifications(d)
+        e.cache.Delete(oldPDID)
+        if e.store != nil {
+            _ = e.store.DeleteDevice(oldPDID)
+        }
 
-	d.Touch(time.Now())
-	if changed {
-		e.cache.Upsert(d)
-		if e.store != nil {
-			_ = e.store.SaveDevice(d)
-		}
-		for _, et := range eventTypes {
-			e.broker.Broadcast(models.NewEvent(et, d.PDID, payload))
-		}
-	}
+        d.PDID = newPDID
+        d.IdentityTier = newTier
+        d.IdentityAnchor = newAnchor
 
-	if (d.Vendor == "" || d.DeviceType == "") && e.orch != nil {
-		go e.orch.TriggerEnrichment(d.PDID, false)
-	}
+        e.cache.Upsert(d)
+        if e.store != nil {
+            _ = e.store.SaveDevice(d)
+        }
+
+        migratedMACs := make([]string, len(d.MACs))
+        copy(migratedMACs, d.MACs)
+
+        e.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, d.PDID, models.DeviceReidentifiedPayload{
+            OldPDID:      oldPDID,
+            NewPDID:      newPDID,
+            Reason:       string(newTier) + "_observed_via_enrichment",
+            MigratedMACs: migratedMACs,
+            Timestamp:    time.Now(),
+        }))
+        
+        return d
+    }
+    
+    return d
+}
+
+// PersistDevice saves the device state to storage.
+func (e *Engine) PersistDevice(pdid string) {
+    d := e.cache.Get(pdid)
+    if d != nil && e.store != nil {
+        _ = e.store.SaveDevice(d)
+    }
+}
+
+func (e *Engine) scheduleDeferredOnline(pdid string, delay time.Duration) {
+    time.Sleep(delay)
+    d := e.cache.Get(pdid)
+    if d != nil && !d.Online && len(d.PendingOnlineObs) > 0 {
+        d.Online = true
+        d.PendingOnlineObs = nil
+        e.cache.Upsert(d)
+        // Do not save here to avoid disk thrash on transient state; will be saved on next dirty event or staleness sweep
+        e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
+    }
 }
 
 // ApplySmartClassifications automatically categorizes routers and Amazon Echo devices.
 func ApplySmartClassifications(d *models.Device) {
-	if d == nil {
-		return
-	}
+    if d == nil {
+        return
+    }
 
-	if d.CurrentIP != "" {
-		ip := net.ParseIP(d.CurrentIP)
-		if ip != nil && ip.To4() != nil {
-			ip4 := ip.To4()
-			if ip4[3] == 1 || ip4[3] == 254 {
-				d.DeviceType = "infrastructure"
-				if d.FriendlyName == "" {
-					d.FriendlyName = "Network Gateway Router"
-				}
-			}
-		}
-	}
+    if d.CurrentIP != "" {
+        ip := net.ParseIP(d.CurrentIP)
+        if ip != nil && ip.To4() != nil {
+            ip4 := ip.To4()
+            if ip4[3] == 1 || ip4[3] == 254 {
+                d.DeviceType = "infrastructure"
+                if d.FriendlyName == "" {
+                    d.FriendlyName = "Network Gateway Router"
+                }
+            }
+        }
+    }
 
-	if strings.HasPrefix(d.Hostname, "amzn.") || strings.Contains(d.Hostname, "amzn.dmgr") {
-		d.Vendor = "Amazon Technologies Inc."
-		d.DeviceType = "iot"
-		if d.FriendlyName == "" {
-			d.FriendlyName = "Amazon Alexa Device"
-		}
-	}
+    if strings.HasPrefix(d.Hostname, "amzn.") || strings.Contains(d.Hostname, "amzn.dmgr") {
+        d.Vendor = "Amazon Technologies Inc."
+        d.DeviceType = "iot"
+        if d.FriendlyName == "" {
+            d.FriendlyName = "Amazon Alexa Device"
+        }
+    }
 }

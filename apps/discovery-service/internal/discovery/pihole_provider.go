@@ -265,15 +265,16 @@ func (p *PiholeProvider) poll() {
 			continue
 		}
 
-		obs := Observation{
-			Source:     p.Name(),
-			IP:         ipObj,
-			MAC:        macObj,
-			Hostname:   UnescapeHostname(c.Name),
-			Online:     true,
-			Confidence: 0.3,
-			Timestamp:  time.Now(),
-		}
+obs := Observation{
+    Source:     p.Name(),
+    Group:      GroupC,
+    IP:         ipObj,
+    MAC:        macObj,
+    Hostname:   UnescapeHostname(c.Name),
+    Online:     true,
+    Confidence: 0.30,
+    Timestamp:  time.Now(),
+}
 
 		select {
 		case p.events <- obs:
