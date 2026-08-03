@@ -1,10 +1,10 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 2.0
+// Version: 2.1 (Audited, Global Switch Drawer & Continuous Range Integration)
 
 import { API } from './api.js';
-import { projectSchedule, detectConflicts } from './scheduleConflict.js';
+import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
 class App {
   constructor() {
@@ -44,27 +44,19 @@ class App {
   }
 
   initSSE() {
-    const es = new EventSource('/api/v1/events');
-    es.onmessage = (evt) => {
-      try {
-        const data = JSON.parse(evt.data);
-        this.handleRealtimeEvent(data);
-      } catch (err) {
-        console.error('SSE parse error', err);
-      }
-    };
-    es.onerror = () => {
-      console.warn('SSE disconnected, browser will auto-reconnect');
-    };
+    API.subscribeEvents((event) => {
+      this.handleRealtimeEvent(event);
+    });
   }
 
   handleRealtimeEvent(event) {
+    const pdid = (event.payload && event.payload.pdid) || event.device_id || 'device';
     if (event.type === 'device.added') {
-      this.showToast(`✨ New Device Discovered: ${event.device_id}`);
+      this.showToast(`✨ New Device Discovered: ${pdid}`);
     } else if (event.type === 'device.online') {
-      this.showToast(`🟢 Device Online: ${event.device_id}`);
+      this.showToast(`🟢 Device Online: ${pdid}`);
     } else if (event.type === 'device.offline') {
-      this.showToast(`🔴 Device Offline: ${event.device_id}`);
+      this.showToast(`🔴 Device Offline: ${pdid}`);
     }
     this.loadData();
   }
@@ -138,11 +130,16 @@ class App {
 
     container.innerHTML = `
       <div class="global-switch-banner">
-        <div>
-          <h3>Global Access Switch</h3>
-          <p style="font-size:13px; color:var(--text-secondary);">Master internet access control across all managed devices</p>
+        <div class="global-switch-top">
+          <div>
+            <h3>Global Access Switch</h3>
+            <p style="font-size:13px; color:var(--text-secondary);">Master internet access control across all managed devices</p>
+          </div>
+          <div>${this.renderGlobalSwitchControls()}</div>
         </div>
-        <div>${this.renderGlobalSwitchControls()}</div>
+        <div id="global-switch-drawer-container">
+          ${this.renderGlobalSwitchDrawerHtml()}
+        </div>
       </div>
 
       <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:16px; margin-bottom:24px;">
@@ -182,6 +179,23 @@ class App {
     `;
   }
 
+  renderGlobalSwitchDrawerHtml() {
+    const globalPol = this.policies.find(p => p.id === 'global_default');
+    if (!globalPol || globalPol.action !== 'schedule') return '';
+
+    const selectedScheds = this.resolvePolicySchedules(globalPol);
+
+    return `
+      <div class="global-switch-drawer">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <strong style="font-size:13px;">Global Schedule Bundle (${selectedScheds.length} attached)</strong>
+          <button class="btn btn-secondary" id="btn-edit-global-bundle" style="padding:4px 10px; font-size:12px;">Manage Schedules</button>
+        </div>
+        ${this.renderWeeklyTimeline(selectedScheds)}
+      </div>
+    `;
+  }
+
   bindGlobalSwitchEvents() {
     document.querySelectorAll('.global-switch-banner .segmented-btn').forEach(btn => {
       btn.addEventListener('click', async (e) => {
@@ -204,6 +218,21 @@ class App {
         }
       });
     });
+
+    const manageBtn = document.getElementById('btn-edit-global-bundle');
+    if (manageBtn) {
+      manageBtn.addEventListener('click', () => {
+        let globalPol = this.policies.find(p => p.id === 'global_default') || {
+          id: 'global_default',
+          name: 'Global Access Switch',
+          type: 'global',
+          target_id: '',
+          action: 'schedule',
+          priority: 0
+        };
+        this.openPolicyWizard(globalPol);
+      });
+    }
   }
 
   renderTagGroupsView(container) {
@@ -315,16 +344,15 @@ class App {
   }
 
   renderPoliciesView(container) {
-    const validPolicies = this.policies.filter(p => p.target_id !== 'infrastructure');
-
     let html = `
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-        <h3>Access Policies (${validPolicies.length})</h3>
+        <h3>Access Policies (${this.policies.length})</h3>
         <button class="btn btn-primary" id="btn-add-policy">+ New Policy</button>
       </div>
 
       <div style="display:flex; flex-direction:column; gap:16px;">
-        ${validPolicies.map(p => {
+        ${this.policies.map(p => {
+          const isInfra = p.target_id === 'infrastructure';
           const schedSummary = this.getScheduleSummary(p);
           const scheds = this.resolvePolicySchedules(p);
 
@@ -332,21 +360,27 @@ class App {
             <div class="card" style="margin-bottom:0;">
               <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                 <div>
-                  <div style="font-size:16px; font-weight:700;">${p.name}</div>
+                  <div style="font-size:16px; font-weight:700;">${p.name} ${isInfra ? '🔒' : ''}</div>
                   <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
                     Scope: <strong style="text-transform:capitalize;">${p.type}</strong> | Target: <strong>${p.target_id || 'Global'}</strong> | Priority: <strong>${p.priority}</strong>
                   </div>
                 </div>
                 <div style="display:flex; gap:8px;">
-                  <button class="btn btn-secondary btn-edit-policy" data-id="${p.id}">Edit</button>
+                  <button class="btn btn-secondary btn-edit-policy" data-id="${p.id}" ${isInfra ? 'disabled' : ''}>Edit</button>
                   <button class="btn btn-danger btn-delete-policy" data-id="${p.id}">Delete</button>
                 </div>
               </div>
-              <div style="margin-top:12px; font-size:13px; font-weight:600;">
-                Action: <span style="color:${p.action === 'allow' ? 'var(--success)' : p.action === 'block' ? 'var(--danger)' : 'var(--accent)'}">${p.action.toUpperCase()}</span>
-                ${schedSummary ? `<div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">${schedSummary}</div>` : ''}
-              </div>
-              ${(p.action === 'schedule' && scheds.length > 0) ? this.renderWeeklyTimeline(scheds) : ''}
+              ${isInfra ? `
+                <div style="font-size:12px; color:var(--warning); margin-top:8px;">
+                  🔒 Infrastructure devices always have unrestricted access — this policy has no effect and can be safely deleted.
+                </div>
+              ` : `
+                <div style="margin-top:12px; font-size:13px; font-weight:600;">
+                  Action: <span style="color:${p.action === 'allow' ? 'var(--success)' : p.action === 'block' ? 'var(--danger)' : 'var(--accent)'}">${p.action.toUpperCase()}</span>
+                  ${schedSummary ? `<div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">${schedSummary}</div>` : ''}
+                </div>
+                ${(p.action === 'schedule' && scheds.length > 0) ? this.renderWeeklyTimeline(scheds) : ''}
+              `}
             </div>
           `;
         }).join('')}
@@ -358,7 +392,7 @@ class App {
     const addBtn = document.getElementById('btn-add-policy');
     if (addBtn) addBtn.addEventListener('click', () => this.openPolicyWizard());
 
-    document.querySelectorAll('.btn-edit-policy').forEach(btn => {
+    document.querySelectorAll('.btn-edit-policy:not([disabled])').forEach(btn => {
       btn.addEventListener('click', (e) => {
         const id = e.currentTarget.dataset.id;
         const p = this.policies.find(item => item.id === id);
@@ -521,7 +555,7 @@ class App {
       `;
     }
 
-    days.forEach((day, dayIdx) => {
+    days.forEach((day) => {
       html += `
         <div class="timeline-day-row">
           <div class="timeline-day-label">${day}</div>
@@ -650,7 +684,6 @@ class App {
       `;
     } else if (step === 3) {
       const selectedScheds = (policy.schedule_ids || []).map(id => this.schedules.find(s => s.id === id)).filter(Boolean);
-      const conflicts = detectConflicts(selectedScheds);
 
       bodyHtml += `
         <div style="display:flex; flex-direction:column; gap:16px;">
@@ -684,6 +717,36 @@ class App {
 
     this.openModal(title, bodyHtml, footerHtml);
     this.bindPolicyWizardEvents();
+    if (step === 1) this.checkShadowPolicy();
+  }
+
+  checkShadowPolicy() {
+    const { policy } = this.wizardState;
+    const container = document.getElementById('wiz-shadow-warning');
+    if (!container || policy.type === 'global') {
+      if (container) container.innerHTML = '';
+      return;
+    }
+
+    const target = policy.target_id;
+    const existing = this.policies.find(p => p.id !== policy.id && p.type === policy.type && p.target_id === target);
+
+    if (existing) {
+      container.innerHTML = `
+        <div class="shadow-policy-banner">
+          ⚠️ <strong>Shadow Policy Warning:</strong> '${existing.name}' already targets this ${policy.type}. Creating a second policy will not replace it — the higher-priority rule wins.
+          <button class="btn btn-secondary" id="btn-edit-existing-shadow" style="padding:2px 8px; font-size:11px; margin-top:6px; display:block;">Edit Existing Policy Instead</button>
+        </div>
+      `;
+      const editBtn = document.getElementById('btn-edit-existing-shadow');
+      if (editBtn) {
+        editBtn.addEventListener('click', () => {
+          this.openPolicyWizard(existing);
+        });
+      }
+    } else {
+      container.innerHTML = '';
+    }
   }
 
   renderWizardTargetDropdown(type, selectedTarget) {
@@ -728,6 +791,15 @@ class App {
         typeSel.addEventListener('change', (e) => {
           policy.type = e.target.value;
           document.getElementById('wiz-target-container').innerHTML = this.renderWizardTargetDropdown(policy.type, policy.target_id);
+          this.checkShadowPolicy();
+        });
+      }
+
+      const targetSel = document.getElementById('wiz-target');
+      if (targetSel) {
+        targetSel.addEventListener('change', (e) => {
+          policy.target_id = e.target.value;
+          this.checkShadowPolicy();
         });
       }
 
@@ -740,8 +812,8 @@ class App {
             return;
           }
           policy.name = nameInput.value.trim();
-          const targetSel = document.getElementById('wiz-target');
-          policy.target_id = targetSel ? targetSel.value : '';
+          const targetEl = document.getElementById('wiz-target');
+          policy.target_id = targetEl ? targetEl.value : '';
 
           this.wizardState.step = 2;
           this.renderPolicyWizardStep();
@@ -794,7 +866,7 @@ class App {
     }
   }
 
-  // Schedule Modal with Continuous Range & Overnight Chip
+  // Schedule Modal with Continuous Range Mode & Overnight Chip
   openScheduleModal(existingSchedule = null) {
     const s = existingSchedule ? JSON.parse(JSON.stringify(existingSchedule)) : {
       name: '',
@@ -826,7 +898,7 @@ class App {
           <button class="btn btn-secondary" id="btn-add-rule">+ Add Rule</button>
         </div>
 
-        <div id="sched-rules-container" style="display:flex; flex-direction:column; gap:12px; max-height:240px; overflow-y:auto;">
+        <div id="sched-rules-container" style="display:flex; flex-direction:column; gap:12px; max-height:260px; overflow-y:auto;">
           ${s.rules.map((r, idx) => this.renderScheduleRuleRow(r, idx)).join('')}
         </div>
       </div>
@@ -842,14 +914,40 @@ class App {
 
   renderScheduleRuleRow(rule, idx) {
     const isOvernight = rule.start_time && rule.end_time && rule.end_time <= rule.start_time;
+    const daysArr = (rule.days || []).map(d => d.toLowerCase().substring(0, 3));
 
     return `
       <div class="card rule-row" data-idx="${idx}" style="padding:12px; margin-bottom:0; background:var(--bg-tertiary);">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
           <strong style="font-size:12px;">Rule #${idx + 1}</strong>
-          <button class="btn btn-danger btn-remove-rule" data-idx="${idx}" style="padding:4px 8px; font-size:11px;">Remove</button>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <select class="day-mode-select" style="font-size:11px; padding:4px 8px;">
+              <option value="range">Continuous Day Range</option>
+              <option value="specific">Specific Days</option>
+            </select>
+            <button class="btn btn-danger btn-remove-rule" data-idx="${idx}" style="padding:4px 8px; font-size:11px;">Remove</button>
+          </div>
         </div>
-        <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+
+        <div class="day-range-picker" style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+          <label style="font-size:11px; font-weight:700;">From:</label>
+          <select class="range-from" style="flex:1; font-size:12px; padding:6px;">
+            ${['mon','tue','wed','thu','fri','sat','sun'].map(d => `<option value="${d}" ${daysArr[0] === d ? 'selected' : ''}>${d.toUpperCase()}</option>`).join('')}
+          </select>
+          <label style="font-size:11px; font-weight:700;">To:</label>
+          <select class="range-to" style="flex:1; font-size:12px; padding:6px;">
+            ${['mon','tue','wed','thu','fri','sat','sun'].map(d => `<option value="${d}" ${daysArr[daysArr.length - 1] === d ? 'selected' : ''}>${d.toUpperCase()}</option>`).join('')}
+          </select>
+        </div>
+
+        <div class="day-chip-group specific-days-picker" style="display:none; margin-bottom:8px;">
+          ${['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'].map(day => {
+            const sel = daysArr.includes(day);
+            return `<div class="day-chip ${sel ? 'selected' : ''}" data-day="${day}">${day.toUpperCase()}</div>`;
+          }).join('')}
+        </div>
+
+        <div style="display:flex; gap:8px; align-items:center;">
           <input type="time" class="rule-start" value="${rule.start_time}" style="flex:1;">
           <span>to</span>
           <input type="time" class="rule-end" value="${rule.end_time}" style="flex:1;">
@@ -858,19 +956,25 @@ class App {
             <option value="allow" ${rule.action === 'allow' ? 'selected' : ''}>Allow</option>
           </select>
         </div>
-        <div class="day-chip-group">
-          ${['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'].map(day => {
-            const sel = (rule.days || []).map(d => d.toLowerCase().substring(0, 3)).includes(day);
-            return `<div class="day-chip ${sel ? 'selected' : ''}" data-day="${day}">${day.toUpperCase()}</div>`;
-          }).join('')}
+
+        <div class="overnight-container">
+          ${isOvernight ? `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${rule.end_time} the FOLLOWING day</div>` : ''}
         </div>
-        ${isOvernight ? `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${rule.end_time} the FOLLOWING day</div>` : ''}
       </div>
     `;
   }
 
   bindScheduleModalEvents(s) {
     document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
+
+    document.querySelectorAll('.day-mode-select').forEach(sel => {
+      sel.addEventListener('change', (e) => {
+        const row = e.target.closest('.rule-row');
+        const isRange = e.target.value === 'range';
+        row.querySelector('.day-range-picker').style.display = isRange ? 'flex' : 'none';
+        row.querySelector('.specific-days-picker').style.display = isRange ? 'none' : 'flex';
+      });
+    });
 
     document.querySelectorAll('.day-chip').forEach(chip => {
       chip.addEventListener('click', (e) => {
@@ -883,18 +987,36 @@ class App {
         const row = input.closest('.rule-row');
         const start = row.querySelector('.rule-start').value;
         const end = row.querySelector('.rule-end').value;
-        let chip = row.querySelector('.overnight-chip');
+        const container = row.querySelector('.overnight-container');
 
         if (start && end && end <= start) {
-          if (!chip) {
-            chip = document.createElement('div');
-            chip.className = 'overnight-chip moon';
-            row.appendChild(chip);
-          }
-          chip.textContent = `🌙 Continues past midnight — ends ${end} the FOLLOWING day`;
-        } else if (chip) {
-          chip.remove();
+          container.innerHTML = `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${end} the FOLLOWING day</div>`;
+        } else {
+          container.innerHTML = '';
         }
+      });
+    });
+
+    const addRuleBtn = document.getElementById('btn-add-rule');
+    if (addRuleBtn) {
+      addRuleBtn.addEventListener('click', () => {
+        const container = document.getElementById('sched-rules-container');
+        const newIdx = container.children.length;
+        const newRuleHtml = this.renderScheduleRuleRow({
+          days: ['mon', 'tue', 'wed', 'thu', 'fri'],
+          start_time: '22:00',
+          end_time: '06:00',
+          action: 'block'
+        }, newIdx);
+        container.insertAdjacentHTML('beforeend', newRuleHtml);
+        this.bindScheduleModalEvents(s);
+      });
+    }
+
+    document.querySelectorAll('.btn-remove-rule').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const row = e.currentTarget.closest('.rule-row');
+        row.remove();
       });
     });
 
@@ -913,7 +1035,16 @@ class App {
         const start = row.querySelector('.rule-start').value;
         const end = row.querySelector('.rule-end').value;
         const action = row.querySelector('.rule-action').value;
-        const days = Array.from(row.querySelectorAll('.day-chip.selected')).map(c => c.dataset.day);
+        const mode = row.querySelector('.day-mode-select').value;
+
+        let days = [];
+        if (mode === 'range') {
+          const fromDay = row.querySelector('.range-from').value;
+          const toDay = row.querySelector('.range-to').value;
+          days = expandDayRange(fromDay, toDay);
+        } else {
+          days = Array.from(row.querySelectorAll('.day-chip.selected')).map(c => c.dataset.day);
+        }
 
         if (start && end && days.length > 0) {
           rules.push({ days, start_time: start, end_time: end, action });
