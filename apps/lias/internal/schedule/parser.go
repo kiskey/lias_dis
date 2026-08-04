@@ -1,25 +1,26 @@
 // Package schedule implements time-based rule parsing and evaluation for LIAS.
 //
 // File:    apps/lias/internal/schedule/parser.go
-// Version: 1.5
+// Version: 1.6
 package schedule
 
 import (
-	"sort"
-	"strings"
-	"time"
+    "log/slog"
+    "sort"
+    "strings"
+    "time"
 
-	"github.com/user/lias-dis/shared/models"
+    "github.com/user/lias-dis/shared/models"
 )
 
 var dayMap = map[string]time.Weekday{
-	"sun": time.Sunday,
-	"mon": time.Monday,
-	"tue": time.Tuesday,
-	"wed": time.Wednesday,
-	"thu": time.Thursday,
-	"fri": time.Friday,
-	"sat": time.Saturday,
+    "sun": time.Sunday,
+    "mon": time.Monday,
+    "tue": time.Tuesday,
+    "wed": time.Wednesday,
+    "thu": time.Thursday,
+    "fri": time.Friday,
+    "sat": time.Saturday,
 }
 
 // Evaluate determines the effective action for a schedule at a specific time.
@@ -28,147 +29,161 @@ var dayMap = map[string]time.Weekday{
 // 1. Scheduled Whitelist Mode (Action: ALLOW rules) -> Default state outside windows is BLOCK.
 // 2. Scheduled Downtime Mode (Action: BLOCK rules)  -> Default state outside windows is ALLOW.
 func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
-	loc, err := time.LoadLocation(s.Timezone)
-	if err != nil {
-		loc = time.UTC
-	}
-	now = now.In(loc)
+    loc, err := time.LoadLocation(s.Timezone)
+    if err != nil {
+        loc = time.UTC
+    }
+    now = now.In(loc)
 
-	var bestMatch *models.ScheduleRule
-	var bestDuration time.Duration = -1
+    var bestMatch *models.ScheduleRule
+    var bestDuration time.Duration = -1
 
-	for _, rule := range s.Rules {
-		matchesDay := false
-		currentWeekday := now.Weekday()
-		prevWeekday := (now.Weekday() + 6) % 7 // Day prior to handle overnight windows starting yesterday
+    currentWeekday := now.Weekday()
+    prevWeekday := (now.Weekday() + 6) % 7 // Day prior to handle overnight windows starting yesterday
 
-		for _, dayStr := range rule.Days {
-			dLower := strings.ToLower(strings.TrimSpace(dayStr))
-			if day, ok := dayMap[dLower]; ok {
-				if day == currentWeekday || day == prevWeekday {
-					matchesDay = true
-					break
-				}
-			}
-		}
+    for _, rule := range s.Rules {
+        matchesCurrentDay := false
+        matchesPrevDay := false
 
-		if !matchesDay {
-			continue
-		}
+        for _, dayStr := range rule.Days {
+            dLower := strings.ToLower(strings.TrimSpace(dayStr))
+            if day, ok := dayMap[dLower]; ok {
+                if day == currentWeekday {
+                    matchesCurrentDay = true
+                }
+                if day == prevWeekday {
+                    matchesPrevDay = true
+                }
+            }
+        }
 
-		startTime, err := time.Parse("15:04", rule.StartTime)
-		if err != nil {
-			continue
-		}
-		endTime, err := time.Parse("15:04", rule.EndTime)
-		if err != nil {
-			continue
-		}
+        if !matchesCurrentDay && !matchesPrevDay {
+            continue
+        }
 
-		// Calculate start and end time boundaries relative to current day
-		year, month, day := now.Date()
-		start := time.Date(year, month, day, startTime.Hour(), startTime.Minute(), 0, 0, loc)
-		end := time.Date(year, month, day, endTime.Hour(), endTime.Minute(), 0, 0, loc)
+        startTime, err := time.Parse("15:04", rule.StartTime)
+        if err != nil {
+            continue
+        }
+        endTime, err := time.Parse("15:04", rule.EndTime)
+        if err != nil {
+            continue
+        }
 
-		isMatch := false
-		var windowDuration time.Duration
+        // Calculate start and end time boundaries relative to current day
+        year, month, day := now.Date()
+        start := time.Date(year, month, day, startTime.Hour(), startTime.Minute(), 0, 0, loc)
+        end := time.Date(year, month, day, endTime.Hour(), endTime.Minute(), 0, 0, loc)
 
-		if end.After(start) {
-			// Normal same-day window (e.g., 12:00 to 18:00)
-			isMatch = (now.Equal(start) || now.After(start)) && now.Before(end)
-			windowDuration = end.Sub(start)
-		} else {
-			// Cross-midnight window (e.g., 22:00 to 06:00)
-			startOvernight := start.AddDate(0, 0, -1) // Yesterday's start
+        // GAP-L-H07 Fix: Detect DST transition collapsing a window
+        if rule.StartTime != rule.EndTime && start.Equal(end) {
+            slog.Warn("Schedule rule window collapsed to zero duration due to DST transition",
+                "schedule_id", s.ID, "rule_start", rule.StartTime, "rule_end", rule.EndTime)
+        }
 
-			isMatchYesterday := (now.Equal(startOvernight) || now.After(startOvernight)) && now.Before(end)
-			isMatchToday := (now.Equal(start) || now.After(start)) && now.Before(end.AddDate(0, 0, 1))
+        isMatch := false
+        var windowDuration time.Duration
 
-			isMatch = isMatchYesterday || isMatchToday
-			windowDuration = end.Add(24 * time.Hour).Sub(start)
-		}
+        if end.After(start) {
+            // Normal same-day window (e.g., 12:00 to 18:00)
+            // Only evaluate if the current day matches
+            if matchesCurrentDay {
+                isMatch = (now.Equal(start) || now.After(start)) && now.Before(end)
+            }
+            windowDuration = end.Sub(start)
+        } else {
+            // Cross-midnight window (e.g., 22:00 to 06:00)
+            windowDuration = end.Add(24 * time.Hour).Sub(start)
 
-		if isMatch {
-			// Narrowest window wins precedence
-			if bestDuration == -1 || windowDuration < bestDuration {
-				bestDuration = windowDuration
-				r := rule
-				bestMatch = &r
-			}
-		}
-	}
+            // Check if match starts yesterday and ends today
+            if matchesPrevDay {
+                startOvernight := start.AddDate(0, 0, -1) // Yesterday's start
+                if (now.Equal(startOvernight) || now.After(startOvernight)) && now.Before(end) {
+                    isMatch = true
+                }
+            }
 
-	// 1. If a rule window is currently active, enforce the rule's specified action (ALLOW or BLOCK)
-	if bestMatch != nil {
-		return bestMatch.Action, nil
-	}
+            // Check if match starts today and ends tomorrow
+            if matchesCurrentDay {
+                if (now.Equal(start) || now.After(start)) && now.Before(end.AddDate(0, 0, 1)) {
+                    isMatch = true
+                }
+            }
+        }
 
-	// 2. DYNAMIC DEFAULT FALLBACK (When outside all configured windows):
-	// Check if the schedule contains any ALLOW rules or explicitly declares Whitelist Mode
-	hasAllowRules := false
-	for _, r := range s.Rules {
-		if r.Action == models.ActionAllow {
-			hasAllowRules = true
-			break
-		}
-	}
+        if isMatch {
+            // Narrowest window wins precedence
+            if bestDuration == -1 || windowDuration < bestDuration {
+                bestDuration = windowDuration
+                r := rule
+                bestMatch = &r
+            }
+        }
+    }
 
-	// If schedule is Whitelist Mode: default state outside window is BLOCK.
-	if hasAllowRules || s.Mode == models.ScheduleModeWhitelist {
-		return models.ActionBlock, nil
-	}
+    // 1. If a rule window is currently active, enforce the rule's specified action (ALLOW or BLOCK)
+    if bestMatch != nil {
+        return bestMatch.Action, nil
+    }
 
-	// If schedule is Downtime Mode: default state outside window is ALLOW.
-	return models.ActionAllow, nil
+    // 2. AUTHORITATIVE DEFAULT FALLBACK (GAP-L-H02 Fix):
+    // Mode explicitly defines default outside window behavior.
+    // Do not infer from rule actions.
+    if s.Mode == models.ScheduleModeWhitelist {
+        return models.ActionBlock, nil
+    }
+
+    // Default for Downtime Mode (or unspecified)
+    return models.ActionAllow, nil
 }
 
 // NextStateChange calculates the exact next timestamp when the schedule action will transition.
 func NextStateChange(s models.Schedule, now time.Time) (time.Time, error) {
-	loc, err := time.LoadLocation(s.Timezone)
-	if err != nil {
-		loc = time.UTC
-	}
-	now = now.In(loc)
+    loc, err := time.LoadLocation(s.Timezone)
+    if err != nil {
+        loc = time.UTC
+    }
+    now = now.In(loc)
 
-	currentAction, _ := Evaluate(s, now)
+    currentAction, _ := Evaluate(s, now)
 
-	var transitionPoints []time.Time
-	year, month, day := now.Date()
+    var transitionPoints []time.Time
+    year, month, day := now.Date()
 
-	for i := 0; i < 8; i++ {
-		baseDate := time.Date(year, month, day+i, 0, 0, 0, 0, loc)
+    for i := 0; i < 8; i++ {
+        baseDate := time.Date(year, month, day+i, 0, 0, 0, 0, loc)
 
-		for _, rule := range s.Rules {
-			if startT, err := time.Parse("15:04", rule.StartTime); err == nil {
-				t := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), startT.Hour(), startT.Minute(), 0, 0, loc)
-				if t.After(now) {
-					transitionPoints = append(transitionPoints, t)
-				}
-			}
+        for _, rule := range s.Rules {
+            if startT, err := time.Parse("15:04", rule.StartTime); err == nil {
+                t := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), startT.Hour(), startT.Minute(), 0, 0, loc)
+                if t.After(now) {
+                    transitionPoints = append(transitionPoints, t)
+                }
+            }
 
-			if endT, err := time.Parse("15:04", rule.EndTime); err == nil {
-				t := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), endT.Hour(), endT.Minute(), 0, 0, loc)
-				if t.After(now) {
-					transitionPoints = append(transitionPoints, t)
-				}
-			}
-		}
-	}
+            if endT, err := time.Parse("15:04", rule.EndTime); err == nil {
+                t := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), endT.Hour(), endT.Minute(), 0, 0, loc)
+                if t.After(now) {
+                    transitionPoints = append(transitionPoints, t)
+                }
+            }
+        }
+    }
 
-	if len(transitionPoints) == 0 {
-		return now.Add(24 * time.Hour), nil
-	}
+    if len(transitionPoints) == 0 {
+        return now.Add(24 * time.Hour), nil
+    }
 
-	sort.Slice(transitionPoints, func(i, j int) bool {
-		return transitionPoints[i].Before(transitionPoints[j])
-	})
+    sort.Slice(transitionPoints, func(i, j int) bool {
+        return transitionPoints[i].Before(transitionPoints[j])
+    })
 
-	for _, t := range transitionPoints {
-		nextAction, _ := Evaluate(s, t.Add(1*time.Second))
-		if nextAction != currentAction {
-			return t, nil
-		}
-	}
+    for _, t := range transitionPoints {
+        nextAction, _ := Evaluate(s, t.Add(1*time.Second))
+        if nextAction != currentAction {
+            return t, nil
+        }
+    }
 
-	return now.Add(24 * time.Hour), nil
+    return now.Add(24 * time.Hour), nil
 }
