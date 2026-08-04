@@ -1,7 +1,7 @@
 // Binary lias implements the LAN Internet Access Scheduler.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 2.4
+// Version: 2.5 (Verified Wiring)
 package main
 
 import (
@@ -18,7 +18,7 @@ import (
 
     liasAPI "github.com/user/lias-dis/apps/lias/internal/api"
     "github.com/user/lias-dis/apps/lias/internal/config"
-    "github.com/user/lias-dis/apps/lias/internal/metrics" // SYS-OBS-01
+    "github.com/user/lias-dis/apps/lias/internal/metrics"
     "github.com/user/lias-dis/apps/lias/internal/nftables"
     "github.com/user/lias-dis/apps/lias/internal/policy"
     "github.com/user/lias-dis/apps/lias/internal/schedule"
@@ -111,7 +111,6 @@ func main() {
     handlers := liasAPI.NewHandlers(cache, tagMgr, polEng, schedEng, nftCtrl, store, trigger, broker)
     handlers.RegisterRoutes(mux, cfg.HTTP.AuthToken)
 
-    // SYS-OBS-01 Fix: Register Prometheus metrics endpoint
     metrics.RegisterHandler(mux, "/metrics")
 
     mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
