@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 3.1 (Infra Pause Fix, Vacation Mode UI Fix, Full HIG Modals)
+// Version: 3.2 (Unpause UI, Vacation Mode CSS/JS Fix)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -520,6 +520,9 @@ class App {
     const dispName = d.friendly_name || d.hostname || `${d.vendor || ''} ${d.model || ''}`.trim() || d.current_mac || d.pdid;
     const tags = (d.tags && d.tags.length > 0) ? d.tags : ['generic'];
     const isInfra = tags.includes('infrastructure');
+    
+    // Fix 1: Check if device is currently paused to render Unpause button
+    const isPaused = this.policies.some(p => p.id === `pol_pause_${d.pdid}`);
 
     // LIAS-TAG-01 Fix: Render multi-select for tags
     const tagCheckboxes = this.tags.map(t => `
@@ -529,8 +532,15 @@ class App {
       </label>
     `).join('');
 
-    // FIX: Hide Pause button for Infrastructure devices to prevent UI confusion
-    const pauseBtnHtml = isInfra ? '' : `<button class="btn btn-danger btn-pause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px;">⏸ Pause</button>`;
+    // FIX: Hide Pause button for Infrastructure devices. Show Unpause if paused.
+    let actionBtnHtml = '';
+    if (!isInfra) {
+      if (isPaused) {
+        actionBtnHtml = `<button class="btn btn-success btn-unpause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px;">▶ Unpause</button>`;
+      } else {
+        actionBtnHtml = `<button class="btn btn-danger btn-pause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px;">⏸ Pause</button>`;
+      }
+    }
 
     return `
       <div class="device-item">
@@ -558,7 +568,7 @@ class App {
             </div>
           </details>
           <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px;">
-            ${pauseBtnHtml}
+            ${actionBtnHtml}
             <button class="btn btn-secondary btn-rename-device" data-pdid="${d.pdid}" data-name="${dispName}" style="padding: 6px 10px; font-size: 12px;">✏️</button>
             <button class="btn btn-secondary btn-details-device" data-pdid="${d.pdid}" style="padding: 6px 10px; font-size: 12px;">📋</button>
           </div>
@@ -597,8 +607,26 @@ class App {
           try {
             await API.pauseDeviceInternet(pdid);
             this.showToast(`Internet paused for ${name}`);
+            this.loadData();
           } catch (err) {
             this.showToast(`Failed to pause: ${err.message}`, 'danger');
+          }
+        });
+      });
+    });
+
+    // Fix 1: Bind Unpause Internet (HIG Modal)
+    document.querySelectorAll('.btn-unpause-device').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const pdid = e.currentTarget.dataset.pdid;
+        const name = e.currentTarget.dataset.name;
+        this.openConfirmModal('Resume Internet', `Are you sure you want to resume the internet for ${name}?`, 'Unpause', async () => {
+          try {
+            await API.unpauseDeviceInternet(pdid);
+            this.showToast(`Internet resumed for ${name}`);
+            this.loadData();
+          } catch (err) {
+            this.showToast(`Failed to unpause: ${err.message}`, 'danger');
           }
         });
       });
@@ -1561,7 +1589,7 @@ class App {
   }
 
   renderSettingsView(container) {
-    // FIX: Added explicit Apple HIG compliant CSS for the toggle switch to ensure visibility
+    // Fix 3: Rewrote Vacation Mode Toggle HTML/CSS to be strictly HIG compliant and clickable
     container.innerHTML = `
       <div class="card">
         <h3>System Maintenance</h3>
@@ -1574,10 +1602,10 @@ class App {
               <strong>Vacation Mode</strong>
               <p>Immediately blocks all internet access for all devices (except Infrastructure).</p>
             </div>
-            <div class="hig-toggle-switch">
+            <label class="hig-toggle-switch">
               <input type="checkbox" id="chk-vacation">
               <span class="hig-slider"></span>
-            </div>
+            </label>
           </div>
         </div>
       </div>
@@ -1607,6 +1635,7 @@ class App {
           width: 51px;
           height: 31px;
           flex-shrink: 0;
+          cursor: pointer;
         }
         .hig-toggle-switch input {
           opacity: 0;
@@ -1654,11 +1683,33 @@ class App {
 
     const vacChk = document.getElementById('chk-vacation');
     const globalPol = this.policies.find(p => p.id === 'global_default');
-    if (globalPol && globalPol.action === 'block') vacChk.checked = true;
+    
+    // Fix 3: Explicitly set initial state
+    if (globalPol && globalPol.action === 'block') {
+      vacChk.checked = true;
+    } else {
+      vacChk.checked = false;
+    }
     
     vacChk.addEventListener('change', async (e) => {
-      try { await API.toggleVacationMode(e.target.checked); this.showToast(`Vacation Mode ${e.target.checked ? 'Enabled' : 'Disabled'}`); }
-      catch (err) { this.showToast(`Failed: ${err.message}`, 'danger'); e.target.checked = !e.target.checked; }
+      try { 
+        await API.toggleVacationMode(e.target.checked); 
+        this.showToast(`Vacation Mode ${e.target.checked ? 'Enabled' : 'Disabled'}`); 
+        
+        // Fix 3: Update local state immediately to prevent UI flicker, then delay reload
+        if (globalPol) {
+          globalPol.action = e.target.checked ? 'block' : 'schedule';
+        } else {
+          this.policies.push({ id: 'global_default', action: e.target.checked ? 'block' : 'schedule' });
+        }
+        
+        // Delay loadData to allow the toggle animation to complete smoothly
+        setTimeout(() => this.loadData(), 300);
+      } 
+      catch (err) { 
+        this.showToast(`Failed: ${err.message}`, 'danger'); 
+        e.target.checked = !e.target.checked; 
+      }
     });
   }
 
