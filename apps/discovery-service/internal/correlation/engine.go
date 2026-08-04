@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 4.2
+// Version: 4.3 (Corrected Tier type revert)
 package correlation
 
 import (
@@ -33,11 +33,9 @@ type Engine struct {
     dedupMu     sync.Mutex
     lastSeenObs map[string]time.Time
 
-    // DIS-IO-01 Fix: Dirty device batching
     dirtyMu      sync.Mutex
-    dirtyDevices map[string]struct{} // CONC-01/CPU-02 Fix: Store only PDID to prevent stale overwrites
+    dirtyDevices map[string]struct{}
 
-    // CONC-02 Fix: Lock for identity promotion
     promoteMu sync.Mutex
 }
 
@@ -123,7 +121,6 @@ func (e *Engine) flushDirty() {
         e.dirtyMu.Unlock()
         return
     }
-    // CONC-01 Fix: Copy PDIDs and clear map immediately to minimize lock contention
     pdids := make([]string, 0, len(e.dirtyDevices))
     for pdid := range e.dirtyDevices {
         pdids = append(pdids, pdid)
@@ -133,7 +130,6 @@ func (e *Engine) flushDirty() {
 
     devs := make([]*models.Device, 0, len(pdids))
     for _, pdid := range pdids {
-        // CONC-01 Fix: Fetch fresh copy from cache right before saving
         d := e.cache.Get(pdid)
         if d != nil {
             devs = append(devs, d)
@@ -143,7 +139,6 @@ func (e *Engine) flushDirty() {
     if e.store != nil && len(devs) > 0 {
         if err := e.store.SaveDevicesBatch(devs); err != nil {
             slog.Error("Failed to flush dirty devices batch to storage", "count", len(devs), "error", err)
-            // CONC-03 Fix: Re-queue PDIDs on failure to prevent data loss
             e.dirtyMu.Lock()
             for _, d := range devs {
                 e.dirtyDevices[d.PDID] = struct{}{}
@@ -320,7 +315,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     d := e.cache.GetByMACOrIP(macStr, ipStr)
     dirty := false
 
-    // MATH-02 Fix: Removed cache.SetCurrentMAC/IP calls. Mutate local copy `d` directly.
     if macStr != "" && d != nil && d.HasMAC(macStr) && d.CurrentMAC != macStr {
         d.CurrentMAC = macStr
         dirty = true
@@ -341,7 +335,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                 })
                 dirty = true
             } else if claimRes == ClaimCreateNewSilent {
-                // NET-02 Fix: Silent DHCP reassignment
                 d = nil
             } else {
                 e.broker.Broadcast(models.NewEvent(models.EventSecurityAlert, d.PDID, models.SecurityAlertPayload{
@@ -371,7 +364,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                     d = existingOnIP 
                     dirty = true
                 } else if claimRes == ClaimCreateNewSilent {
-                    // NET-02 Fix: Silent DHCP reassignment
                     d = nil
                 } else {
                     e.broker.Broadcast(models.NewEvent(models.EventSecurityAlert, existingOnIP.PDID, models.SecurityAlertPayload{
@@ -499,9 +491,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     }
 
     d.Touch(time.Now())
-    
-    // CPU-01 Fix: Only Upsert if dirty or if LastSeen needs updating in cache
-    // Since Touch modifies LastSeen, we must Upsert to reflect that in cache.
     e.cache.Upsert(d)
 
     if dirty {
@@ -509,7 +498,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     }
 }
 
-// CONC-02 Fix: Extracted promotion logic to a locked helper
 func (e *Engine) promoteDevice(d *models.Device, newTier models.IdentityTier, newAnchor, canonicalHost, reasonSuffix string) {
     e.promoteMu.Lock()
     defer e.promoteMu.Unlock()
@@ -524,13 +512,11 @@ func (e *Engine) promoteDevice(d *models.Device, newTier models.IdentityTier, ne
     d.IdentityAnchor = newAnchor
     d.CanonicalHostname = canonicalHost
 
-    // IO-05 Fix: Atomic DB replacement
     if e.store != nil {
         if err := e.store.ReplaceDevicePDID(oldPDID, newPDID, d); err != nil {
             slog.Error("Atomic PDID replacement failed", "old", oldPDID, "new", newPDID, "error", err)
-            // Revert in-memory changes on failure
             d.PDID = oldPDID
-            d.IdentityTier = inventory.TierL7 // revert tier
+            d.IdentityTier = models.TierL7 // Corrected type reference
             return
         }
     }
