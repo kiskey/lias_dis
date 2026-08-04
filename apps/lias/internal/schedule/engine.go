@@ -1,7 +1,7 @@
 // Package schedule implements time-based rule evaluation for LIAS.
 //
 // File:    apps/lias/internal/schedule/engine.go
-// Version: 1.4
+// Version: 1.5 (Fixed Timer Leak)
 package schedule
 
 import (
@@ -17,8 +17,6 @@ import (
     "github.com/user/lias-dis/shared/models"
 )
 
-// EffectivePolicyProvider allows the schedule engine to query the active policy for a device
-// to accurately compute NextStateChange transitions.
 type EffectivePolicyProvider interface {
     GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy
 }
@@ -29,11 +27,14 @@ type Engine struct {
     mergedCache    map[string]models.Schedule
     reverseIdx     map[string][]string
     cache          *liasSync.Cache
-    policyProvider EffectivePolicyProvider // GAP-L-CR04 Fix
-    trigger        chan struct{}           // GAP-L-H05 Fix
+    policyProvider EffectivePolicyProvider
+    trigger        chan struct{}
+    
+    // CPU-04 Fix: Track the timer to prevent leaks
+    nextTransitionTimer *time.Timer
+    timerMu             sync.Mutex
 }
 
-// NewEngine initializes the schedule engine.
 func NewEngine(cache *liasSync.Cache, policyProvider EffectivePolicyProvider, trigger chan struct{}) *Engine {
     return &Engine{
         schedules:      make(map[string]models.Schedule),
@@ -171,7 +172,6 @@ func (e *Engine) updateNextStateChanges() {
     var minNextChange *time.Time
 
     for _, d := range devs {
-        // GAP-L-CR04 Fix: Use EffectivePolicyProvider to correctly identify schedule-driven devices
         if e.policyProvider != nil {
             devCopy := d
             pol := e.policyProvider.GetEffectivePolicy(&devCopy)
@@ -196,7 +196,6 @@ func (e *Engine) updateNextStateChanges() {
                         if err == nil {
                             e.cache.SetNextStateChange(d.PDID, &nextChange)
                             
-                            // GAP-L-H05 Fix: Track the earliest transition to trigger immediate nftables sync
                             if minNextChange == nil || nextChange.Before(*minNextChange) {
                                 n := nextChange
                                 minNextChange = &n
@@ -212,20 +211,25 @@ func (e *Engine) updateNextStateChanges() {
         }
     }
 
-    // GAP-L-H05 Fix: Schedule an immediate resync precisely when the next schedule transition occurs
+    // CPU-04 Fix: Stop the previous timer before creating a new one to prevent leaks
+    e.timerMu.Lock()
+    if e.nextTransitionTimer != nil {
+        e.nextTransitionTimer.Stop()
+    }
+    
     if minNextChange != nil {
         duration := time.Until(*minNextChange)
         if duration < 0 {
             duration = 0
         }
         
-        time.AfterFunc(duration, func() {
+        e.nextTransitionTimer = time.AfterFunc(duration, func() {
             select {
             case e.trigger <- struct{}{}:
                 slog.Info("Triggered immediate nftables sync for schedule transition", "transition_time", minNextChange)
             default:
-                // Trigger already pending
             }
         })
     }
+    e.timerMu.Unlock()
 }
