@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 2.9
+// Version: 3.0 (Verified Dependencies)
 package api
 
 import (
@@ -67,7 +67,7 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux, authToken string) {
     handler.HandleFunc("GET /api/v1/devices/{pdid}", h.GetDevice)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/tags", h.AssignDeviceTag)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/pause", h.PauseDeviceInternet)
-    handler.HandleFunc("DELETE /api/v1/devices/{pdid}/pause", h.UnpauseDeviceInternet) // Fix 1: Unpause endpoint
+    handler.HandleFunc("DELETE /api/v1/devices/{pdid}/pause", h.UnpauseDeviceInternet)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/rename", h.RenameDevice)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/user", h.AssignDeviceUser)
     handler.HandleFunc("GET /api/v1/devices/{pdid}/logs", h.GetDeviceLogs)
@@ -195,14 +195,12 @@ func (h *Handlers) GetDeviceLogs(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(logs)
 }
 
-// LIAS-TAG-01 Fix: AssignDeviceTag accepts an array of tags
 func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
     var req struct {
         TagIDs []string `json:"tag_ids"`
     }
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        // Fallback for legacy single tag_id payload
         var legacyReq struct { TagID string `json:"tag_id"` }
         if err := json.NewDecoder(r.Body).Decode(&legacyReq); err != nil {
             http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -226,7 +224,6 @@ func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
     w.WriteHeader(http.StatusNoContent)
 }
 
-// Fix 2: Temporary Pause creates in-memory only schedules and auto-deletes them after 1 hour
 func (h *Handlers) PauseDeviceInternet(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
     d := h.cache.Get(pdid)
@@ -244,7 +241,6 @@ func (h *Handlers) PauseDeviceInternet(w http.ResponseWriter, r *http.Request) {
         },
     }
     h.schedEng.UpsertSchedule(tempSched)
-    // Fix 2: Deliberately NOT saving to DB to avoid bloat.
 
     polID := "pol_pause_" + pdid
     tempPol := models.Policy{
@@ -252,11 +248,9 @@ func (h *Handlers) PauseDeviceInternet(w http.ResponseWriter, r *http.Request) {
         Action: models.ActionSchedule, ScheduleIDs: []string{tempSchedID}, Priority: 1000, Enabled: true,
     }
     h.polEng.UpsertPolicy(tempPol)
-    // Fix 2: Deliberately NOT saving to DB to avoid bloat.
 
     h.tryTrigger()
 
-    // Fix 2: Register automatic cleanup after 1 hour to prevent accumulation
     go func(policyID, schedID string) {
         time.Sleep(1 * time.Hour)
         h.polEng.DeletePolicy(policyID)
@@ -269,12 +263,10 @@ func (h *Handlers) PauseDeviceInternet(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(map[string]string{"status": "paused for 1 hour"})
 }
 
-// Fix 1: UnpauseDeviceInternet removes the temporary block immediately
 func (h *Handlers) UnpauseDeviceInternet(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
     polID := "pol_pause_" + pdid
     
-    // Find the policy to get the associated schedule ID
     pol, exists := h.polEng.GetPolicy(polID)
     if !exists {
         w.WriteHeader(http.StatusNoContent)
@@ -283,10 +275,8 @@ func (h *Handlers) UnpauseDeviceInternet(w http.ResponseWriter, r *http.Request)
     
     schedIDs := pol.GetScheduleIDs()
     
-    // Delete policy from engine
     h.polEng.DeletePolicy(polID)
     
-    // Delete schedule from engine
     for _, sid := range schedIDs {
         h.schedEng.DeleteSchedule(sid)
     }
@@ -490,7 +480,6 @@ func (h *Handlers) ImportPolicies(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // FIX: Reload hydrated state into engine without causing an import cycle
     var policies []models.Policy
     if err := json.Unmarshal(data, &policies); err == nil {
         for _, p := range policies {
@@ -657,7 +646,6 @@ func isSupportedTimezone(tz string) bool {
 
 func validateScheduleRules(s *models.Schedule) error {
     for i, rule := range s.Rules {
-        // LIAS-SCH-09 Fix: Allow empty days if calendar dates are specified
         if len(rule.Days) == 0 && (rule.StartDate == "" || rule.EndDate == "") {
             return fmt.Errorf("rule %d: days must be non-empty if calendar dates are not specified", i+1)
         }
@@ -670,7 +658,6 @@ func validateScheduleRules(s *models.Schedule) error {
         if _, err := time.Parse("15:04", rule.EndTime); err != nil {
             return fmt.Errorf("rule %d: invalid end_time format %q", i+1, rule.EndTime)
         }
-        // LIAS-SCH-09 Fix: Validate calendar dates format
         if rule.StartDate != "" {
             if _, err := time.Parse("2006-01-02", rule.StartDate); err != nil {
                 return fmt.Errorf("rule %d: invalid start_date format %q (expected YYYY-MM-DD)", i+1, rule.StartDate)
