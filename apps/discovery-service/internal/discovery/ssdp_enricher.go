@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/ssdp_enricher.go
-// Version: 1.1
+// Version: 1.2
 package discovery
 
 import (
@@ -20,12 +20,18 @@ import (
     "github.com/user/lias-dis/shared/models"
 )
 
+// EnrichmentTriggerer allows the enricher to trigger the Orchestrator without causing an import cycle.
+type EnrichmentTriggerer interface {
+    TriggerEnrichment(pdid string, force bool)
+}
+
 // SSDPEnricher uses native Go multicast UDP to discover UPnP devices.
 // It features an active M-SEARCH mechanism and a passive NOTIFY listener.
 type SSDPEnricher struct {
     ctx     context.Context
     cancel  context.CancelFunc
     cache   *inventory.Cache
+    trigger EnrichmentTriggerer
     bgQueue chan string  // Background queue for LOCATION URLs to fetch
     wg      sync.WaitGroup
 }
@@ -61,6 +67,11 @@ func (e *SSDPEnricher) Stop() error {
 // SetCache allows the passive listener to look up devices by IP.
 func (e *SSDPEnricher) SetCache(cache *inventory.Cache) {
     e.cache = cache
+}
+
+// SetEnrichmentTriggerer allows the passive listener to trigger the Orchestrator safely.
+func (e *SSDPEnricher) SetEnrichmentTriggerer(t EnrichmentTriggerer) {
+    e.trigger = t
 }
 
 // Enrich broadcasts an SSDP M-SEARCH, waits for a response, and if a response
@@ -183,32 +194,32 @@ func (e *SSDPEnricher) runPassiveListener() {
 }
 
 // runBackgroundFetcher processes LOCATION URLs from the passive queue.
+// DIS-ENR-03 Fix: Fully wired to trigger the Orchestrator safely.
 func (e *SSDPEnricher) runBackgroundFetcher() {
     e.wg.Add(1)
     defer e.wg.Done()
 
     for loc := range e.bgQueue {
-        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-        enr, err := e.fetchDescriptor(ctx, loc)
-        cancel()
-
-        if err != nil || enr == nil {
+        if e.cache == nil || e.trigger == nil {
             continue
         }
 
-        // If we have cache access, try to correlate to a device and update it
-        if e.cache != nil {
-            // To do this properly, we need the IP from the LOCATION URL
-            // E.g., http://192.168.1.50:80/desc.xml
-            if ip := extractIPFromURL(loc); ip != "" {
-                if dev := e.cache.GetByIP(ip); dev != nil {
-                    // Use the orchestrator's applyEnrichment logic by faking an event
-                    // For simplicity here, we just log it. A true implementation would 
-                    // push this to a channel the Orchestrator listens on.
-                    slog.Info("Passive SSDP discovered device data", "ip", ip, "name", enr.FriendlyName)
-                }
-            }
+        ip := extractIPFromURL(loc)
+        if ip == "" {
+            continue
         }
+
+        // Look up the device in the cache by IP
+        dev := e.cache.GetByIP(ip)
+        if dev == nil {
+            slog.Debug("Passive SSDP: Device not in cache, skipping trigger", "ip", ip)
+            continue
+        }
+
+        slog.Debug("Passive SSDP: Triggering enrichment for device", "ip", ip, "pdid", dev.PDID)
+        // Trigger the Orchestrator. The Orchestrator will safely handle deduplication
+        // (activeLocks) and diffing (applyEnrichment), ensuring no flapping occurs.
+        e.trigger.TriggerEnrichment(dev.PDID, true)
     }
 }
 
