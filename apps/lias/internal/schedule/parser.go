@@ -1,7 +1,7 @@
 // Package schedule implements time-based rule parsing and evaluation for LIAS.
 //
 // File:    apps/lias/internal/schedule/parser.go
-// Version: 1.7
+// Version: 1.8
 package schedule
 
 import (
@@ -33,12 +33,8 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
     now = now.In(loc)
 
     // LIAS-SCH-03/04 Fix: Resolve DST ambiguities.
-    // If the clock falls back, 'now' might occur twice. We force evaluation against the FIRST occurrence (DST active).
-    // If the clock springs forward, 'now' might not exist. We shift it forward by 1 hour.
     _, offset := now.Zone()
     now = now.Add(time.Duration(-offset) * time.Second) 
-    
-    // Re-apply the offset to get the absolute instant
     now = now.In(loc)
     
     var bestMatch *models.ScheduleRule
@@ -48,6 +44,55 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
     prevWeekday := (now.Weekday() + 6) % 7
 
     for _, rule := range s.Rules {
+        // LIAS-SCH-09 Fix: Calendar Date Scheduling
+        if rule.StartDate != "" && rule.EndDate != "" {
+            startDt, err1 := time.ParseInLocation("2006-01-02", rule.StartDate, loc)
+            endDt, err2 := time.ParseInLocation("2006-01-02", rule.EndDate, loc)
+            if err1 == nil && err2 == nil {
+                // Add 1 day to EndDate to make it inclusive of the whole day
+                endDt = endDt.AddDate(0, 0, 1)
+                if now.Before(startDt) || now.After(endDt) {
+                    continue
+                }
+                
+                // Match time within the date range
+                startTime, _ := time.Parse("15:04", rule.StartTime)
+                endTime, _ := time.Parse("15:04", rule.EndTime)
+                
+                year, month, day := now.Date()
+                start := time.Date(year, month, day, startTime.Hour(), startTime.Minute(), 0, 0, loc)
+                end := time.Date(year, month, day, endTime.Hour(), endTime.Minute(), 0, 0, loc)
+
+                if start.Equal(end) {
+                    continue // Zero duration
+                }
+
+                isMatch := false
+                var windowDuration time.Duration
+
+                if end.After(start) {
+                    isMatch = (now.Equal(start) || now.After(start)) && now.Before(end)
+                    windowDuration = end.Sub(start)
+                } else {
+                    // Overnight
+                    windowDuration = end.Add(24 * time.Hour).Sub(start)
+                    if (now.Equal(start) || now.After(start)) && now.Before(end.AddDate(0, 0, 1)) {
+                        isMatch = true
+                    }
+                }
+
+                if isMatch {
+                    if bestDuration == -1 || windowDuration < bestDuration {
+                        bestDuration = windowDuration
+                        r := rule
+                        bestMatch = &r
+                    }
+                }
+            }
+            continue // Skip weekly logic if dates were specified
+        }
+
+        // Weekly Scheduling
         matchesCurrentDay := false
         matchesPrevDay := false
 
@@ -80,7 +125,6 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
         start := time.Date(year, month, day, startTime.Hour(), startTime.Minute(), 0, 0, loc)
         end := time.Date(year, month, day, endTime.Hour(), endTime.Minute(), 0, 0, loc)
 
-        // LIAS-SCH-03 Fix: Detect DST transition collapsing a window
         if rule.StartTime != rule.EndTime && start.Equal(end) {
             slog.Warn("Schedule rule window collapsed to zero duration due to DST transition",
                 "schedule_id", s.ID, "rule_start", rule.StartTime, "rule_end", rule.EndTime)
@@ -149,6 +193,18 @@ func NextStateChange(s models.Schedule, now time.Time) (time.Time, error) {
         baseDate := time.Date(year, month, day+i, 0, 0, 0, 0, loc)
 
         for _, rule := range s.Rules {
+            // LIAS-SCH-09 Fix: Check calendar date transitions
+            if rule.StartDate != "" && rule.EndDate != "" {
+                startDt, err1 := time.ParseInLocation("2006-01-02", rule.StartDate, loc)
+                endDt, err2 := time.ParseInLocation("2006-01-02", rule.EndDate, loc)
+                if err1 == nil && err2 == nil {
+                    endDt = endDt.AddDate(0, 0, 1) // Include full end date
+                    if baseDate.Before(startDt) || baseDate.After(endDt) {
+                        continue
+                    }
+                }
+            }
+
             if startT, err := time.Parse("15:04", rule.StartTime); err == nil {
                 t := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), startT.Hour(), startT.Minute(), 0, 0, loc)
                 if t.After(now) {
