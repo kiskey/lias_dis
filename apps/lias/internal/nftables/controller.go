@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 2.2 (Fixed nftables.TableFamilyNetdev casing typo)
+// Version: 2.3 (GAP-L-H06 Fix: Atomic set updates via pre-validation and buffer reset)
 package nftables
 
 import (
@@ -48,7 +48,7 @@ func (c *Controller) Init() error {
 
     // 1. Create or bind the netdev table
     c.table = c.conn.AddTable(&nftables.Table{
-        Family: nftables.TableFamilyNetdev, // FIXED TYPO: Netdev instead of NetDev
+        Family: nftables.TableFamilyNetdev,
         Name:   c.cfg.TableName,
     })
 
@@ -59,7 +59,7 @@ func (c *Controller) Init() error {
         Type:     nftables.ChainTypeFilter,
         Hooknum:  nftables.ChainHookIngress,
         Priority: nftables.ChainPriorityRef(-500),
-        Device:   c.cfg.Interface, // MANDATORY KERNEL HOOK INTERFACE BINDING
+        Device:   c.cfg.Interface,
     })
 
     // Flush existing chain rules to prevent duplicate rule accumulation
@@ -116,7 +116,6 @@ func (c *Controller) Init() error {
     ifaceBytes := []byte(c.cfg.Interface + "\x00")
 
     // 4. DROP RULES FIRST (Highest Precedence for MACs)
-    // Rule 1: BLOCK MACs on c.cfg.Interface (iifname "eth0" @blocked_macs drop)
     c.conn.AddRule(&nftables.Rule{
         Table: c.table,
         Chain: c.chain,
@@ -127,7 +126,7 @@ func (c *Controller) Init() error {
                 OperationType: expr.PayloadLoad,
                 DestRegister:  1,
                 Base:          expr.PayloadBaseLLHeader,
-                Offset:        6, // Source MAC starts at byte 6 in Ethernet header
+                Offset:        6,
                 Len:           6,
             },
             &expr.Lookup{
@@ -139,8 +138,7 @@ func (c *Controller) Init() error {
         },
     })
 
-    // Rule 2: ALLOW MACs on c.cfg.Interface (iifname "eth0" @allowed_macs accept)
-    // MOVED ABOVE blocked_ips: Prevents trusted MACs from being blocked by stale IP entries
+    // Rule 2: ALLOW MACs on c.cfg.Interface
     c.conn.AddRule(&nftables.Rule{
         Table: c.table,
         Chain: c.chain,
@@ -163,7 +161,7 @@ func (c *Controller) Init() error {
         },
     })
 
-    // Rule 3: BLOCK IPs on c.cfg.Interface (iifname "eth0" @blocked_ips drop)
+    // Rule 3: BLOCK IPs on c.cfg.Interface
     c.conn.AddRule(&nftables.Rule{
         Table: c.table,
         Chain: c.chain,
@@ -174,7 +172,7 @@ func (c *Controller) Init() error {
                 OperationType: expr.PayloadLoad,
                 DestRegister:  1,
                 Base:          expr.PayloadBaseNetworkHeader,
-                Offset:        12, // Source IPv4 starts at byte 12
+                Offset:        12,
                 Len:           4,
             },
             &expr.Lookup{
@@ -186,7 +184,7 @@ func (c *Controller) Init() error {
         },
     })
 
-    // Rule 4: ALLOW IPs on c.cfg.Interface (iifname "eth0" @allowed_ips accept)
+    // Rule 4: ALLOW IPs on c.cfg.Interface
     c.conn.AddRule(&nftables.Rule{
         Table: c.table,
         Chain: c.chain,
@@ -245,6 +243,10 @@ type SetElements struct {
 }
 
 // Apply flushes existing sets and atomically updates netfilter sets with new elements.
+//
+// GAP-L-H06 Fix: Pre-validates all elements before queueing flush operations. If the transaction
+// fails midway, the connection buffer is reset to prevent stale FlushSet commands from executing
+// on the next cycle without their accompanying SetAddElements payloads.
 func (c *Controller) Apply(allowed, blocked SetElements) error {
     c.mu.Lock()
     defer c.mu.Unlock()
@@ -253,56 +255,85 @@ func (c *Controller) Apply(allowed, blocked SetElements) error {
         return fmt.Errorf("nftables connection uninitialized")
     }
 
+    // 1. Pre-validate and prepare all elements
+    allowedIPEls := make([]nftables.SetElement, 0, len(allowed.IPs))
+    for _, ip := range allowed.IPs {
+        if ip4 := ip.To4(); ip4 != nil {
+            allowedIPEls = append(allowedIPEls, nftables.SetElement{Key: ip4})
+        }
+    }
+
+    allowedMACEls := make([]nftables.SetElement, 0, len(allowed.MACs))
+    for _, mac := range allowed.MACs {
+        if len(mac) == 6 {
+            allowedMACEls = append(allowedMACEls, nftables.SetElement{Key: mac})
+        }
+    }
+
+    blockedIPEls := make([]nftables.SetElement, 0, len(blocked.IPs))
+    for _, ip := range blocked.IPs {
+        if ip4 := ip.To4(); ip4 != nil {
+            blockedIPEls = append(blockedIPEls, nftables.SetElement{Key: ip4})
+        }
+    }
+
+    blockedMACEls := make([]nftables.SetElement, 0, len(blocked.MACs))
+    for _, mac := range blocked.MACs {
+        if len(mac) == 6 {
+            blockedMACEls = append(blockedMACEls, nftables.SetElement{Key: mac})
+        }
+    }
+
+    // 2. Queue flush operations
     c.conn.FlushSet(c.sets["allowed_ips"])
     c.conn.FlushSet(c.sets["allowed_macs"])
     c.conn.FlushSet(c.sets["blocked_ips"])
     c.conn.FlushSet(c.sets["blocked_macs"])
 
-    if err := c.addElements("allowed_ips", allowed.IPs); err != nil {
-        return err
+    // 3. Queue add operations, handling errors to reset buffer if needed
+    if len(allowedIPEls) > 0 {
+        if err := c.conn.SetAddElements(c.sets["allowed_ips"], allowedIPEls); err != nil {
+            c.reinitializeConn()
+            return fmt.Errorf("failed to queue allowed_ips: %w", err)
+        }
     }
-    if err := c.addElements("allowed_macs", allowed.MACs); err != nil {
-        return err
+    if len(allowedMACEls) > 0 {
+        if err := c.conn.SetAddElements(c.sets["allowed_macs"], allowedMACEls); err != nil {
+            c.reinitializeConn()
+            return fmt.Errorf("failed to queue allowed_macs: %w", err)
+        }
     }
-    if err := c.addElements("blocked_ips", blocked.IPs); err != nil {
-        return err
+    if len(blockedIPEls) > 0 {
+        if err := c.conn.SetAddElements(c.sets["blocked_ips"], blockedIPEls); err != nil {
+            c.reinitializeConn()
+            return fmt.Errorf("failed to queue blocked_ips: %w", err)
+        }
     }
-    if err := c.addElements("blocked_macs", blocked.MACs); err != nil {
-        return err
+    if len(blockedMACEls) > 0 {
+        if err := c.conn.SetAddElements(c.sets["blocked_macs"], blockedMACEls); err != nil {
+            c.reinitializeConn()
+            return fmt.Errorf("failed to queue blocked_macs: %w", err)
+        }
     }
 
+    // 4. Commit transaction atomically
     if err := c.conn.Flush(); err != nil {
+        // If the kernel rejects the batch, reset the connection buffer
+        c.reinitializeConn()
         return fmt.Errorf("failed to commit nftables set update: %w", err)
     }
 
     return nil
 }
 
-func (c *Controller) addElements(setName string, items interface{}) error {
-    set := c.sets[setName]
-    var elements []nftables.SetElement
-
-    switch v := items.(type) {
-    case []net.IP:
-        for _, ip := range v {
-            if ip4 := ip.To4(); ip4 != nil {
-                elements = append(elements, nftables.SetElement{Key: ip4})
-            }
-        }
-    case []net.HardwareAddr:
-        for _, mac := range v {
-            if len(mac) == 6 {
-                elements = append(elements, nftables.SetElement{Key: mac})
-            }
-        }
-    default:
-        return fmt.Errorf("unsupported element type for set %s", setName)
+// reinitializeConn safely discards the dirty netlink buffer by creating a new connection.
+// The kernel maintains the last successfully applied state, so the next Apply() cycle
+// will simply re-flush and re-add the correct elements.
+func (c *Controller) reinitializeConn() {
+    conn, err := nftables.New()
+    if err != nil {
+        slog.Error("Failed to reinitialize nftables connection", "error", err)
+        return
     }
-
-    if len(elements) > 0 {
-        if err := c.conn.SetAddElements(set, elements); err != nil {
-            return fmt.Errorf("failed to add elements to set %s: %w", setName, err)
-        }
-    }
-    return nil
+    c.conn = conn
 }

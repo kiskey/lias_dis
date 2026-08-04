@@ -1,8 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 2.4 (Timezone UX Dropdown & Empty Schedule Warnings)
-
+// Version: 2.7 (Fixes overnight band rendering & 12hr conflict format)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -29,6 +28,13 @@ class App {
     this.initRouter();
     this.initSSE();
     this.loadData();
+
+    // Auto-refresh dashboard view every minute to update live enforcements dynamically
+    setInterval(() => {
+      if (this.currentView === 'dashboard') {
+        this.renderCurrentView();
+      }
+    }, 60000);
   }
 
   initRouter() {
@@ -142,12 +148,139 @@ class App {
     }
   }
 
+  // Dashboard Live Enforcements Helper Methods
+  getActiveScheduleAction(schedule) {
+    if (!schedule || !schedule.rules || schedule.rules.length === 0) return null;
+    try {
+      const tz = schedule.timezone || 'UTC';
+      const fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz,
+        weekday: 'short',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+      });
+      const parts = fmt.formatToParts(new Date());
+      let weekday = '', hour = 0, minute = 0;
+      for (const p of parts) {
+        if (p.type === 'weekday') weekday = p.value.toLowerCase();
+        else if (p.type === 'hour') hour = parseInt(p.value, 10) % 24;
+        else if (p.type === 'minute') minute = parseInt(p.value, 10);
+      }
+      const dayMap = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+      if (!(weekday in dayMap)) return null;
+      
+      const currentMin = dayMap[weekday] * 1440 + hour * 60 + minute;
+      const segments = projectSchedule(schedule);
+      
+      for (const seg of segments) {
+        if (currentMin >= seg.start && currentMin < seg.end) {
+          return seg.action;
+        }
+      }
+    } catch (e) {
+      console.error("Failed to evaluate schedule active state", e);
+    }
+    return null;
+  }
+
+  isTimezoneInDST(tz) {
+    try {
+      const now = new Date();
+      const fmtLong = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' });
+      const parts = fmtLong.formatToParts(now);
+      const tzName = parts.find(p => p.type === 'timeZoneName')?.value || '';
+      return tzName.includes('DT') || tzName.includes('DST');
+    } catch {
+      return false;
+    }
+  }
+
+  renderActiveEnforcementsHtml() {
+    const activeItems = [];
+    
+    this.policies.forEach(p => {
+      if (p.action === 'schedule' && p.type !== 'global') {
+        const targetTag = this.tags.find(t => t.id === p.target_id);
+        const targetName = p.type === 'tag' 
+            ? (targetTag?.name || p.target_id) 
+            : (this.devices.find(d => d.pdid === p.target_id)?.hostname || p.target_id);
+        const targetColor = p.type === 'tag' 
+            ? (targetTag?.color || '#8e8e93') 
+            : '#8e8e93';
+
+        const scheds = this.resolvePolicySchedules(p);
+        for (const s of scheds) {
+          const activeAction = this.getActiveScheduleAction(s);
+          if (activeAction) {
+            activeItems.push({
+              policyName: p.name,
+              targetName: targetName,
+              targetColor: targetColor,
+              scheduleName: s.name,
+              action: activeAction,
+              timezone: s.timezone,
+              isDST: this.isTimezoneInDST(s.timezone)
+            });
+            break; // One active schedule per policy is enough to show
+          }
+        }
+      }
+    });
+
+    if (activeItems.length === 0) {
+      return `
+        <div class="card" style="margin-bottom: 24px; background: var(--bg-secondary); border: 1px dashed var(--separator);">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="active-empty-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+            </div>
+            <div>
+              <h3 style="font-size: 16px; font-weight: 700; margin-bottom: 2px;">No Active Schedules</h3>
+              <p style="font-size: 13px; color: var(--text-secondary);">All devices are currently operating under their default policies.</p>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="active-enforcements-container">
+        ${activeItems.map(item => `
+          <div class="live-activity-card ${item.action === 'block' ? 'is-blocking' : 'is-allowing'}">
+            <div class="live-activity-icon">
+              ${item.action === 'block' 
+                ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line></svg>'
+                : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>'
+              }
+            </div>
+            <div class="live-activity-content">
+              <div class="live-activity-status">${item.action === 'block' ? 'Internet Blocked' : 'Internet Allowed'}</div>
+              <div class="live-activity-details">
+                <span class="group-dot" style="background-color: ${item.targetColor};"></span>
+                <strong>${item.targetName}</strong> 
+                <span style="color: var(--text-secondary); margin-left: 4px;">${item.scheduleName}</span>
+              </div>
+            </div>
+            ${item.isDST ? '<div class="dst-pill">DST Active</div>' : ''}
+          </div>
+        `).join('')}
+      </div>
+    `;
+  }
+
   renderDashboardView(container) {
     const total = this.devices.length;
     const online = this.devices.filter(d => d.online).length;
     const offline = total - online;
 
     container.innerHTML = `
+      <div style="margin-bottom: 20px;">
+        <h3 style="font-size: 20px; font-weight: 800; letter-spacing: -0.5px;">Active Enforcements</h3>
+        <p style="font-size: 13px; color: var(--text-secondary); margin-top: 2px;">Live status of scheduled policies currently in effect.</p>
+      </div>
+      ${this.renderActiveEnforcementsHtml()}
+
       <div class="global-switch-banner">
         <div class="global-switch-top">
           <div>
@@ -428,17 +561,36 @@ class App {
     });
 
     document.querySelectorAll('.btn-delete-policy').forEach(btn => {
-      btn.addEventListener('click', async (e) => {
+      btn.addEventListener('click', (e) => {
         const id = e.currentTarget.dataset.id;
-        if (confirm('Are you sure you want to delete this policy?')) {
+        const p = this.policies.find(item => item.id === id);
+        if (!p) return;
+        
+        this.openModal('Delete Policy', `
+          <div class="modal-warning-icon">⚠️</div>
+          <p style="text-align: center; font-size: 15px; margin-bottom: 8px;">
+            Are you sure you want to delete the policy <strong>${p.name}</strong>?
+          </p>
+          <p style="text-align: center; font-size: 13px; color: var(--text-secondary);">
+            This action cannot be undone. Devices affected by this policy will revert to the global default rules.
+          </p>
+        `, `
+          <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+          <button class="btn btn-danger" id="modal-confirm">Delete</button>
+        `);
+
+        document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
+        document.getElementById('modal-confirm').addEventListener('click', async () => {
           try {
             await API.deletePolicy(id);
             this.showToast('Policy deleted');
+            this.closeModal();
             this.loadData();
           } catch (err) {
             this.showToast(`Failed to delete policy: ${err.message}`, 'danger');
+            this.closeModal();
           }
-        }
+        });
       });
     });
   }
@@ -561,6 +713,18 @@ class App {
     });
   }
 
+  // HIG Time Formatter Helper
+  formatTimeTo12hr(timeStr) {
+    if (!timeStr) return '';
+    const parts = timeStr.split(':');
+    const h = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    const period = h >= 12 ? 'PM' : 'AM';
+    let hour12 = h % 12;
+    if (hour12 === 0) hour12 = 12;
+    return `${hour12}:${String(m).padStart(2, '0')} ${period}`;
+  }
+
   renderWeeklyTimeline(schedules) {
     if (!schedules || schedules.length === 0) return '';
 
@@ -578,7 +742,19 @@ class App {
       `;
     }
 
+    // Project all schedules into segments using the shared logic to ensure overnight continuity is handled
+    let allSegments = [];
+    schedules.forEach((s, sIdx) => {
+      const segs = projectSchedule(s);
+      segs.forEach(seg => {
+        seg.color = colors[sIdx % colors.length];
+        seg.scheduleName = s.name;
+      });
+      allSegments = allSegments.concat(segs);
+    });
+
     const days = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+    const dayIndices = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
 
     let html = `<div class="weekly-timeline">`;
     html += tzWarningHtml;
@@ -588,52 +764,77 @@ class App {
         <div class="hig-callout-warning" style="margin-top:0; margin-bottom:8px;">
           <strong>⚠️ Schedule Contradiction Detected</strong>
           <ul>
-            ${conflicts.map(c => `<li>${c.schedule_a_name} (${c.action_a.toUpperCase()}) vs ${c.schedule_b_name} (${c.action_b.toUpperCase()}) on ${c.day} ${c.overlap_start}-${c.overlap_end}</li>`).join('')}
+            ${conflicts.map(c => `<li>${c.schedule_a_name} (${c.action_a.toUpperCase()}) vs ${c.schedule_b_name} (${c.action_b.toUpperCase()}) on ${c.day} ${this.formatTimeTo12hr(c.overlap_start)} - ${this.formatTimeTo12hr(c.overlap_end)}</li>`).join('')}
           </ul>
         </div>
       `;
     }
 
+    // HIG Time Axis Header
+    html += `
+      <div class="timeline-axis">
+        <div class="timeline-day-label"></div>
+        <div class="timeline-axis-track">
+          <div class="axis-mark" style="left: 0%; transform: translateX(0);">12 AM</div>
+          <div class="axis-mark" style="left: 25%;">6 AM</div>
+          <div class="axis-mark" style="left: 50%;">12 PM</div>
+          <div class="axis-mark" style="left: 75%;">6 PM</div>
+          <div class="axis-mark" style="left: 100%; transform: translateX(-100%);">12 AM</div>
+        </div>
+      </div>
+    `;
+
     days.forEach((day) => {
+      const dayIdx = dayIndices[day];
       html += `
         <div class="timeline-day-row">
           <div class="timeline-day-label">${day}</div>
           <div class="timeline-track">
       `;
 
-      schedules.forEach((s, sIdx) => {
-        const color = colors[sIdx % colors.length];
-        (s.rules || []).forEach(rule => {
-          if ((rule.days || []).map(d => d.toLowerCase().substring(0, 3)).includes(day)) {
-            const startParts = (rule.start_time || '00:00').split(':');
-            const endParts = (rule.end_time || '23:59').split(':');
-
-            const startMin = parseInt(startParts[0], 10) * 60 + parseInt(startParts[1], 10);
-            const endMin = parseInt(endParts[0], 10) * 60 + parseInt(endParts[1], 10);
-
-            if (startMin < endMin) {
-              const leftPct = ((startMin / 1440) * 100).toFixed(1);
-              const widthPct = (((endMin - startMin) / 1440) * 100).toFixed(1);
-              html += `<div class="timeline-band" style="left:${leftPct}%; width:${widthPct}%; background:${color};" title="${s.name}: ${rule.start_time}-${rule.end_time} (${rule.action})"></div>`;
-            } else {
-              const leftPct = ((startMin / 1440) * 100).toFixed(1);
-              const widthPct = (((1440 - startMin) / 1440) * 100).toFixed(1);
-              html += `<div class="timeline-band" style="left:${leftPct}%; width:${widthPct}%; background:${color};" title="${s.name}: ${rule.start_time}-Midnight (${rule.action})"></div>`;
-            }
-          }
-        });
+      // Filter segments that belong to this specific day
+      const daySegments = allSegments.filter(seg => {
+        const segDayIdx = Math.floor(seg.start / 1440);
+        return segDayIdx === dayIdx;
       });
 
+      daySegments.forEach(seg => {
+        const startMin = seg.start % 1440;
+        // FIX: If segment ends at exactly 24:00 (1440), modulo gives 0. We must treat 0 as 1440 for width calculation.
+        let endMin = seg.end % 1440;
+        if (endMin === 0 && seg.end > seg.start) {
+            endMin = 1440;
+        }
+        
+        // Convert minute indices back to HH:MM for the tooltip
+        const startH = Math.floor(startMin / 60);
+        const startM = startMin % 60;
+        const endH = Math.floor(endMin / 60);
+        const endM = endMin % 60;
+        
+        const startStr = this.formatTimeTo12hr(`${String(startH).padStart(2,'0')}:${String(startM).padStart(2,'0')}`);
+        const endStr = this.formatTimeTo12hr(`${String(endH).padStart(2,'0')}:${String(endM).padStart(2,'0')}`);
+
+        const leftPct = ((startMin / 1440) * 100).toFixed(1);
+        const widthPct = (((endMin - startMin) / 1440) * 100).toFixed(1);
+        
+        html += `<div class="timeline-band" style="left:${leftPct}%; width:${widthPct}%; background:${seg.color};" title="${seg.scheduleName}: ${startStr} - ${endStr} (${seg.action})"></div>`;
+      });
+
+      // Conflict bands
       conflicts.forEach(c => {
         if (c.day.substring(0, 3).toLowerCase() === day) {
           const startParts = c.overlap_start.split(':');
           const endParts = c.overlap_end.split(':');
           const startMin = parseInt(startParts[0], 10) * 60 + parseInt(startParts[1], 10);
           const endMin = parseInt(endParts[0], 10) * 60 + parseInt(endParts[1], 10);
-
-          const leftPct = ((startMin / 1440) * 100).toFixed(1);
-          const widthPct = (((endMin - startMin) / 1440) * 100).toFixed(1);
-          html += `<div class="timeline-band conflict" style="left:${leftPct}%; width:${widthPct}%;" title="CONFLICT: ${c.schedule_a_name} vs ${c.schedule_b_name} (${c.overlap_start}-${c.overlap_end})"></div>`;
+          
+          // Only draw if it's a valid same-day segment representation
+          if (startMin < endMin) {
+            const leftPct = ((startMin / 1440) * 100).toFixed(1);
+            const widthPct = (((endMin - startMin) / 1440) * 100).toFixed(1);
+            html += `<div class="timeline-band conflict" style="left:${leftPct}%; width:${widthPct}%;" title="CONFLICT: ${c.schedule_a_name} vs ${c.schedule_b_name}"></div>`;
+          }
         }
       });
 
@@ -935,7 +1136,7 @@ class App {
     const s = existingSchedule ? JSON.parse(JSON.stringify(existingSchedule)) : {
       name: '',
       mode: 'downtime',
-      timezone: 'UTC', // Default to UTC for new schedules
+      timezone: 'UTC',
       rules: [{ days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_time: '22:00', end_time: '06:00', action: 'block' }]
     };
 
@@ -953,7 +1154,6 @@ class App {
           </select>
         </div>
         
-        <!-- UX Timezone Dropdown -->
         <div>
           <label style="font-size:12px; font-weight:700;">Timezone</label>
           <select id="sched-tz" style="width:100%; margin-top:4px;">
@@ -1028,7 +1228,7 @@ class App {
 
         <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
           <div class="overnight-container">
-            ${isOvernight && !isAllDay ? `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${rule.end_time} the FOLLOWING day</div>` : ''}
+            ${isOvernight && !isAllDay ? `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${this.formatTimeTo12hr(rule.end_time)} the FOLLOWING day</div>` : ''}
           </div>
           <label style="display:flex; align-items:center; gap:4px; font-size:11px; font-weight:600; color:var(--text-secondary);">
             <input type="checkbox" class="rule-all-day" ${isAllDay ? 'checked' : ''}> All Day
@@ -1067,7 +1267,7 @@ class App {
         if (allDayChk && allDayChk.checked) return;
 
         if (start && end && end <= start) {
-          container.innerHTML = `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${end} the FOLLOWING day</div>`;
+          container.innerHTML = `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${this.formatTimeTo12hr(end)} the FOLLOWING day</div>`;
         } else {
           container.innerHTML = '';
         }
@@ -1125,7 +1325,7 @@ class App {
       }
 
       const mode = document.getElementById('sched-mode').value;
-      const timezone = document.getElementById('sched-tz').value; // Read from dropdown
+      const timezone = document.getElementById('sched-tz').value;
 
       const rules = [];
       document.querySelectorAll('.rule-row').forEach(row => {
