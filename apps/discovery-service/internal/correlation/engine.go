@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 4.1
+// Version: 4.2
 package correlation
 
 import (
@@ -35,7 +35,10 @@ type Engine struct {
 
     // DIS-IO-01 Fix: Dirty device batching
     dirtyMu      sync.Mutex
-    dirtyDevices map[string]*models.Device
+    dirtyDevices map[string]struct{} // CONC-01/CPU-02 Fix: Store only PDID to prevent stale overwrites
+
+    // CONC-02 Fix: Lock for identity promotion
+    promoteMu sync.Mutex
 }
 
 func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
@@ -45,7 +48,7 @@ func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
         broker:       broker,
         debouncer:    deb,
         lastSeenObs:  make(map[string]time.Time),
-        dirtyDevices: make(map[string]*models.Device),
+        dirtyDevices: make(map[string]struct{}),
     }
 }
 
@@ -97,8 +100,6 @@ func (e *Engine) Run(ctx context.Context, providers []discovery.DiscoveryProvide
     }
     go e.runStalenessSweep(ctx)
     go e.runDedupSweep(ctx)
-    
-    // DIS-IO-01 Fix: Start dirty device batch flusher
     go e.runDirtyFlusher(ctx)
 }
 
@@ -122,18 +123,32 @@ func (e *Engine) flushDirty() {
         e.dirtyMu.Unlock()
         return
     }
-    devs := make([]*models.Device, 0, len(e.dirtyDevices))
-    for _, d := range e.dirtyDevices {
-        devs = append(devs, d)
+    // CONC-01 Fix: Copy PDIDs and clear map immediately to minimize lock contention
+    pdids := make([]string, 0, len(e.dirtyDevices))
+    for pdid := range e.dirtyDevices {
+        pdids = append(pdids, pdid)
     }
-    e.dirtyDevices = make(map[string]*models.Device)
+    e.dirtyDevices = make(map[string]struct{})
     e.dirtyMu.Unlock()
 
-    if e.store != nil {
+    devs := make([]*models.Device, 0, len(pdids))
+    for _, pdid := range pdids {
+        // CONC-01 Fix: Fetch fresh copy from cache right before saving
+        d := e.cache.Get(pdid)
+        if d != nil {
+            devs = append(devs, d)
+        }
+    }
+
+    if e.store != nil && len(devs) > 0 {
         if err := e.store.SaveDevicesBatch(devs); err != nil {
             slog.Error("Failed to flush dirty devices batch to storage", "count", len(devs), "error", err)
-            // Re-queue? For simplicity, we drop on failure to prevent map bloat. 
-            // The next dirty event will retry.
+            // CONC-03 Fix: Re-queue PDIDs on failure to prevent data loss
+            e.dirtyMu.Lock()
+            for _, d := range devs {
+                e.dirtyDevices[d.PDID] = struct{}{}
+            }
+            e.dirtyMu.Unlock()
         }
     }
 }
@@ -142,12 +157,9 @@ func (e *Engine) markDirty(pdid string) {
     if e.store == nil || pdid == "" {
         return
     }
-    d := e.cache.Get(pdid)
-    if d != nil {
-        e.dirtyMu.Lock()
-        e.dirtyDevices[pdid] = d
-        e.dirtyMu.Unlock()
-    }
+    e.dirtyMu.Lock()
+    e.dirtyDevices[pdid] = struct{}{}
+    e.dirtyMu.Unlock()
 }
 
 func (e *Engine) runDedupSweep(ctx context.Context) {
@@ -290,6 +302,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             }
             if !ipAlreadyKnown {
                 existing.AddIP(ipStr)
+                e.cache.Upsert(existing)
                 e.markDirty(existing.PDID)
             }
             return
@@ -307,8 +320,9 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     d := e.cache.GetByMACOrIP(macStr, ipStr)
     dirty := false
 
+    // MATH-02 Fix: Removed cache.SetCurrentMAC/IP calls. Mutate local copy `d` directly.
     if macStr != "" && d != nil && d.HasMAC(macStr) && d.CurrentMAC != macStr {
-        e.cache.SetCurrentMAC(d.PDID, macStr)
+        d.CurrentMAC = macStr
         dirty = true
     }
 
@@ -318,7 +332,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             if claimRes == ClaimAttach {
                 oldMAC := d.CurrentMAC
                 d.AddMAC(macStr)
-                e.cache.SetCurrentMAC(d.PDID, macStr)
+                d.CurrentMAC = macStr
                 e.debouncer.Submit(d.PDID, models.EventMACChanged, obs.Source, obs.Group, models.DeviceEventPayload{
                     PDID:      d.PDID,
                     MAC:       macStr,
@@ -326,6 +340,9 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                     Timestamp: time.Now(),
                 })
                 dirty = true
+            } else if claimRes == ClaimCreateNewSilent {
+                // NET-02 Fix: Silent DHCP reassignment
+                d = nil
             } else {
                 e.broker.Broadcast(models.NewEvent(models.EventSecurityAlert, d.PDID, models.SecurityAlertPayload{
                     AlertType: "mac_spoof_detected",
@@ -344,7 +361,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                 if claimRes == ClaimAttach {
                     oldMAC := existingOnIP.CurrentMAC
                     existingOnIP.AddMAC(macStr)
-                    e.cache.SetCurrentMAC(existingOnIP.PDID, macStr)
+                    existingOnIP.CurrentMAC = macStr
                     e.debouncer.Submit(existingOnIP.PDID, models.EventMACChanged, obs.Source, obs.Group, models.DeviceEventPayload{
                         PDID:      existingOnIP.PDID,
                         MAC:       macStr,
@@ -353,6 +370,9 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                     })
                     d = existingOnIP 
                     dirty = true
+                } else if claimRes == ClaimCreateNewSilent {
+                    // NET-02 Fix: Silent DHCP reassignment
+                    d = nil
                 } else {
                     e.broker.Broadcast(models.NewEvent(models.EventSecurityAlert, existingOnIP.PDID, models.SecurityAlertPayload{
                         AlertType: "mac_spoof_detected",
@@ -428,35 +448,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
     newTier, newAnchor := inventory.DeriveTierAndAnchor(macStr, canonicalHost, obs.Vendor)
     if inventory.CanPromote(d.IdentityTier, newTier) {
-        oldPDID := d.PDID
-        newPDID := inventory.GeneratePDID(newTier, newAnchor)
-
-        slog.Info("Promoting device identity tier", "old_pdid", oldPDID, "new_pdid", newPDID, "from", d.IdentityTier, "to", newTier)
-
-        e.cache.Delete(oldPDID)
-        // Delete immediately from DB to prevent PDID collision on flush
-        if e.store != nil {
-            _ = e.store.DeleteDevice(oldPDID)
-        }
-
-        d.PDID = newPDID
-        d.IdentityTier = newTier
-        d.IdentityAnchor = newAnchor
-        d.CanonicalHostname = canonicalHost
-
-        e.cache.Upsert(d)
-        e.markDirty(d.PDID)
-
-        migratedMACs := make([]string, len(d.MACs))
-        copy(migratedMACs, d.MACs)
-
-        e.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, d.PDID, models.DeviceReidentifiedPayload{
-            OldPDID:      oldPDID,
-            NewPDID:      newPDID,
-            Reason:       string(newTier) + "_observed",
-            MigratedMACs: migratedMACs,
-            Timestamp:    time.Now(),
-        }))
+        e.promoteDevice(d, newTier, newAnchor, canonicalHost, "observed")
         return
     }
 
@@ -495,7 +487,8 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
     if ipStr != "" && canUpdateCurrentIP(obs.Source) && d.CurrentIP != ipStr {
         oldIP := d.CurrentIP
-        e.cache.SetCurrentIP(d.PDID, ipStr)
+        d.CurrentIP = ipStr
+        d.AddIP(ipStr)
         e.debouncer.Submit(d.PDID, models.EventIPChanged, obs.Source, obs.Group, models.DeviceEventPayload{
             PDID:      d.PDID,
             IP:        ipStr,
@@ -506,11 +499,56 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     }
 
     d.Touch(time.Now())
+    
+    // CPU-01 Fix: Only Upsert if dirty or if LastSeen needs updating in cache
+    // Since Touch modifies LastSeen, we must Upsert to reflect that in cache.
     e.cache.Upsert(d)
 
     if dirty {
         e.markDirty(d.PDID)
     }
+}
+
+// CONC-02 Fix: Extracted promotion logic to a locked helper
+func (e *Engine) promoteDevice(d *models.Device, newTier models.IdentityTier, newAnchor, canonicalHost, reasonSuffix string) {
+    e.promoteMu.Lock()
+    defer e.promoteMu.Unlock()
+
+    oldPDID := d.PDID
+    newPDID := inventory.GeneratePDID(newTier, newAnchor)
+
+    slog.Info("Promoting device identity tier", "old_pdid", oldPDID, "new_pdid", newPDID, "from", d.IdentityTier, "to", newTier)
+
+    d.PDID = newPDID
+    d.IdentityTier = newTier
+    d.IdentityAnchor = newAnchor
+    d.CanonicalHostname = canonicalHost
+
+    // IO-05 Fix: Atomic DB replacement
+    if e.store != nil {
+        if err := e.store.ReplaceDevicePDID(oldPDID, newPDID, d); err != nil {
+            slog.Error("Atomic PDID replacement failed", "old", oldPDID, "new", newPDID, "error", err)
+            // Revert in-memory changes on failure
+            d.PDID = oldPDID
+            d.IdentityTier = inventory.TierL7 // revert tier
+            return
+        }
+    }
+
+    e.cache.Delete(oldPDID)
+    e.cache.Upsert(d)
+    e.markDirty(d.PDID)
+
+    migratedMACs := make([]string, len(d.MACs))
+    copy(migratedMACs, d.MACs)
+
+    e.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, d.PDID, models.DeviceReidentifiedPayload{
+        OldPDID:      oldPDID,
+        NewPDID:      newPDID,
+        Reason:       string(newTier) + "_" + reasonSuffix,
+        MigratedMACs: migratedMACs,
+        Timestamp:    time.Now(),
+    }))
 }
 
 func (e *Engine) PromoteDeviceIdentity(pdid string) *models.Device {
@@ -522,37 +560,9 @@ func (e *Engine) PromoteDeviceIdentity(pdid string) *models.Device {
     newTier, newAnchor := inventory.DeriveTierAndAnchor(d.CurrentMAC, d.CanonicalHostname, d.Vendor)
     
     if inventory.CanPromote(d.IdentityTier, newTier) {
-        oldPDID := d.PDID
-        newPDID := inventory.GeneratePDID(newTier, newAnchor)
-
-        slog.Info("Promoting device identity tier via enrichment", "old_pdid", oldPDID, "new_pdid", newPDID, "from", d.IdentityTier, "to", newTier)
-
-        e.cache.Delete(oldPDID)
-        if e.store != nil {
-            _ = e.store.DeleteDevice(oldPDID)
-        }
-
-        d.PDID = newPDID
-        d.IdentityTier = newTier
-        d.IdentityAnchor = newAnchor
-
-        e.cache.Upsert(d)
-        e.markDirty(d.PDID)
-
-        migratedMACs := make([]string, len(d.MACs))
-        copy(migratedMACs, d.MACs)
-
-        e.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, d.PDID, models.DeviceReidentifiedPayload{
-            OldPDID:      oldPDID,
-            NewPDID:      newPDID,
-            Reason:       string(newTier) + "_observed_via_enrichment",
-            MigratedMACs: migratedMACs,
-            Timestamp:    time.Now(),
-        }))
-        
-        return d
+        e.promoteDevice(d, newTier, newAnchor, d.CanonicalHostname, "via_enrichment")
+        return e.cache.Get(d.PDID)
     }
-    
     return d
 }
 
