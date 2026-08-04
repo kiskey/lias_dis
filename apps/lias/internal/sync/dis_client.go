@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 1.9
+// Version: 2.0
 package sync
 
 import (
@@ -28,13 +28,12 @@ type EventBroadcaster interface {
 type DISClient struct {
     cfg     config.DISConfig
     cache   *Cache
-    store   StorageMigrator // NEW: Interface for DB migration
+    store   StorageMigrator
     client  *http.Client
     trigger chan struct{}
     broker  EventBroadcaster
 }
 
-// StorageMigrator allows DISClient to migrate tag assignments without importing sqlite directly
 type StorageMigrator interface {
     MigrateDeviceTag(oldPDID, newPDID string) error
 }
@@ -133,6 +132,20 @@ func (c *DISClient) pollDevices() {
         return
     }
 
+    // GAP-L-CR05 Fix: Reconcile cache by removing stale devices
+    activePDIDs := make(map[string]bool)
+    for _, d := range listResp.Devices {
+        activePDIDs[d.PDID] = true
+    }
+
+    cachedPDIDs := c.cache.ListPDIDs()
+    for _, pdid := range cachedPDIDs {
+        if !activePDIDs[pdid] {
+            c.cache.RemoveDevice(pdid)
+            slog.Info("Removed stale device from LIAS cache (no longer reported by DIS)", "pdid", pdid)
+        }
+    }
+
     for _, d := range listResp.Devices {
         prev := c.cache.Get(d.PDID)
         isNewDevice := prev == nil
@@ -142,7 +155,6 @@ func (c *DISClient) pollDevices() {
         if isNewDevice {
             slog.Info("Completely new device discovered in LIAS", "pdid", d.PDID, "name", d.DisplayName())
             if c.broker != nil {
-                // Broadcast explicit EventDeviceAdded to trigger UI toast notification for brand-new device
                 c.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
             }
         } else if c.broker != nil && prev.Online != d.Online {
@@ -276,22 +288,19 @@ func (c *DISClient) handleEvent(e models.Event) {
             c.broker.Broadcast(e)
         }
 
-    case models.EventDeviceReidentified: // GAP-L02
+    case models.EventDeviceReidentified:
         var payload models.DeviceReidentifiedPayload
         if len(e.Payload) > 0 {
             json.Unmarshal(e.Payload, &payload)
         }
 
         if payload.OldPDID != "" && payload.NewPDID != "" {
-            // Migrate sticky tags from old PDID to new PDID in cache
             c.cache.MigrateDeviceIdentity(payload.OldPDID, payload.NewPDID, payload.MigratedMACs)
 
-            // Migrate tag persistence in storage
             if c.store != nil {
                 _ = c.store.MigrateDeviceTag(payload.OldPDID, payload.NewPDID)
             }
 
-            // Fetch the new device record to upsert into cache
             if c.fetchSingleDevice(payload.NewPDID) {
                 c.tryTrigger()
             }
@@ -306,14 +315,12 @@ func (c *DISClient) handleEvent(e models.Event) {
             }
         }
 
-    case models.EventDeviceAdded, models.EventDeviceOnline, models.EventDeviceOffline,
-        models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged, models.EventFingerprintUpdated:
-
+    case models.EventDeviceAdded, models.EventDeviceOnline, models.EventFingerprintUpdated:
+        // GAP-L-CR02 Fix: Only these events carry full models.Device payloads
         go func(pdid string, evt models.Event) {
             prev := c.cache.Get(pdid)
             isNewDevice := prev == nil || evt.Type == models.EventDeviceAdded
 
-            // Attempt to unmarshal full Device payload directly from event to avoid extra REST call
             var inlineDev models.Device
             if len(evt.Payload) > 0 && json.Unmarshal(evt.Payload, &inlineDev) == nil && inlineDev.PDID == pdid {
                 c.cache.UpsertDevice(inlineDev)
@@ -324,14 +331,25 @@ func (c *DISClient) handleEvent(e models.Event) {
 
             if c.broker != nil {
                 if isNewDevice {
-                    // Ensure event type is explicitly EventDeviceAdded so Web UI displays new device toast
                     evt.Type = models.EventDeviceAdded
                 }
                 c.broker.Broadcast(evt)
             }
         }(e.DeviceID, e)
 
-    default: // GAP-I02
+    case models.EventDeviceOffline, models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged:
+        // GAP-L-CR02 Fix: These events carry DeviceEventPayload, not models.Device. Always fetch.
+        go func(pdid string, evt models.Event) {
+            if c.fetchSingleDevice(pdid) {
+                c.tryTrigger()
+            }
+            
+            if c.broker != nil {
+                c.broker.Broadcast(evt)
+            }
+        }(e.DeviceID, e)
+
+    default:
         slog.Debug("Unhandled DIS event type", "type", e.Type, "device_id", e.DeviceID)
     }
 }
