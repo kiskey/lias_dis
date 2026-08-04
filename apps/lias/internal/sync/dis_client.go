@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 2.0
+// Version: 2.1
 package sync
 
 import (
@@ -25,27 +25,30 @@ type EventBroadcaster interface {
     Broadcast(event models.Event)
 }
 
-type DISClient struct {
-    cfg     config.DISConfig
-    cache   *Cache
-    store   StorageMigrator
-    client  *http.Client
-    trigger chan struct{}
-    broker  EventBroadcaster
-}
-
 type StorageMigrator interface {
     MigrateDeviceTag(oldPDID, newPDID string) error
+    MigrateDevicePolicies(oldPDID, newPDID string) error // LIAS-POL-15 Fix
+}
+
+type DISClient struct {
+    cfg          config.DISConfig
+    cache        *Cache
+    store        StorageMigrator
+    client       *http.Client
+    trigger      chan struct{}
+    broker       EventBroadcaster
+    lastSeenInDIS map[string]time.Time // LIAS-SYNC-10 Fix: Grace period tracking
 }
 
 func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, broker EventBroadcaster, store StorageMigrator) *DISClient {
     return &DISClient{
-        cfg:     cfg,
-        cache:   cache,
-        store:   store,
-        client:  &http.Client{Timeout: 10 * time.Second},
-        trigger: trigger,
-        broker:  broker,
+        cfg:           cfg,
+        cache:         cache,
+        store:         store,
+        client:        &http.Client{Timeout: 10 * time.Second},
+        trigger:       trigger,
+        broker:        broker,
+        lastSeenInDIS: make(map[string]time.Time),
     }
 }
 
@@ -132,17 +135,25 @@ func (c *DISClient) pollDevices() {
         return
     }
 
-    // GAP-L-CR05 Fix: Reconcile cache by removing stale devices
     activePDIDs := make(map[string]bool)
     for _, d := range listResp.Devices {
         activePDIDs[d.PDID] = true
+        c.lastSeenInDIS[d.PDID] = time.Now() // LIAS-SYNC-10 Fix: Update last seen time
     }
 
     cachedPDIDs := c.cache.ListPDIDs()
     for _, pdid := range cachedPDIDs {
         if !activePDIDs[pdid] {
+            // LIAS-SYNC-10 Fix: Apply 5-minute grace period before removal
+            if lastSeen, ok := c.lastSeenInDIS[pdid]; ok {
+                if time.Since(lastSeen) < 5*time.Minute {
+                    slog.Debug("Device in grace period, keeping in cache", "pdid", pdid)
+                    continue
+                }
+            }
             c.cache.RemoveDevice(pdid)
-            slog.Info("Removed stale device from LIAS cache (no longer reported by DIS)", "pdid", pdid)
+            delete(c.lastSeenInDIS, pdid)
+            slog.Info("Removed stale device from LIAS cache (grace period expired)", "pdid", pdid)
         }
     }
 
@@ -282,6 +293,7 @@ func (c *DISClient) handleEvent(e models.Event) {
     switch e.Type {
     case models.EventDeviceRemoved:
         c.cache.RemoveDevice(e.DeviceID)
+        delete(c.lastSeenInDIS, e.DeviceID)
         slog.Info("Device removed from local cache via SSE", "pdid", e.DeviceID)
         c.tryTrigger()
         if c.broker != nil {
@@ -299,13 +311,17 @@ func (c *DISClient) handleEvent(e models.Event) {
 
             if c.store != nil {
                 _ = c.store.MigrateDeviceTag(payload.OldPDID, payload.NewPDID)
+                // LIAS-POL-15 Fix: Migrate device-specific policies
+                if err := c.store.MigrateDevicePolicies(payload.OldPDID, payload.NewPDID); err != nil {
+                    slog.Error("Failed to migrate device policies during reidentification", "old_pdid", payload.OldPDID, "new_pdid", payload.NewPDID, "error", err)
+                }
             }
 
             if c.fetchSingleDevice(payload.NewPDID) {
                 c.tryTrigger()
             }
 
-            slog.Info("Device reidentified, migrated identity",
+            slog.Info("Device reidentified, migrated identity and policies",
                 "old_pdid", payload.OldPDID,
                 "new_pdid", payload.NewPDID,
                 "reason", payload.Reason)
@@ -316,7 +332,6 @@ func (c *DISClient) handleEvent(e models.Event) {
         }
 
     case models.EventDeviceAdded, models.EventDeviceOnline, models.EventFingerprintUpdated:
-        // GAP-L-CR02 Fix: Only these events carry full models.Device payloads
         go func(pdid string, evt models.Event) {
             prev := c.cache.Get(pdid)
             isNewDevice := prev == nil || evt.Type == models.EventDeviceAdded
@@ -338,7 +353,6 @@ func (c *DISClient) handleEvent(e models.Event) {
         }(e.DeviceID, e)
 
     case models.EventDeviceOffline, models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged:
-        // GAP-L-CR02 Fix: These events carry DeviceEventPayload, not models.Device. Always fetch.
         go func(pdid string, evt models.Event) {
             if c.fetchSingleDevice(pdid) {
                 c.tryTrigger()
