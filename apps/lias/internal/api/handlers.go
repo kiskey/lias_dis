@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 2.6
+// Version: 2.7
 package api
 
 import (
@@ -69,7 +69,7 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux, authToken string) {
     handler.HandleFunc("POST /api/v1/devices/{pdid}/pause", h.PauseDeviceInternet)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/rename", h.RenameDevice)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/user", h.AssignDeviceUser)
-    handler.HandleFunc("GET /api/v1/devices/{pdid}/logs", h.GetDeviceLogs) // UI-FN-01
+    handler.HandleFunc("GET /api/v1/devices/{pdid}/logs", h.GetDeviceLogs)
 
     handler.HandleFunc("GET /api/v1/tags", h.ListTags)
     handler.HandleFunc("POST /api/v1/tags", h.CreateTag)
@@ -81,8 +81,8 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux, authToken string) {
     handler.HandleFunc("POST /api/v1/policies/validate", h.ValidatePolicy)
     handler.HandleFunc("PUT /api/v1/policies/{id}", h.UpdatePolicy)
     handler.HandleFunc("DELETE /api/v1/policies/{id}", h.DeletePolicy)
-    handler.HandleFunc("GET /api/v1/policies/export", h.ExportPolicies) // LIAS-POL-08
-    handler.HandleFunc("POST /api/v1/policies/import", h.ImportPolicies) // LIAS-POL-08
+    handler.HandleFunc("GET /api/v1/policies/export", h.ExportPolicies)
+    handler.HandleFunc("POST /api/v1/policies/import", h.ImportPolicies)
 
     handler.HandleFunc("GET /api/v1/schedules", h.ListSchedules)
     handler.HandleFunc("POST /api/v1/schedules", h.CreateSchedule)
@@ -90,9 +90,9 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux, authToken string) {
     handler.HandleFunc("DELETE /api/v1/schedules/{id}", h.DeleteSchedule)
     
     handler.HandleFunc("POST /api/v1/users", h.CreateUser)
-    handler.HandleFunc("POST /api/v1/vacation", h.ToggleVacationMode) // LIAS-POL-12
+    handler.HandleFunc("POST /api/v1/vacation", h.ToggleVacationMode)
 
-    handler.HandleFunc("GET /api/v1/stats", h.GetNetworkStats) // UI-FN-08
+    handler.HandleFunc("GET /api/v1/stats", h.GetNetworkStats)
     handler.HandleFunc("POST /api/v1/nftables/flush", h.FlushNftables)
     handler.HandleFunc("GET /api/v1/events", h.StreamEvents)
 
@@ -177,7 +177,6 @@ func (h *Handlers) GetDevice(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(dev)
 }
 
-// UI-FN-01 Fix: Get Device Logs (Flow History)
 func (h *Handlers) GetDeviceLogs(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
     if h.store == nil {
@@ -195,24 +194,30 @@ func (h *Handlers) GetDeviceLogs(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(logs)
 }
 
+// LIAS-TAG-01 Fix: AssignDeviceTag accepts an array of tags
 func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
     var req struct {
-        TagID string `json:"tag_id"`
+        TagIDs []string `json:"tag_ids"`
     }
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
-        return
+        // Fallback for legacy single tag_id payload
+        var legacyReq struct { TagID string `json:"tag_id"` }
+        if err := json.NewDecoder(r.Body).Decode(&legacyReq); err != nil {
+            http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+            return
+        }
+        req.TagIDs = []string{legacyReq.TagID}
     }
 
-    h.cache.SetTags(pdid, []string{req.TagID})
+    h.cache.SetTags(pdid, req.TagIDs)
     d := h.cache.Get(pdid)
     mac := ""
     if d != nil { mac = d.CurrentMAC }
 
     if h.store != nil {
-        if err := h.store.SaveDeviceTag(pdid, req.TagID, mac); err != nil {
-            http.Error(w, `{"error":"failed to persist device tag assignment"}`, http.StatusInternalServerError)
+        if err := h.store.SaveDeviceTags(pdid, req.TagIDs, mac); err != nil {
+            http.Error(w, `{"error":"failed to persist device tags"}`, http.StatusInternalServerError)
             return
         }
     }
@@ -252,17 +257,13 @@ func (h *Handlers) PauseDeviceInternet(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(map[string]string{"status": "paused for 1 hour"})
 }
 
-// LIAS-POL-12 Fix: Vacation Mode (Global Temporary Override)
 func (h *Handlers) ToggleVacationMode(w http.ResponseWriter, r *http.Request) {
-    var req struct {
-        Enabled bool `json:"enabled"`
-    }
+    var req struct { Enabled bool `json:"enabled"` }
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
         return
     }
 
-    // We just modify the global_default policy to block/allow directly
     globalPol, exists := h.polEng.GetPolicy("global_default")
     if !exists {
         globalPol = models.Policy{ID: "global_default", Name: "Global Access Switch", Type: models.PolicyTypeGlobal, Priority: 0, Enabled: true}
@@ -271,7 +272,7 @@ func (h *Handlers) ToggleVacationMode(w http.ResponseWriter, r *http.Request) {
     if req.Enabled {
         globalPol.Action = models.ActionBlock
     } else {
-        globalPol.Action = models.ActionSchedule // Revert to schedule-driven default
+        globalPol.Action = models.ActionSchedule
     }
 
     h.polEng.UpsertPolicy(globalPol)
@@ -419,7 +420,6 @@ func (h *Handlers) ListPolicies(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(h.polEng.ListPolicies())
 }
 
-// LIAS-POL-08 Fix: Export Policies
 func (h *Handlers) ExportPolicies(w http.ResponseWriter, r *http.Request) {
     if h.store == nil {
         http.Error(w, `{"error":"storage unavailable"}`, http.StatusServiceUnavailable)
@@ -435,7 +435,6 @@ func (h *Handlers) ExportPolicies(w http.ResponseWriter, r *http.Request) {
     w.Write(data)
 }
 
-// LIAS-POL-08 Fix: Import Policies
 func (h *Handlers) ImportPolicies(w http.ResponseWriter, r *http.Request) {
     if h.store == nil {
         http.Error(w, `{"error":"storage unavailable"}`, http.StatusServiceUnavailable)
@@ -453,7 +452,6 @@ func (h *Handlers) ImportPolicies(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Reload hydrated state into engine
     h.polEng.ReloadPolicies(h.store)
     h.tryTrigger()
     
@@ -614,10 +612,30 @@ func isSupportedTimezone(tz string) bool {
 
 func validateScheduleRules(s *models.Schedule) error {
     for i, rule := range s.Rules {
-        if len(rule.Days) == 0 { return fmt.Errorf("rule %d: days must be non-empty", i+1) }
-        if rule.StartTime == rule.EndTime { return fmt.Errorf("rule %d: start_time and end_time cannot be identical", i+1) }
-        if _, err := time.Parse("15:04", rule.StartTime); err != nil { return fmt.Errorf("rule %d: invalid start_time format %q", i+1, rule.StartTime) }
-        if _, err := time.Parse("15:04", rule.EndTime); err != nil { return fmt.Errorf("rule %d: invalid end_time format %q", i+1, rule.EndTime) }
+        // LIAS-SCH-09 Fix: Allow empty days if calendar dates are specified
+        if len(rule.Days) == 0 && (rule.StartDate == "" || rule.EndDate == "") {
+            return fmt.Errorf("rule %d: days must be non-empty if calendar dates are not specified", i+1)
+        }
+        if rule.StartTime == rule.EndTime {
+            return fmt.Errorf("rule %d: start_time and end_time cannot be identical", i+1)
+        }
+        if _, err := time.Parse("15:04", rule.StartTime); err != nil {
+            return fmt.Errorf("rule %d: invalid start_time format %q", i+1, rule.StartTime)
+        }
+        if _, err := time.Parse("15:04", rule.EndTime); err != nil {
+            return fmt.Errorf("rule %d: invalid end_time format %q", i+1, rule.EndTime)
+        }
+        // LIAS-SCH-09 Fix: Validate calendar dates format
+        if rule.StartDate != "" {
+            if _, err := time.Parse("2006-01-02", rule.StartDate); err != nil {
+                return fmt.Errorf("rule %d: invalid start_date format %q (expected YYYY-MM-DD)", i+1, rule.StartDate)
+            }
+        }
+        if rule.EndDate != "" {
+            if _, err := time.Parse("2006-01-02", rule.EndDate); err != nil {
+                return fmt.Errorf("rule %d: invalid end_date format %q (expected YYYY-MM-DD)", i+1, rule.EndDate)
+            }
+        }
     }
     return nil
 }
@@ -712,7 +730,6 @@ func (h *Handlers) DeleteSchedule(w http.ResponseWriter, r *http.Request) {
     w.WriteHeader(http.StatusNoContent)
 }
 
-// UI-FN-08 Fix: Network Stats Endpoint
 func (h *Handlers) GetNetworkStats(w http.ResponseWriter, r *http.Request) {
     if h.store == nil {
         http.Error(w, `{"error":"storage unavailable"}`, http.StatusServiceUnavailable)
