@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/dhcp_provider.go
-// Version: 1.3
+// Version: 1.4
 package discovery
 
 import (
@@ -23,10 +23,6 @@ import (
 )
 
 // DHCPProvider reads DHCP lease files to map hostnames and MACs to IPs.
-// It supports:
-// 1. Local file reading (lease_file)
-// 2. HTTP fetching (lease_url)
-// 3. Native SSH execution (ssh_host) for OpenWrt/dnsmasq routers
 type DHCPProvider struct {
     cfg    config.DHCPConfig
     ctx    context.Context
@@ -36,7 +32,6 @@ type DHCPProvider struct {
     client *http.Client
 }
 
-// NewDHCPProvider initializes the DHCP lease file parser.
 func NewDHCPProvider(cfg config.DHCPConfig) *DHCPProvider {
     return &DHCPProvider{
         cfg:    cfg,
@@ -46,17 +41,14 @@ func NewDHCPProvider(cfg config.DHCPConfig) *DHCPProvider {
     }
 }
 
-// Name returns the provider's identifier.
 func (p *DHCPProvider) Name() string { return "dhcp" }
 
-// Start begins the polling loop.
 func (p *DHCPProvider) Start(ctx context.Context) error {
     p.ctx, p.cancel = context.WithCancel(ctx)
     go p.run()
     return nil
 }
 
-// Stop terminates the polling loop.
 func (p *DHCPProvider) Stop() error {
     if p.cancel != nil {
         p.cancel()
@@ -65,7 +57,6 @@ func (p *DHCPProvider) Stop() error {
     return nil
 }
 
-// Events returns the read-only channel for observations.
 func (p *DHCPProvider) Events() <-chan Observation {
     return p.events
 }
@@ -92,9 +83,7 @@ func (p *DHCPProvider) poll() {
     var reader io.Reader
     var err error
 
-    // Determine the data source based on configuration
     if p.cfg.SSHHost != "" {
-        // 1. SSH Execution (Best practice for OpenWrt remote reading)
         user := p.cfg.SSHUser
         if user == "" {
             user = "root"
@@ -113,44 +102,38 @@ func (p *DHCPProvider) poll() {
         reader = &stdout
         
     } else if p.cfg.LeaseURL != "" {
-        // 2. HTTP Fetching
         req, reqErr := http.NewRequestWithContext(p.ctx, "GET", p.cfg.LeaseURL, nil)
         if reqErr != nil {
-            slog.Debug("Failed to create DHCP lease request", "url", p.cfg.LeaseURL, "error", reqErr)
             return
         }
         
         resp, httpErr := p.client.Do(req)
         if httpErr != nil {
-            slog.Debug("Failed to fetch DHCP leases via HTTP", "url", p.cfg.LeaseURL, "error", httpErr)
             return
         }
         defer resp.Body.Close()
         
         if resp.StatusCode != http.StatusOK {
-            slog.Debug("DHCP lease URL returned non-200", "url", p.cfg.LeaseURL, "status", resp.StatusCode)
             return
         }
         
         reader = resp.Body
         
     } else if p.cfg.LeaseFile != "" {
-        // 3. Local File Reading
         file, fileErr := os.Open(p.cfg.LeaseFile)
         if fileErr != nil {
-            slog.Debug("Failed to open local DHCP lease file", "file", p.cfg.LeaseFile, "error", fileErr)
             return
         }
         defer file.Close()
         reader = file
     } else {
-        return // No source configured
+        return
     }
 
     scanner := bufio.NewScanner(reader)
     for scanner.Scan() {
         line := scanner.Text()
-        // Standard dnsmasq/OpenWrt format: <expiry_timestamp> <mac> <ip> <hostname> <client_id>
+        // Format: <expiry> <mac> <ip> <hostname> <client_id> [<option_55_hex>]
         parts := strings.Fields(line)
         if len(parts) < 4 {
             continue
@@ -170,17 +153,32 @@ func (p *DHCPProvider) poll() {
         if hostname == "*" {
             hostname = ""
         }
-        
-obs := Observation{
-    Source:     p.Name(),
-    Group:      GroupB,
-    MAC:        mac,
-    IP:         ip,
-    Hostname:   hostname,
-    Online:     true,
-    Confidence: 0.50,
-    Timestamp:  time.Now(),
-}
+
+        obs := Observation{
+            Source:     p.Name(),
+            Group:      GroupB,
+            MAC:        mac,
+            IP:         ip,
+            Hostname:   hostname,
+            Online:     true,
+            Confidence: 0.50,
+            Timestamp:  time.Now(),
+            Raw:        make(map[string]interface{}),
+        }
+
+        // DIS-PROV-11 Fix: DHCP Option 55 Fingerprinting
+        if len(parts) > 5 {
+            opt55 := parts[5]
+            obs.Raw["dhcp_option_55"] = opt55
+            osGuess := fingerprintOSFromDHCP(opt55)
+            if osGuess != "" {
+                obs.Model = osGuess
+                obs.Confidence = 0.70
+            }
+        } else if len(parts) > 4 {
+            // Some routers store client_id instead of option 55
+            obs.Raw["client_id"] = parts[4]
+        }
         
         select {
         case p.events <- obs:
@@ -188,8 +186,29 @@ obs := Observation{
             slog.Warn("DHCP observation channel full, dropping event")
         }
     }
+}
+
+// fingerprintOSFromDHCP provides passive OS identification based on DHCP Parameter Request List (Option 55).
+// Reference: https://docs.microsoft.com/en-us/windows-server/troubleshoot/dynamic-host-configuration-protocol-basics
+func fingerprintOSFromDHCP(opt55 string) string {
+    opt55Lower := strings.ToLower(opt55)
     
-    if err := scanner.Err(); err != nil {
-        slog.Error("Error reading DHCP leases", "error", err)
+    // Typical Windows request: 1,15,3,6,44,46,47,31,33,121,249
+    if strings.Contains(opt55Lower, "1f") && strings.Contains(opt55Lower, "21") && strings.Contains(opt55Lower, "2c") {
+        return "Windows"
     }
+    // Typical macOS / iOS request: 1,121,3,6,15,119,252,95,44
+    if strings.Contains(opt55Lower, "77") && strings.Contains(opt55Lower, "fc") && strings.Contains(opt55Lower, "5f") {
+        return "Apple macOS/iOS"
+    }
+    // Typical Android request: 1,33,3,6,15,28,51,58,59
+    if strings.Contains(opt55Lower, "21") && strings.Contains(opt55Lower, "1c") && !strings.Contains(opt55Lower, "2c") {
+        return "Android"
+    }
+    // Typical Linux (dhclient): 1,28,2,5,3,6,12,15,119
+    if strings.Contains(opt55Lower, "01") && strings.Contains(opt55Lower, "1c") && strings.Contains(opt55Lower, "06") && !strings.Contains(opt55Lower, "77") {
+        return "Linux"
+    }
+
+    return ""
 }
