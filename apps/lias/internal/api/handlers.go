@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 2.8
+// Version: 2.9
 package api
 
 import (
@@ -67,6 +67,7 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux, authToken string) {
     handler.HandleFunc("GET /api/v1/devices/{pdid}", h.GetDevice)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/tags", h.AssignDeviceTag)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/pause", h.PauseDeviceInternet)
+    handler.HandleFunc("DELETE /api/v1/devices/{pdid}/pause", h.UnpauseDeviceInternet) // Fix 1: Unpause endpoint
     handler.HandleFunc("POST /api/v1/devices/{pdid}/rename", h.RenameDevice)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/user", h.AssignDeviceUser)
     handler.HandleFunc("GET /api/v1/devices/{pdid}/logs", h.GetDeviceLogs)
@@ -225,6 +226,7 @@ func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
     w.WriteHeader(http.StatusNoContent)
 }
 
+// Fix 2: Temporary Pause creates in-memory only schedules and auto-deletes them after 1 hour
 func (h *Handlers) PauseDeviceInternet(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
     d := h.cache.Get(pdid)
@@ -242,7 +244,7 @@ func (h *Handlers) PauseDeviceInternet(w http.ResponseWriter, r *http.Request) {
         },
     }
     h.schedEng.UpsertSchedule(tempSched)
-    if h.store != nil { _ = h.store.SaveSchedule(tempSched) }
+    // Fix 2: Deliberately NOT saving to DB to avoid bloat.
 
     polID := "pol_pause_" + pdid
     tempPol := models.Policy{
@@ -250,11 +252,47 @@ func (h *Handlers) PauseDeviceInternet(w http.ResponseWriter, r *http.Request) {
         Action: models.ActionSchedule, ScheduleIDs: []string{tempSchedID}, Priority: 1000, Enabled: true,
     }
     h.polEng.UpsertPolicy(tempPol)
-    if h.store != nil { _ = h.store.SavePolicy(tempPol) }
+    // Fix 2: Deliberately NOT saving to DB to avoid bloat.
 
     h.tryTrigger()
+
+    // Fix 2: Register automatic cleanup after 1 hour to prevent accumulation
+    go func(policyID, schedID string) {
+        time.Sleep(1 * time.Hour)
+        h.polEng.DeletePolicy(policyID)
+        h.schedEng.DeleteSchedule(schedID)
+        h.tryTrigger()
+        slog.Info("Temporary pause expired and cleaned up", "pdid", pdid, "policy_id", policyID)
+    }(polID, tempSchedID)
+
     w.WriteHeader(http.StatusAccepted)
     _ = json.NewEncoder(w).Encode(map[string]string{"status": "paused for 1 hour"})
+}
+
+// Fix 1: UnpauseDeviceInternet removes the temporary block immediately
+func (h *Handlers) UnpauseDeviceInternet(w http.ResponseWriter, r *http.Request) {
+    pdid := r.PathValue("pdid")
+    polID := "pol_pause_" + pdid
+    
+    // Find the policy to get the associated schedule ID
+    pol, exists := h.polEng.GetPolicy(polID)
+    if !exists {
+        w.WriteHeader(http.StatusNoContent)
+        return
+    }
+    
+    schedIDs := pol.GetScheduleIDs()
+    
+    // Delete policy from engine
+    h.polEng.DeletePolicy(polID)
+    
+    // Delete schedule from engine
+    for _, sid := range schedIDs {
+        h.schedEng.DeleteSchedule(sid)
+    }
+    
+    h.tryTrigger()
+    w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) ToggleVacationMode(w http.ResponseWriter, r *http.Request) {
