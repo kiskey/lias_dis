@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for DIS device state.
 //
 // File:    apps/discovery-service/internal/storage/sqlite.go
-// Version: 2.7
+// Version: 2.8
 package storage
 
 import (
@@ -44,13 +44,11 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, fmt.Errorf("failed to create database directory: %w", err)
     }
 
-    db, err := sql.Open("sqlite", dbPath)
+    // IO-06 Fix: Apply PRAGMAs via DSN to ensure all pool connections use WAL and NORMAL synchronous mode
+    dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=journal_mode(WAL)", dbPath)
+    db, err := sql.Open("sqlite", dsn)
     if err != nil {
         return nil, fmt.Errorf("failed to open sqlite database: %w", err)
-    }
-
-    if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;"); err != nil {
-        slog.Warn("Failed to set PRAGMAs on DIS database", "error", err)
     }
 
     s := &Storage{
@@ -61,6 +59,11 @@ func NewStorage(dbPath string) (*Storage, error) {
     if err := s.initSchema(); err != nil {
         db.Close()
         return nil, err
+    }
+
+    // LNX-06 Fix: WAL checkpoint on startup to recover from crashes and prevent -wal file bloat
+    if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+        slog.Warn("Failed to truncate WAL on startup", "error", err)
     }
 
     if err := s.migrateV1PDIDs(); err != nil {
@@ -201,7 +204,6 @@ func (s *Storage) migrateV1PDIDs() error {
     defer ownerRows.Close()
     for ownerRows.Next() {
         var host, pdid string
-        // FIX: syntax error fixed
         if err := ownerRows.Scan(&host, &pdid); err == nil && host != "" {
             _, _ = s.db.Exec("INSERT OR REPLACE INTO hostname_owners (canonical_hostname, pdid, acquired_at) VALUES (?, ?, ?)", host, pdid, time.Now())
         }
@@ -407,7 +409,6 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
         return fmt.Errorf("failed to upsert device %s: %w", d.PDID, err)
     }
 
-    // DIS-IO-02 Fix: Diff-based MAC updates
     existingMACs := make(map[string]bool)
     macRows, err := tx.Query("SELECT mac FROM device_macs WHERE pdid = ?", d.PDID)
     if err == nil {
@@ -437,7 +438,6 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
         }
     }
 
-    // DIS-IO-02 Fix: Diff-based IP updates
     existingIPs := make(map[string]bool)
     ipRows, err := tx.Query("SELECT ip FROM device_ips WHERE pdid = ?", d.PDID)
     if err == nil {
@@ -468,6 +468,34 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
     }
 
     return nil
+}
+
+// IO-05 Fix: Atomic PDID replacement to prevent data loss during identity promotion
+func (s *Storage) ReplaceDevicePDID(oldPDID, newPDID string, d *models.Device) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    tx, err := s.db.Begin()
+    if err != nil {
+        return err
+    }
+    defer func() { _ = tx.Rollback() }()
+
+    if err := s.saveDeviceTx(tx, d); err != nil {
+        return err
+    }
+
+    _, _ = tx.Exec("UPDATE device_macs SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
+    _, _ = tx.Exec("UPDATE device_ips SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
+    _, _ = tx.Exec("UPDATE hostname_owners SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
+    _, _ = tx.Exec("UPDATE pending_events SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
+    
+    _, err = tx.Exec("DELETE FROM devices WHERE pdid = ?", oldPDID)
+    if err != nil {
+        return err
+    }
+
+    return tx.Commit()
 }
 
 func (s *Storage) DeleteDevice(pdid string) error {
@@ -508,6 +536,26 @@ func (s *Storage) SavePendingEvent(pdid, eventType string, payload []byte, first
     `, pdid, eventType, payloadStr, firstSeen, lastSeen, confirmations, sources)
 
     return err
+}
+
+// IO-08 Fix: Batch delete pending events to reduce transactions
+func (s *Storage) DeletePendingEventsBatch(records []PendingEventRecord) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    tx, err := s.db.Begin()
+    if err != nil {
+        return err
+    }
+    defer func() { _ = tx.Rollback() }()
+
+    for _, r := range records {
+        if _, err := tx.Exec("DELETE FROM pending_events WHERE pdid = ? AND event_type = ?", r.PDID, r.EventType); err != nil {
+            return err
+        }
+    }
+
+    return tx.Commit()
 }
 
 func (s *Storage) DeletePendingEvent(pdid, eventType string) error {
