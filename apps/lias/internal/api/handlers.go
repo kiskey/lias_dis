@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 2.5
+// Version: 2.6
 package api
 
 import (
@@ -9,13 +9,14 @@ import (
     "encoding/hex"
     "encoding/json"
     "fmt"
+    "io"
     "log/slog"
     "net/http"
     "strconv"
     "strings"
     "time"
 
-    liasNftables "github.com/user/lias-dis/apps/lias/internal/nftables"
+    "github.com/user/lias-dis/apps/lias/internal/nftables"
     "github.com/user/lias-dis/apps/lias/internal/policy"
     "github.com/user/lias-dis/apps/lias/internal/schedule"
     "github.com/user/lias-dis/apps/lias/internal/scheduleconflict"
@@ -31,7 +32,7 @@ type Handlers struct {
     tagMgr   *tags.Manager
     polEng   *policy.Engine
     schedEng *schedule.Engine
-    nftCtrl  *liasNftables.Controller
+    nftCtrl  *nftables.Controller
     store    *storage.Storage
     trigger  chan struct{}
     broker   *Broker
@@ -42,7 +43,7 @@ func NewHandlers(
     tagMgr *tags.Manager,
     polEng *policy.Engine,
     schedEng *schedule.Engine,
-    nftCtrl *liasNftables.Controller,
+    nftCtrl *nftables.Controller,
     store *storage.Storage,
     trigger chan struct{},
     broker *Broker,
@@ -68,6 +69,7 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux, authToken string) {
     handler.HandleFunc("POST /api/v1/devices/{pdid}/pause", h.PauseDeviceInternet)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/rename", h.RenameDevice)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/user", h.AssignDeviceUser)
+    handler.HandleFunc("GET /api/v1/devices/{pdid}/logs", h.GetDeviceLogs) // UI-FN-01
 
     handler.HandleFunc("GET /api/v1/tags", h.ListTags)
     handler.HandleFunc("POST /api/v1/tags", h.CreateTag)
@@ -79,6 +81,8 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux, authToken string) {
     handler.HandleFunc("POST /api/v1/policies/validate", h.ValidatePolicy)
     handler.HandleFunc("PUT /api/v1/policies/{id}", h.UpdatePolicy)
     handler.HandleFunc("DELETE /api/v1/policies/{id}", h.DeletePolicy)
+    handler.HandleFunc("GET /api/v1/policies/export", h.ExportPolicies) // LIAS-POL-08
+    handler.HandleFunc("POST /api/v1/policies/import", h.ImportPolicies) // LIAS-POL-08
 
     handler.HandleFunc("GET /api/v1/schedules", h.ListSchedules)
     handler.HandleFunc("POST /api/v1/schedules", h.CreateSchedule)
@@ -86,11 +90,12 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux, authToken string) {
     handler.HandleFunc("DELETE /api/v1/schedules/{id}", h.DeleteSchedule)
     
     handler.HandleFunc("POST /api/v1/users", h.CreateUser)
+    handler.HandleFunc("POST /api/v1/vacation", h.ToggleVacationMode) // LIAS-POL-12
 
+    handler.HandleFunc("GET /api/v1/stats", h.GetNetworkStats) // UI-FN-08
     handler.HandleFunc("POST /api/v1/nftables/flush", h.FlushNftables)
     handler.HandleFunc("GET /api/v1/events", h.StreamEvents)
 
-    // FIX: Scope auth middleware to /api/ to avoid conflicting with root "/" static file server
     mux.Handle("/api/", AuthMiddleware(authToken, handler))
 }
 
@@ -98,7 +103,6 @@ func (h *Handlers) StreamEvents(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Content-Type", "text/event-stream")
     w.Header().Set("Cache-Control", "no-cache")
     w.Header().Set("Connection", "keep-alive")
-    // Strict CORS for SSE
     w.Header().Set("Access-Control-Allow-Origin", "null")
 
     flusher, ok := w.(http.Flusher)
@@ -173,6 +177,24 @@ func (h *Handlers) GetDevice(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(dev)
 }
 
+// UI-FN-01 Fix: Get Device Logs (Flow History)
+func (h *Handlers) GetDeviceLogs(w http.ResponseWriter, r *http.Request) {
+    pdid := r.PathValue("pdid")
+    if h.store == nil {
+        http.Error(w, `{"error":"storage unavailable"}`, http.StatusServiceUnavailable)
+        return
+    }
+    
+    logs, err := h.store.GetDeviceFlowLogs(pdid, 100)
+    if err != nil {
+        http.Error(w, `{"error":"failed to fetch logs"}`, http.StatusInternalServerError)
+        return
+    }
+    
+    w.Header().Set("Content-Type", "application/json")
+    _ = json.NewEncoder(w).Encode(logs)
+}
+
 func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
     var req struct {
@@ -184,21 +206,16 @@ func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
     }
 
     h.cache.SetTags(pdid, []string{req.TagID})
-
     d := h.cache.Get(pdid)
     mac := ""
-    if d != nil {
-        mac = d.CurrentMAC
-    }
+    if d != nil { mac = d.CurrentMAC }
 
     if h.store != nil {
         if err := h.store.SaveDeviceTag(pdid, req.TagID, mac); err != nil {
-            slog.Error("Failed to persist device tag assignment to storage", "pdid", pdid, "tag_id", req.TagID, "error", err)
             http.Error(w, `{"error":"failed to persist device tag assignment"}`, http.StatusInternalServerError)
             return
         }
     }
-
     h.tryTrigger()
     w.WriteHeader(http.StatusNoContent)
 }
@@ -214,50 +231,60 @@ func (h *Handlers) PauseDeviceInternet(w http.ResponseWriter, r *http.Request) {
     tempSchedID := "sched_pause_" + generateID()
     now := time.Now()
     tempSched := models.Schedule{
-        ID:       tempSchedID,
-        Name:     "Temporary Pause",
-        Mode:     models.ScheduleModeDowntime,
-        Timezone: "UTC",
+        ID: tempSchedID, Name: "Temporary Pause", Mode: models.ScheduleModeDowntime, Timezone: "UTC",
         Rules: []models.ScheduleRule{
-            {
-                Days:      []string{"sun", "mon", "tue", "wed", "thu", "fri", "sat"},
-                StartTime: now.UTC().Format("15:04"),
-                EndTime:   now.UTC().Add(1 * time.Hour).Format("15:04"),
-                Action:    models.ActionBlock,
-            },
+            {Days: []string{"sun", "mon", "tue", "wed", "thu", "fri", "sat"}, StartTime: now.UTC().Format("15:04"), EndTime: now.UTC().Add(1 * time.Hour).Format("15:04"), Action: models.ActionBlock},
         },
     }
     h.schedEng.UpsertSchedule(tempSched)
-    if h.store != nil {
-        _ = h.store.SaveSchedule(tempSched)
-    }
+    if h.store != nil { _ = h.store.SaveSchedule(tempSched) }
 
     polID := "pol_pause_" + pdid
     tempPol := models.Policy{
-        ID:          polID,
-        Name:        "Paused Internet",
-        Type:        models.PolicyTypeDevice,
-        TargetID:    pdid,
-        Action:      models.ActionSchedule,
-        ScheduleIDs: []string{tempSchedID},
-        Priority:    1000,
-        Enabled:     true,
+        ID: polID, Name: "Paused Internet", Type: models.PolicyTypeDevice, TargetID: pdid,
+        Action: models.ActionSchedule, ScheduleIDs: []string{tempSchedID}, Priority: 1000, Enabled: true,
     }
     h.polEng.UpsertPolicy(tempPol)
-    if h.store != nil {
-        _ = h.store.SavePolicy(tempPol)
-    }
+    if h.store != nil { _ = h.store.SavePolicy(tempPol) }
 
     h.tryTrigger()
     w.WriteHeader(http.StatusAccepted)
     _ = json.NewEncoder(w).Encode(map[string]string{"status": "paused for 1 hour"})
 }
 
+// LIAS-POL-12 Fix: Vacation Mode (Global Temporary Override)
+func (h *Handlers) ToggleVacationMode(w http.ResponseWriter, r *http.Request) {
+    var req struct {
+        Enabled bool `json:"enabled"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+        return
+    }
+
+    // We just modify the global_default policy to block/allow directly
+    globalPol, exists := h.polEng.GetPolicy("global_default")
+    if !exists {
+        globalPol = models.Policy{ID: "global_default", Name: "Global Access Switch", Type: models.PolicyTypeGlobal, Priority: 0, Enabled: true}
+    }
+
+    if req.Enabled {
+        globalPol.Action = models.ActionBlock
+    } else {
+        globalPol.Action = models.ActionSchedule // Revert to schedule-driven default
+    }
+
+    h.polEng.UpsertPolicy(globalPol)
+    if h.store != nil { _ = h.store.SavePolicy(globalPol) }
+    h.tryTrigger()
+
+    w.Header().Set("Content-Type", "application/json")
+    _ = json.NewEncoder(w).Encode(map[string]bool{"vacation_mode": req.Enabled})
+}
+
 func (h *Handlers) RenameDevice(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
-    var req struct {
-        Name string `json:"name"`
-    }
+    var req struct { Name string `json:"name"` }
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
         return
@@ -286,9 +313,7 @@ func (h *Handlers) CreateUser(w http.ResponseWriter, r *http.Request) {
         http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
         return
     }
-    if u.ID == "" {
-        u.ID = "user_" + generateID()
-    }
+    if u.ID == "" { u.ID = "user_" + generateID() }
 
     if h.store != nil {
         if err := h.store.SaveUser(u); err != nil {
@@ -296,7 +321,6 @@ func (h *Handlers) CreateUser(w http.ResponseWriter, r *http.Request) {
             return
         }
     }
-
     w.Header().Set("Content-Type", "application/json")
     w.WriteHeader(http.StatusCreated)
     _ = json.NewEncoder(w).Encode(u)
@@ -304,9 +328,7 @@ func (h *Handlers) CreateUser(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) AssignDeviceUser(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
-    var req struct {
-        UserID string `json:"user_id"`
-    }
+    var req struct { UserID string `json:"user_id"` }
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
         return
@@ -318,7 +340,6 @@ func (h *Handlers) AssignDeviceUser(w http.ResponseWriter, r *http.Request) {
             return
         }
     }
-
     h.tryTrigger()
     w.WriteHeader(http.StatusNoContent)
 }
@@ -342,12 +363,10 @@ func (h *Handlers) CreateTag(w http.ResponseWriter, r *http.Request) {
 
     if h.store != nil {
         if err := h.store.SaveTag(created); err != nil {
-            slog.Error("Failed to persist new tag to storage", "tag_id", created.ID, "error", err)
             http.Error(w, `{"error":"failed to persist tag to storage"}`, http.StatusInternalServerError)
             return
         }
     }
-
     w.Header().Set("Content-Type", "application/json")
     w.WriteHeader(http.StatusCreated)
     _ = json.NewEncoder(w).Encode(created)
@@ -369,12 +388,10 @@ func (h *Handlers) UpdateTag(w http.ResponseWriter, r *http.Request) {
 
     if h.store != nil {
         if err := h.store.SaveTag(updated); err != nil {
-            slog.Error("Failed to persist updated tag to storage", "tag_id", updated.ID, "error", err)
             http.Error(w, `{"error":"failed to update tag in storage"}`, http.StatusInternalServerError)
             return
         }
     }
-
     h.tryTrigger()
     w.Header().Set("Content-Type", "application/json")
     _ = json.NewEncoder(w).Encode(updated)
@@ -389,12 +406,10 @@ func (h *Handlers) DeleteTag(w http.ResponseWriter, r *http.Request) {
 
     if h.store != nil {
         if err := h.store.DeleteTag(id); err != nil {
-            slog.Error("Failed to delete tag from storage", "tag_id", id, "error", err)
             http.Error(w, `{"error":"failed to delete tag from storage"}`, http.StatusInternalServerError)
             return
         }
     }
-
     h.tryTrigger()
     w.WriteHeader(http.StatusNoContent)
 }
@@ -404,15 +419,52 @@ func (h *Handlers) ListPolicies(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(h.polEng.ListPolicies())
 }
 
-func (h *Handlers) validateAndMergePolicySchedules(p *models.Policy) ([]scheduleconflict.Conflict, error) {
-    if p.Action != models.ActionSchedule {
-        return nil, nil
+// LIAS-POL-08 Fix: Export Policies
+func (h *Handlers) ExportPolicies(w http.ResponseWriter, r *http.Request) {
+    if h.store == nil {
+        http.Error(w, `{"error":"storage unavailable"}`, http.StatusServiceUnavailable)
+        return
+    }
+    data, err := h.store.ExportPolicies()
+    if err != nil {
+        http.Error(w, `{"error":"failed to export policies"}`, http.StatusInternalServerError)
+        return
+    }
+    w.Header().Set("Content-Type", "application/json")
+    w.Header().Set("Content-Disposition", "attachment; filename=lias_policies_export.json")
+    w.Write(data)
+}
+
+// LIAS-POL-08 Fix: Import Policies
+func (h *Handlers) ImportPolicies(w http.ResponseWriter, r *http.Request) {
+    if h.store == nil {
+        http.Error(w, `{"error":"storage unavailable"}`, http.StatusServiceUnavailable)
+        return
+    }
+    
+    data, err := io.ReadAll(r.Body)
+    if err != nil {
+        http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
+        return
     }
 
-    schedIDs := p.GetScheduleIDs()
-    if len(schedIDs) == 0 {
-        return nil, nil
+    if err := h.store.ImportPolicies(data); err != nil {
+        http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+        return
     }
+
+    // Reload hydrated state into engine
+    h.polEng.ReloadPolicies(h.store)
+    h.tryTrigger()
+    
+    w.Header().Set("Content-Type", "application/json")
+    _ = json.NewEncoder(w).Encode(map[string]string{"status": "import successful"})
+}
+
+func (h *Handlers) validateAndMergePolicySchedules(p *models.Policy) ([]scheduleconflict.Conflict, error) {
+    if p.Action != models.ActionSchedule { return nil, nil }
+    schedIDs := p.GetScheduleIDs()
+    if len(schedIDs) == 0 { return nil, nil }
 
     var scheds []models.Schedule
     for _, sid := range schedIDs {
@@ -422,34 +474,20 @@ func (h *Handlers) validateAndMergePolicySchedules(p *models.Policy) ([]schedule
         }
         scheds = append(scheds, sch)
     }
-
     _, conflicts, err := scheduleconflict.MergeSchedules(scheds)
     return conflicts, err
 }
 
-type httpError struct {
-    status int
-    msg    string
-}
-
+type httpError struct { status int; msg string }
 func (e httpError) Error() string { return e.msg }
 
 func toAPIConflicts(sc []scheduleconflict.Conflict) []api.Conflict {
-    if len(sc) == 0 {
-        return []api.Conflict{}
-    }
+    if len(sc) == 0 { return []api.Conflict{} }
     out := make([]api.Conflict, len(sc))
     for i, c := range sc {
         out[i] = api.Conflict{
-            ScheduleAID:   c.ScheduleAID,
-            ScheduleAName: c.ScheduleAName,
-            ScheduleBID:   c.ScheduleBID,
-            ScheduleBName: c.ScheduleBName,
-            Day:           c.Day,
-            OverlapStart:  c.OverlapStart,
-            OverlapEnd:    c.OverlapEnd,
-            ActionA:       c.ActionA,
-            ActionB:       c.ActionB,
+            ScheduleAID: c.ScheduleAID, ScheduleAName: c.ScheduleAName, ScheduleBID: c.ScheduleBID, ScheduleBName: c.ScheduleBName,
+            Day: c.Day, OverlapStart: c.OverlapStart, OverlapEnd: c.OverlapEnd, ActionA: c.ActionA, ActionB: c.ActionB,
         }
     }
     return out
@@ -461,14 +499,11 @@ func (h *Handlers) ValidatePolicy(w http.ResponseWriter, r *http.Request) {
         http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
         return
     }
-
     w.Header().Set("Content-Type", "application/json")
-
     if len(req.ScheduleIDs) == 0 {
         _ = json.NewEncoder(w).Encode(api.ConflictResponse{Conflicts: []api.Conflict{}})
         return
     }
-
     var scheds []models.Schedule
     for _, sid := range req.ScheduleIDs {
         sch, ok := h.schedEng.GetSchedule(sid)
@@ -478,12 +513,8 @@ func (h *Handlers) ValidatePolicy(w http.ResponseWriter, r *http.Request) {
         }
         scheds = append(scheds, sch)
     }
-
     _, conflicts, _ := scheduleconflict.MergeSchedules(scheds)
-
-    _ = json.NewEncoder(w).Encode(api.ConflictResponse{
-        Conflicts: toAPIConflicts(conflicts),
-    })
+    _ = json.NewEncoder(w).Encode(api.ConflictResponse{Conflicts: toAPIConflicts(conflicts)})
 }
 
 func (h *Handlers) CreatePolicy(w http.ResponseWriter, r *http.Request) {
@@ -492,51 +523,32 @@ func (h *Handlers) CreatePolicy(w http.ResponseWriter, r *http.Request) {
         http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
         return
     }
-    if p.ID == "" {
-        p.ID = "pol_" + generateID()
-    }
-
+    if p.ID == "" { p.ID = "pol_" + generateID() }
     if p.Type == models.PolicyTypeTag && p.TargetID == "infrastructure" {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusBadRequest)
-        _ = json.NewEncoder(w).Encode(map[string]string{
-            "error":   "policy_immutable_target",
-            "message": "The 'infrastructure' tag is super-immutable and cannot be targeted by tag policies.",
-        })
+        w.Header().Set("Content-Type", "application/json"); w.WriteHeader(http.StatusBadRequest)
+        _ = json.NewEncoder(w).Encode(map[string]string{"error": "policy_immutable_target", "message": "The 'infrastructure' tag is super-immutable."})
         return
     }
 
     conflicts, err := h.validateAndMergePolicySchedules(&p)
     if err != nil && conflicts == nil {
-        if hErr, ok := err.(httpError); ok {
-            http.Error(w, `{"error":"`+hErr.msg+`"}`, hErr.status)
-            return
-        }
+        if hErr, ok := err.(httpError); ok { http.Error(w, `{"error":"`+hErr.msg+`"}`, hErr.status); return }
     }
     if len(conflicts) > 0 {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusConflict)
-        _ = json.NewEncoder(w).Encode(api.ConflictResponse{
-            Error:     "schedule_conflict",
-            Message:   "Attached schedules contain contradictory windows",
-            Conflicts: toAPIConflicts(conflicts),
-        })
+        w.Header().Set("Content-Type", "application/json"); w.WriteHeader(http.StatusConflict)
+        _ = json.NewEncoder(w).Encode(api.ConflictResponse{Error: "schedule_conflict", Message: "Attached schedules contain contradictory windows", Conflicts: toAPIConflicts(conflicts)})
         return
     }
 
     h.polEng.UpsertPolicy(p)
-
     if h.store != nil {
         if err := h.store.SavePolicy(p); err != nil {
-            slog.Error("Failed to persist policy to storage", "policy_id", p.ID, "error", err)
             http.Error(w, `{"error":"failed to persist policy to storage"}`, http.StatusInternalServerError)
             return
         }
     }
-
     h.tryTrigger()
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusCreated)
+    w.Header().Set("Content-Type", "application/json"); w.WriteHeader(http.StatusCreated)
     _ = json.NewEncoder(w).Encode(p)
 }
 
@@ -548,45 +560,29 @@ func (h *Handlers) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
         return
     }
     p.ID = id
-
     if p.Type == models.PolicyTypeTag && p.TargetID == "infrastructure" {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusBadRequest)
-        _ = json.NewEncoder(w).Encode(map[string]string{
-            "error":   "policy_immutable_target",
-            "message": "The 'infrastructure' tag is super-immutable and cannot be targeted by tag policies.",
-        })
+        w.Header().Set("Content-Type", "application/json"); w.WriteHeader(http.StatusBadRequest)
+        _ = json.NewEncoder(w).Encode(map[string]string{"error": "policy_immutable_target", "message": "The 'infrastructure' tag is super-immutable."})
         return
     }
 
     conflicts, err := h.validateAndMergePolicySchedules(&p)
     if err != nil && conflicts == nil {
-        if hErr, ok := err.(httpError); ok {
-            http.Error(w, `{"error":"`+hErr.msg+`"}`, hErr.status)
-            return
-        }
+        if hErr, ok := err.(httpError); ok { http.Error(w, `{"error":"`+hErr.msg+`"}`, hErr.status); return }
     }
     if len(conflicts) > 0 {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusConflict)
-        _ = json.NewEncoder(w).Encode(api.ConflictResponse{
-            Error:     "schedule_conflict",
-            Message:   "Attached schedules contain contradictory windows",
-            Conflicts: toAPIConflicts(conflicts),
-        })
+        w.Header().Set("Content-Type", "application/json"); w.WriteHeader(http.StatusConflict)
+        _ = json.NewEncoder(w).Encode(api.ConflictResponse{Error: "schedule_conflict", Message: "Attached schedules contain contradictory windows", Conflicts: toAPIConflicts(conflicts)})
         return
     }
 
     h.polEng.UpsertPolicy(p)
-
     if h.store != nil {
         if err := h.store.SavePolicy(p); err != nil {
-            slog.Error("Failed to update policy in storage", "policy_id", p.ID, "error", err)
             http.Error(w, `{"error":"failed to update policy in storage"}`, http.StatusInternalServerError)
             return
         }
     }
-
     h.tryTrigger()
     w.Header().Set("Content-Type", "application/json")
     _ = json.NewEncoder(w).Encode(p)
@@ -595,15 +591,12 @@ func (h *Handlers) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) DeletePolicy(w http.ResponseWriter, r *http.Request) {
     id := r.PathValue("id")
     h.polEng.DeletePolicy(id)
-
     if h.store != nil {
         if err := h.store.DeletePolicy(id); err != nil {
-            slog.Error("Failed to delete policy from storage", "policy_id", id, "error", err)
             http.Error(w, `{"error":"failed to delete policy from storage"}`, http.StatusInternalServerError)
             return
         }
     }
-
     h.tryTrigger()
     w.WriteHeader(http.StatusNoContent)
 }
@@ -614,27 +607,17 @@ func (h *Handlers) ListSchedules(w http.ResponseWriter, r *http.Request) {
 }
 
 func isSupportedTimezone(tz string) bool {
-    if tz == "" {
-        return false
-    }
+    if tz == "" { return false }
     _, err := time.LoadLocation(tz)
     return err == nil
 }
 
 func validateScheduleRules(s *models.Schedule) error {
     for i, rule := range s.Rules {
-        if len(rule.Days) == 0 {
-            return fmt.Errorf("rule %d: days must be non-empty", i+1)
-        }
-        if rule.StartTime == rule.EndTime {
-            return fmt.Errorf("rule %d: start_time and end_time cannot be identical", i+1)
-        }
-        if _, err := time.Parse("15:04", rule.StartTime); err != nil {
-            return fmt.Errorf("rule %d: invalid start_time format %q", i+1, rule.StartTime)
-        }
-        if _, err := time.Parse("15:04", rule.EndTime); err != nil {
-            return fmt.Errorf("rule %d: invalid end_time format %q", i+1, rule.EndTime)
-        }
+        if len(rule.Days) == 0 { return fmt.Errorf("rule %d: days must be non-empty", i+1) }
+        if rule.StartTime == rule.EndTime { return fmt.Errorf("rule %d: start_time and end_time cannot be identical", i+1) }
+        if _, err := time.Parse("15:04", rule.StartTime); err != nil { return fmt.Errorf("rule %d: invalid start_time format %q", i+1, rule.StartTime) }
+        if _, err := time.Parse("15:04", rule.EndTime); err != nil { return fmt.Errorf("rule %d: invalid end_time format %q", i+1, rule.EndTime) }
     }
     return nil
 }
@@ -645,60 +628,35 @@ func (h *Handlers) CreateSchedule(w http.ResponseWriter, r *http.Request) {
         http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
         return
     }
-    if s.ID == "" {
-        s.ID = "sched_" + generateID()
-    }
-
+    if s.ID == "" { s.ID = "sched_" + generateID() }
     if s.Mode == "" {
         hasAllow := false
-        for _, r := range s.Rules {
-            if r.Action == models.ActionAllow {
-                hasAllow = true
-                break
-            }
-        }
-        if hasAllow {
-            s.Mode = models.ScheduleModeWhitelist
-        } else {
-            s.Mode = models.ScheduleModeDowntime
-        }
+        for _, r := range s.Rules { if r.Action == models.ActionAllow { hasAllow = true; break } }
+        if hasAllow { s.Mode = models.ScheduleModeWhitelist } else { s.Mode = models.ScheduleModeDowntime }
     }
-
     if err := validateScheduleRules(&s); err != nil {
         http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
         return
     }
-
     if !isSupportedTimezone(s.Timezone) {
         http.Error(w, `{"error":"unsupported or invalid timezone"}`, http.StatusBadRequest)
         return
     }
-
     _, conflicts, err := scheduleconflict.MergeSchedules([]models.Schedule{s})
     if err != nil || len(conflicts) > 0 {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusConflict)
-        _ = json.NewEncoder(w).Encode(api.ConflictResponse{
-            Error:     "schedule_conflict",
-            Message:   "Schedule rules contain internal contradictory windows",
-            Conflicts: toAPIConflicts(conflicts),
-        })
+        w.Header().Set("Content-Type", "application/json"); w.WriteHeader(http.StatusConflict)
+        _ = json.NewEncoder(w).Encode(api.ConflictResponse{Error: "schedule_conflict", Message: "Schedule rules contain internal contradictory windows", Conflicts: toAPIConflicts(conflicts)})
         return
     }
-
     h.schedEng.UpsertSchedule(s)
-
     if h.store != nil {
         if err := h.store.SaveSchedule(s); err != nil {
-            slog.Error("Failed to persist schedule to storage", "schedule_id", s.ID, "error", err)
             http.Error(w, `{"error":"failed to persist schedule to storage"}`, http.StatusInternalServerError)
             return
         }
     }
-
     h.tryTrigger()
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusCreated)
+    w.Header().Set("Content-Type", "application/json"); w.WriteHeader(http.StatusCreated)
     _ = json.NewEncoder(w).Encode(s)
 }
 
@@ -710,54 +668,32 @@ func (h *Handlers) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
         return
     }
     s.ID = id
-
     if s.Mode == "" {
         hasAllow := false
-        for _, r := range s.Rules {
-            if r.Action == models.ActionAllow {
-                hasAllow = true
-                break
-            }
-        }
-        if hasAllow {
-            s.Mode = models.ScheduleModeWhitelist
-        } else {
-            s.Mode = models.ScheduleModeDowntime
-        }
+        for _, r := range s.Rules { if r.Action == models.ActionAllow { hasAllow = true; break } }
+        if hasAllow { s.Mode = models.ScheduleModeWhitelist } else { s.Mode = models.ScheduleModeDowntime }
     }
-
     if err := validateScheduleRules(&s); err != nil {
         http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
         return
     }
-
     if !isSupportedTimezone(s.Timezone) {
         http.Error(w, `{"error":"unsupported or invalid timezone"}`, http.StatusBadRequest)
         return
     }
-
     _, conflicts, err := scheduleconflict.MergeSchedules([]models.Schedule{s})
     if err != nil || len(conflicts) > 0 {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusConflict)
-        _ = json.NewEncoder(w).Encode(api.ConflictResponse{
-            Error:     "schedule_conflict",
-            Message:   "Schedule rules contain internal contradictory windows",
-            Conflicts: toAPIConflicts(conflicts),
-        })
+        w.Header().Set("Content-Type", "application/json"); w.WriteHeader(http.StatusConflict)
+        _ = json.NewEncoder(w).Encode(api.ConflictResponse{Error: "schedule_conflict", Message: "Schedule rules contain internal contradictory windows", Conflicts: toAPIConflicts(conflicts)})
         return
     }
-
     h.schedEng.UpsertSchedule(s)
-
     if h.store != nil {
         if err := h.store.SaveSchedule(s); err != nil {
-            slog.Error("Failed to update schedule in storage", "schedule_id", s.ID, "error", err)
             http.Error(w, `{"error":"failed to update schedule in storage"}`, http.StatusInternalServerError)
             return
         }
     }
-
     h.tryTrigger()
     w.Header().Set("Content-Type", "application/json")
     _ = json.NewEncoder(w).Encode(s)
@@ -766,17 +702,29 @@ func (h *Handlers) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) DeleteSchedule(w http.ResponseWriter, r *http.Request) {
     id := r.PathValue("id")
     h.schedEng.DeleteSchedule(id)
-
     if h.store != nil {
         if err := h.store.DeleteSchedule(id); err != nil {
-            slog.Error("Failed to delete schedule from storage", "schedule_id", id, "error", err)
             http.Error(w, `{"error":"failed to delete schedule from storage"}`, http.StatusInternalServerError)
             return
         }
     }
-
     h.tryTrigger()
     w.WriteHeader(http.StatusNoContent)
+}
+
+// UI-FN-08 Fix: Network Stats Endpoint
+func (h *Handlers) GetNetworkStats(w http.ResponseWriter, r *http.Request) {
+    if h.store == nil {
+        http.Error(w, `{"error":"storage unavailable"}`, http.StatusServiceUnavailable)
+        return
+    }
+    stats, err := h.store.GetNetworkStats()
+    if err != nil {
+        http.Error(w, `{"error":"failed to fetch stats"}`, http.StatusInternalServerError)
+        return
+    }
+    w.Header().Set("Content-Type", "application/json")
+    _ = json.NewEncoder(w).Encode(stats)
 }
 
 func (h *Handlers) FlushNftables(w http.ResponseWriter, r *http.Request) {
@@ -793,26 +741,22 @@ func generateID() string {
     return hex.EncodeToString(b)
 }
 
-// AuthMiddleware enforces Bearer token authentication if a token is configured.
 func AuthMiddleware(token string, next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         if token == "" {
             next.ServeHTTP(w, r)
             return
         }
-
         authHeader := r.Header.Get("Authorization")
         if authHeader == "" {
             http.Error(w, `{"error":"missing authorization header"}`, http.StatusUnauthorized)
             return
         }
-
         parts := strings.SplitN(authHeader, " ", 2)
         if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] != token {
             http.Error(w, `{"error":"invalid or malformed authorization token"}`, http.StatusUnauthorized)
             return
         }
-
         next.ServeHTTP(w, r)
     })
 }
