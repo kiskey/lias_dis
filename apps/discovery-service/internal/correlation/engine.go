@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 4.4 (Applied CPU-01 TouchLastSeen)
+// Version: 4.5 (Wired Debouncer MigratePDID, Fixed Dangling CurrentIP)
 package correlation
 
 import (
@@ -346,6 +346,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                 slog.Warn("Potential MAC spoofing detected", "existing_pdid", d.PDID, "existing_mac", d.CurrentMAC, "spoof_mac", macStr, "ip", ipStr)
                 
                 e.cache.RemoveIPIndex(ipStr)
+                e.markDirty(d.PDID) // High 5 Fix: Mark dirty so DB knows about IP eviction
                 d = nil
             }
         } else if ipStr != "" {
@@ -375,6 +376,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                     slog.Warn("Potential cross-device MAC spoofing detected", "target_pdid", existingOnIP.PDID, "spoof_mac", macStr, "ip", ipStr)
                     
                     e.cache.RemoveIPIndex(ipStr)
+                    e.markDirty(existingOnIP.PDID) // High 5 Fix: Mark dirty so DB knows about IP eviction
                     d = nil
                 }
             }
@@ -490,7 +492,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         dirty = true
     }
 
-    // CPU-01 Fix: Only Upsert if dirty. Otherwise, just touch LastSeen in cache.
     if dirty {
         d.Touch(time.Now())
         e.cache.Upsert(d)
@@ -522,6 +523,9 @@ func (e *Engine) promoteDevice(d *models.Device, newTier models.IdentityTier, ne
             return
         }
     }
+
+    // Critical 3 Fix: Migrate pending events in the debouncer to the new PDID
+    e.debouncer.MigratePDID(oldPDID, newPDID)
 
     e.cache.Delete(oldPDID)
     e.cache.Upsert(d)
