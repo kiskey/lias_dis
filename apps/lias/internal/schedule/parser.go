@@ -1,7 +1,7 @@
 // Package schedule implements time-based rule parsing and evaluation for LIAS.
 //
 // File:    apps/lias/internal/schedule/parser.go
-// Version: 1.8
+// Version: 1.9
 package schedule
 
 import (
@@ -30,11 +30,6 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
     if err != nil {
         loc = time.UTC
     }
-    now = now.In(loc)
-
-    // LIAS-SCH-03/04 Fix: Resolve DST ambiguities.
-    _, offset := now.Zone()
-    now = now.Add(time.Duration(-offset) * time.Second) 
     now = now.In(loc)
     
     var bestMatch *models.ScheduleRule
@@ -176,15 +171,13 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
     return models.ActionAllow, nil
 }
 
-// NextStateChange calculates the exact next timestamp when the schedule action will transition.
+// NextStateChange calculates the exact next timestamp when the schedule action or rule context will transition.
 func NextStateChange(s models.Schedule, now time.Time) (time.Time, error) {
     loc, err := time.LoadLocation(s.Timezone)
     if err != nil {
         loc = time.UTC
     }
     now = now.In(loc)
-
-    currentAction, _ := Evaluate(s, now)
 
     var transitionPoints []time.Time
     year, month, day := now.Date()
@@ -229,12 +222,8 @@ func NextStateChange(s models.Schedule, now time.Time) (time.Time, error) {
         return transitionPoints[i].Before(transitionPoints[j])
     })
 
-    for _, t := range transitionPoints {
-        nextAction, _ := Evaluate(s, t.Add(1*time.Second))
-        if nextAction != currentAction {
-            return t, nil
-        }
-    }
-
-    return now.Add(24 * time.Hour), nil
+    // MATH-07 Fix: Return the very next transition point.
+    // Nftables syncs are cheap and idempotent, so triggering on rule boundaries
+    // (even if the action doesn't change) is safe and prevents missed evaluations.
+    return transitionPoints[0], nil
 }
