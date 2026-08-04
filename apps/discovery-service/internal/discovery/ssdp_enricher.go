@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/ssdp_enricher.go
-// Version: 1.5 (Fixed Build Error and SO_REUSEPORT Multicast)
+// Version: 1.6 (Fixed Multicast Binding and SO_REUSEPORT)
 package discovery
 
 import (
@@ -146,38 +146,20 @@ func (e *SSDPEnricher) runPassiveListener() {
         }
     }
 
-    // LNX-01 Fix: Use ListenConfig with SO_REUSEPORT
-    lc := net.ListenConfig{
-        Control: func(network, address string, c syscall.RawConn) error {
-            var opErr error
-            err := c.Control(func(fd uintptr) {
-                opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-            })
-            if err != nil {
-                return err
-            }
-            return opErr
-        },
-    }
-
-    pc, err := lc.ListenPacket(e.ctx, "udp4", "0.0.0.0:1900")
+    // ListenMulticastUDP natively sets SO_REUSEADDR, which is correct for multicast on Linux.
+    conn, err := net.ListenMulticastUDP("udp4", iface, addr)
     if err != nil {
-        slog.Error("Failed to listen on SSDP port 1900", "error", err)
+        slog.Error("Failed to listen on SSDP multicast", "error", err)
         return
     }
-    defer pc.Close()
+    defer conn.Close()
 
-    conn := pc.(*net.UDPConn)
-
-    // NET-05 Fix: Join multicast group on specific interface
-    if iface != nil {
-        if err := conn.JoinGroup(iface, addr); err != nil {
-            slog.Warn("Failed to join SSDP multicast group on specific interface", "iface", e.ifaceName, "error", err)
-        }
-    } else {
-        if err := conn.JoinGroup(nil, addr); err != nil {
-            slog.Warn("Failed to join SSDP multicast group", "error", err)
-        }
+    // LNX-01 Fix: Explicitly set SO_REUSEPORT to allow multiple DIS instances if needed
+    sc, err := conn.SyscallConn()
+    if err == nil {
+        _ = sc.Control(func(fd uintptr) {
+            _ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+        })
     }
 
     buf := make([]byte, 4096)
