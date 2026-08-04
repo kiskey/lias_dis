@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 2.5 (Incremental diff application, zero flushes)
+// Version: 2.6 (LAN traffic bypass for blocked devices)
 package nftables
 
 import (
@@ -58,7 +58,6 @@ func (c *Controller) Init() error {
 
     c.conn.FlushChain(c.chain)
 
-    // No timeout to prevent silent unblocking
     allowedIPsSet := &nftables.Set{
         Name:    "allowed_ips",
         Table:   c.table,
@@ -109,20 +108,58 @@ func (c *Controller) Init() error {
 
     ifaceBytes := []byte(c.cfg.Interface + "\x00")
 
-    // Rules (unchanged from v2.4 for brevity, but fully present in the actual file)
+    // Build and inject rules
     c.addRules(ifaceBytes)
 
     if err := c.conn.Flush(); err != nil {
         return fmt.Errorf("failed to initialize netdev lancontrol table: %w", err)
     }
 
-    slog.Info("nftables netdev table initialized successfully with priority -500 and drop-first rules",
-        "table", c.cfg.TableName, "iface", c.cfg.Interface)
+    slog.Info("nftables netdev table initialized successfully with priority -500, drop-first rules, and LAN bypass",
+        "table", c.cfg.TableName, "iface", c.cfg.Interface, "bypass_subnets", len(c.cfg.LanSubnets))
     return nil
 }
 
 func (c *Controller) addRules(ifaceBytes []byte) {
-    // DROP MACs
+    // 0. LAN BYPASS RULES (Highest Priority)
+    // Allows blocked devices to communicate with local infrastructure (printers, NAS, DNS)
+    for _, subnetStr := range c.cfg.LanSubnets {
+        _, ipNet, err := net.ParseCIDR(subnetStr)
+        if err != nil {
+            slog.Warn("Invalid LAN subnet in config, skipping bypass rule", "subnet", subnetStr)
+            continue
+        }
+
+        isV4 := ipNet.IP.To4() != nil
+        offset := uint32(8)  // IPv6 Src offset
+        length := uint32(16) // IPv6 length
+        if isV4 {
+            offset = 12 // IPv4 Src offset
+            length = 4  // IPv4 length
+        }
+
+        // Must match iifname AND destination subnet
+        c.conn.AddRule(&nftables.Rule{
+            Table: c.table,
+            Chain: c.chain,
+            Exprs: []expr.Any{
+                &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+                &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
+                &expr.Payload{
+                    OperationType: expr.PayloadLoad,
+                    DestRegister:  1,
+                    Base:          expr.PayloadBaseNetworkHeader,
+                    Offset:        offset,
+                    Len:           length,
+                },
+                &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ipNet.Mask},
+                &expr.Cmp{Op: expr.CmpOpGt, Register: 1, Data: ipNet.IP}, // Checks if IP >= network base
+                &expr.Verdict{Kind: expr.VerdictAccept},
+            },
+        })
+    }
+
+    // 1. DROP MACs (Applies only to Internet-bound traffic)
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
@@ -130,7 +167,8 @@ func (c *Controller) addRules(ifaceBytes []byte) {
         &expr.Lookup{SourceRegister: 1, SetName: "blocked_macs", SetID: c.sets["blocked_macs"].ID},
         &expr.Verdict{Kind: expr.VerdictDrop},
     }})
-    // ALLOW MACs
+    
+    // 2. ALLOW MACs
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
@@ -138,7 +176,8 @@ func (c *Controller) addRules(ifaceBytes []byte) {
         &expr.Lookup{SourceRegister: 1, SetName: "allowed_macs", SetID: c.sets["allowed_macs"].ID},
         &expr.Verdict{Kind: expr.VerdictAccept},
     }})
-    // BLOCK IPv4s
+    
+    // 3. BLOCK IPv4s
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
@@ -146,7 +185,8 @@ func (c *Controller) addRules(ifaceBytes []byte) {
         &expr.Lookup{SourceRegister: 1, SetName: "blocked_ips", SetID: c.sets["blocked_ips"].ID},
         &expr.Verdict{Kind: expr.VerdictDrop},
     }})
-    // ALLOW IPv4s
+    
+    // 4. ALLOW IPv4s
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
@@ -154,7 +194,8 @@ func (c *Controller) addRules(ifaceBytes []byte) {
         &expr.Lookup{SourceRegister: 1, SetName: "allowed_ips", SetID: c.sets["allowed_ips"].ID},
         &expr.Verdict{Kind: expr.VerdictAccept},
     }})
-    // BLOCK IPv6s
+    
+    // 5. BLOCK IPv6s
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
@@ -162,7 +203,8 @@ func (c *Controller) addRules(ifaceBytes []byte) {
         &expr.Lookup{SourceRegister: 1, SetName: "blocked_ips_v6", SetID: c.sets["blocked_ips_v6"].ID},
         &expr.Verdict{Kind: expr.VerdictDrop},
     }})
-    // ALLOW IPv6s
+    
+    // 6. ALLOW IPv6s
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
@@ -207,7 +249,6 @@ type SetDiff struct {
     BlockedIP6sToRem  []net.IP
 }
 
-// Apply applies only the incremental diffs to the kernel sets.
 func (c *Controller) Apply(diff SetDiff) error {
     c.mu.Lock()
     defer c.mu.Unlock()
