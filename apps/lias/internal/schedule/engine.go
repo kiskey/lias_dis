@@ -1,7 +1,7 @@
 // Package schedule implements time-based rule evaluation for LIAS.
 //
 // File:    apps/lias/internal/schedule/engine.go
-// Version: 1.3
+// Version: 1.4
 package schedule
 
 import (
@@ -17,22 +17,31 @@ import (
     "github.com/user/lias-dis/shared/models"
 )
 
-// Engine manages schedules and evaluates them in real-time.
+// EffectivePolicyProvider allows the schedule engine to query the active policy for a device
+// to accurately compute NextStateChange transitions.
+type EffectivePolicyProvider interface {
+    GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy
+}
+
 type Engine struct {
-    mu          sync.RWMutex
-    schedules   map[string]models.Schedule
-    mergedCache map[string]models.Schedule
-    reverseIdx  map[string][]string
-    cache       *liasSync.Cache
+    mu             sync.RWMutex
+    schedules      map[string]models.Schedule
+    mergedCache    map[string]models.Schedule
+    reverseIdx     map[string][]string
+    cache          *liasSync.Cache
+    policyProvider EffectivePolicyProvider // GAP-L-CR04 Fix
+    trigger        chan struct{}           // GAP-L-H05 Fix
 }
 
 // NewEngine initializes the schedule engine.
-func NewEngine(cache *liasSync.Cache) *Engine {
+func NewEngine(cache *liasSync.Cache, policyProvider EffectivePolicyProvider, trigger chan struct{}) *Engine {
     return &Engine{
-        schedules:   make(map[string]models.Schedule),
-        mergedCache: make(map[string]models.Schedule),
-        reverseIdx:  make(map[string][]string),
-        cache:       cache,
+        schedules:      make(map[string]models.Schedule),
+        mergedCache:    make(map[string]models.Schedule),
+        reverseIdx:     make(map[string][]string),
+        cache:          cache,
+        policyProvider: policyProvider,
+        trigger:        trigger,
     }
 }
 
@@ -52,7 +61,6 @@ func (e *Engine) invalidateCacheForScheduleLocked(id string) {
     }
 }
 
-// UpsertSchedule adds or updates a schedule record and invalidates composite caches.
 func (e *Engine) UpsertSchedule(s models.Schedule) {
     e.mu.Lock()
     defer e.mu.Unlock()
@@ -60,7 +68,6 @@ func (e *Engine) UpsertSchedule(s models.Schedule) {
     e.invalidateCacheForScheduleLocked(s.ID)
 }
 
-// DeleteSchedule removes a schedule record by ID and invalidates composite caches.
 func (e *Engine) DeleteSchedule(id string) {
     e.mu.Lock()
     defer e.mu.Unlock()
@@ -68,7 +75,6 @@ func (e *Engine) DeleteSchedule(id string) {
     e.invalidateCacheForScheduleLocked(id)
 }
 
-// GetSchedule returns a single schedule by ID if found.
 func (e *Engine) GetSchedule(id string) (models.Schedule, bool) {
     e.mu.RLock()
     defer e.mu.RUnlock()
@@ -76,7 +82,6 @@ func (e *Engine) GetSchedule(id string) (models.Schedule, bool) {
     return s, ok
 }
 
-// ListSchedules returns all configured schedules.
 func (e *Engine) ListSchedules() []models.Schedule {
     e.mu.RLock()
     defer e.mu.RUnlock()
@@ -88,7 +93,6 @@ func (e *Engine) ListSchedules() []models.Schedule {
     return list
 }
 
-// EvaluateNow implements policy.ScheduleEvaluator for single schedule evaluation.
 func (e *Engine) EvaluateNow(schedID string) models.Action {
     if schedID == "" {
         return models.ActionAllow
@@ -96,11 +100,7 @@ func (e *Engine) EvaluateNow(schedID string) models.Action {
     return e.EvaluateBundle([]string{schedID})
 }
 
-// EvaluateBundle evaluates a policy's attached multi-schedule bundle.
-// If scheduleIDs is empty, returns ActionAllow (no restriction).
-// Returns ActionBlock (fail-closed) if any schedule is missing or if conflicts occur.
 func (e *Engine) EvaluateBundle(scheduleIDs []string) models.Action {
-    // OPTION B FIX: Empty schedule list means no restriction (Allow)
     if len(scheduleIDs) == 0 {
         return models.ActionAllow
     }
@@ -150,7 +150,6 @@ func (e *Engine) EvaluateBundle(scheduleIDs []string) models.Action {
     return action
 }
 
-// Run starts the background timer that updates NextStateChange timestamps for scheduled devices.
 func (e *Engine) Run(ctx context.Context) {
     ticker := time.NewTicker(1 * time.Minute)
     defer ticker.Stop()
@@ -169,29 +168,64 @@ func (e *Engine) Run(ctx context.Context) {
 
 func (e *Engine) updateNextStateChanges() {
     devs := e.cache.List()
+    var minNextChange *time.Time
+
     for _, d := range devs {
-        if d.Policy != nil && d.Policy.Action == models.ActionSchedule {
-            schedIDs := d.Policy.GetScheduleIDs()
-            if len(schedIDs) > 0 {
-                key := bundleKey(schedIDs)
-                e.mu.RLock()
-                merged, ok := e.mergedCache[key]
-                e.mu.RUnlock()
-
-                if !ok {
-                    _ = e.EvaluateBundle(schedIDs)
+        // GAP-L-CR04 Fix: Use EffectivePolicyProvider to correctly identify schedule-driven devices
+        if e.policyProvider != nil {
+            devCopy := d
+            pol := e.policyProvider.GetEffectivePolicy(&devCopy)
+            
+            if pol.Action == models.ActionSchedule {
+                schedIDs := pol.GetScheduleIDs()
+                if len(schedIDs) > 0 {
+                    key := bundleKey(schedIDs)
                     e.mu.RLock()
-                    merged, ok = e.mergedCache[key]
+                    merged, ok := e.mergedCache[key]
                     e.mu.RUnlock()
-                }
 
-                if ok {
-                    nextChange, err := NextStateChange(merged, time.Now())
-                    if err == nil {
-                        e.cache.SetNextStateChange(d.PDID, &nextChange)
+                    if !ok {
+                        _ = e.EvaluateBundle(schedIDs)
+                        e.mu.RLock()
+                        merged, ok = e.mergedCache[key]
+                        e.mu.RUnlock()
                     }
+
+                    if ok {
+                        nextChange, err := NextStateChange(merged, time.Now())
+                        if err == nil {
+                            e.cache.SetNextStateChange(d.PDID, &nextChange)
+                            
+                            // GAP-L-H05 Fix: Track the earliest transition to trigger immediate nftables sync
+                            if minNextChange == nil || nextChange.Before(*minNextChange) {
+                                n := nextChange
+                                minNextChange = &n
+                            }
+                        }
+                    }
+                } else {
+                    e.cache.SetNextStateChange(d.PDID, nil)
                 }
+            } else {
+                e.cache.SetNextStateChange(d.PDID, nil)
             }
         }
+    }
+
+    // GAP-L-H05 Fix: Schedule an immediate resync precisely when the next schedule transition occurs
+    if minNextChange != nil {
+        duration := time.Until(*minNextChange)
+        if duration < 0 {
+            duration = 0
+        }
+        
+        time.AfterFunc(duration, func() {
+            select {
+            case e.trigger <- struct{}{}:
+                slog.Info("Triggered immediate nftables sync for schedule transition", "transition_time", minNextChange)
+            default:
+                // Trigger already pending
+            }
+        })
     }
 }
