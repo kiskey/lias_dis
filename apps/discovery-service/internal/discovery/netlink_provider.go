@@ -2,12 +2,11 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 2.1
+// Version: 2.2
 package discovery
 
 import (
     "context"
-    "fmt"
     "log/slog"
     "net"
     "sync"
@@ -87,7 +86,6 @@ func (p *NetlinkProvider) runSubscriptionLoop() {
             continue
         }
 
-        // Consume updates until the socket closes or context is cancelled
         for {
             select {
             case <-p.ctx.Done():
@@ -109,7 +107,6 @@ func (p *NetlinkProvider) runSubscriptionLoop() {
         }
 
     ReconnectLoop:
-        // If we break out of the consume loop due to channel close, loop back to start
         select {
         case <-p.ctx.Done():
             return
@@ -177,7 +174,6 @@ func (p *NetlinkProvider) auditKernelNeighbors() {
 
 // probeNeighborIP transmits an active L2 probe packet to force kernel ARP state resolution.
 func (p *NetlinkProvider) probeNeighborIP(ip net.IP) {
-    // Use standard port 80 to ensure penetration through basic stateful firewalls
     addr := net.JoinHostPort(ip.String(), "80")
     conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
     if err == nil {
