@@ -1,7 +1,7 @@
 // Package nftables implements the isolated firewall controller for LIAS.
 //
 // File:    apps/lias/internal/nftables/builder.go
-// Version: 1.7 (Incremental Diffing & IPv6 Support)
+// Version: 1.8 (Pure incremental diffing)
 package nftables
 
 import (
@@ -13,22 +13,19 @@ import (
     "github.com/user/lias-dis/shared/models"
 )
 
-// Builder evaluates LIAS policies and updates the netfilter set elements.
 type Builder struct {
     mu         sync.Mutex
     cache      *liasSync.Cache
     controller *Controller
 
-    // State tracking for incremental diffing (LIAS-NFT-11)
-    currentAllowedIPs   map[string]net.IP
-    currentBlockedIPs   map[string]net.IP
-    currentAllowedMACs  map[string]net.HardwareAddr
-    currentBlockedMACs  map[string]net.HardwareAddr
-    currentAllowedIP6s  map[string]net.IP
-    currentBlockedIP6s  map[string]net.IP
+    currentAllowedIPs  map[string]net.IP
+    currentBlockedIPs  map[string]net.IP
+    currentAllowedMACs map[string]net.HardwareAddr
+    currentBlockedMACs map[string]net.HardwareAddr
+    currentAllowedIP6s map[string]net.IP
+    currentBlockedIP6s map[string]net.IP
 }
 
-// NewBuilder initializes a new rules builder.
 func NewBuilder(cache *liasSync.Cache, controller *Controller) *Builder {
     return &Builder{
         cache:      cache,
@@ -43,15 +40,12 @@ func NewBuilder(cache *liasSync.Cache, controller *Controller) *Builder {
     }
 }
 
-// Sync evaluates all devices in the local cache and applies updated sets to nftables.
-// Implements incremental diffing to reduce netlink traffic.
 func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.ScheduleEvaluator) error {
     b.mu.Lock()
     defer b.mu.Unlock()
 
     devs := b.cache.List()
 
-    // Desired state maps
     desiredAllowedIPs := make(map[string]net.IP)
     desiredBlockedIPs := make(map[string]net.IP)
     desiredAllowedMACs := make(map[string]net.HardwareAddr)
@@ -84,7 +78,6 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
             }
 
         case models.ActionBlock:
-            // LATCHED BLOCK INVARIANT: Block elements must persist even if offline
             for _, ipStr := range d.IPs {
                 if ip := net.ParseIP(ipStr); ip != nil {
                     if ip4 := ip.To4(); ip4 != nil {
@@ -102,38 +95,42 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
         }
     }
 
-    // Calculate Diffs
-    allowedIPsToAdd, allowedIPsToRem := diffIPs(desiredAllowedIPs, b.currentAllowedIPs)
-    blockedIPsToAdd, blockedIPsToRem := diffIPs(desiredBlockedIPs, b.currentBlockedIPs)
-    
-    allowedMACsToAdd, allowedMACsToRem := diffMACs(desiredAllowedMACs, b.currentAllowedMACs)
-    blockedMACsToAdd, blockedMACsToRem := diffMACs(desiredBlockedMACs, b.currentBlockedMACs)
-    
-    allowedIP6sToAdd, allowedIP6sToRem := diffIPs(desiredAllowedIP6s, b.currentAllowedIP6s)
-    blockedIP6sToAdd, blockedIP6sToRem := diffIPs(desiredBlockedIP6s, b.currentBlockedIP6s)
+    diff := SetDiff{
+        AllowedIPsToAdd:   make([]net.IP, 0),
+        AllowedIPsToRem:   make([]net.IP, 0),
+        BlockedIPsToAdd:   make([]net.IP, 0),
+        BlockedIPsToRem:   make([]net.IP, 0),
+        AllowedMACsToAdd:  make([]net.HardwareAddr, 0),
+        AllowedMACsToRem:  make([]net.HardwareAddr, 0),
+        BlockedMACsToAdd:  make([]net.HardwareAddr, 0),
+        BlockedMACsToRem:  make([]net.HardwareAddr, 0),
+        AllowedIP6sToAdd:  make([]net.IP, 0),
+        AllowedIP6sToRem:  make([]net.IP, 0),
+        BlockedIP6sToAdd:  make([]net.IP, 0),
+        BlockedIP6sToRem:  make([]net.IP, 0),
+    }
 
-    // If nothing changed, skip netlink transaction entirely
-    if len(allowedIPsToAdd) == 0 && len(allowedIPsToRem) == 0 &&
-        len(blockedIPsToAdd) == 0 && len(blockedIPsToRem) == 0 &&
-        len(allowedMACsToAdd) == 0 && len(allowedMACsToRem) == 0 &&
-        len(blockedMACsToAdd) == 0 && len(blockedMACsToRem) == 0 &&
-        len(allowedIP6sToAdd) == 0 && len(allowedIP6sToRem) == 0 &&
-        len(blockedIP6sToAdd) == 0 && len(blockedIP6sToRem) == 0 {
+    // Compute Diffs
+    diffIPs(desiredAllowedIPs, b.currentAllowedIPs, &diff.AllowedIPsToAdd, &diff.AllowedIPsToRem)
+    diffIPs(desiredBlockedIPs, b.currentBlockedIPs, &diff.BlockedIPsToAdd, &diff.BlockedIPsToRem)
+    diffMACs(desiredAllowedMACs, b.currentAllowedMACs, &diff.AllowedMACsToAdd, &diff.AllowedMACsToRem)
+    diffMACs(desiredBlockedMACs, b.currentBlockedMACs, &diff.BlockedMACsToAdd, &diff.BlockedMACsToRem)
+    diffIPs(desiredAllowedIP6s, b.currentAllowedIP6s, &diff.AllowedIP6sToAdd, &diff.AllowedIP6sToRem)
+    diffIPs(desiredBlockedIP6s, b.currentBlockedIP6s, &diff.BlockedIP6sToAdd, &diff.BlockedIP6sToRem)
+
+    // If completely empty, skip
+    if len(diff.AllowedIPsToAdd) == 0 && len(diff.AllowedIPsToRem) == 0 &&
+        len(diff.BlockedIPsToAdd) == 0 && len(diff.BlockedIPsToRem) == 0 &&
+        len(diff.AllowedMACsToAdd) == 0 && len(diff.AllowedMACsToRem) == 0 &&
+        len(diff.BlockedMACsToAdd) == 0 && len(diff.BlockedMACsToRem) == 0 &&
+        len(diff.AllowedIP6sToAdd) == 0 && len(diff.AllowedIP6sToRem) == 0 &&
+        len(diff.BlockedIP6sToAdd) == 0 && len(diff.BlockedIP6sToRem) == 0 {
         return nil
     }
 
-    // Apply changes. The controller handles the atomic netlink batch.
-    // We pass the full desired state, but in a real high-performance scenario, 
-    // Controller.Apply would be refactored to accept diffs. 
-    // Given the netlink batch limit, passing the full pruned desired state is still 
-    // vastly superior to the previous "flush all, add all" approach.
-    err := b.controller.Apply(
-        SetElements{IPs: mapToIPs(desiredAllowedIPs), MACs: mapToMACs(desiredAllowedMACs), IPsV6: mapToIPs(desiredAllowedIP6s)},
-        SetElements{IPs: mapToIPs(desiredBlockedIPs), MACs: mapToMACs(desiredBlockedMACs), IPsV6: mapToIPs(desiredBlockedIP6s)},
-    )
+    err := b.controller.Apply(diff)
 
     if err == nil {
-        // Update current state cache only on success
         b.currentAllowedIPs = desiredAllowedIPs
         b.currentBlockedIPs = desiredBlockedIPs
         b.currentAllowedMACs = desiredAllowedMACs
@@ -145,48 +142,28 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
     return err
 }
 
-// diffIPs returns elements to add and remove based on desired vs current state.
-func diffIPs(desired, current map[string]net.IP) (toAdd, toRem []net.IP) {
+func diffIPs(desired, current map[string]net.IP, toAdd, toRem *[]net.IP) {
     for k, v := range desired {
         if _, exists := current[k]; !exists {
-            toAdd = append(toAdd, v)
+            *toAdd = append(*toAdd, v)
         }
     }
     for k, v := range current {
         if _, exists := desired[k]; !exists {
-            toRem = append(toRem, v)
+            *toRem = append(*toRem, v)
         }
     }
-    return
 }
 
-// diffMACs returns elements to add and remove based on desired vs current state.
-func diffMACs(desired, current map[string]net.HardwareAddr) (toAdd, toRem []net.HardwareAddr) {
+func diffMACs(desired, current map[string]net.HardwareAddr, toAdd, toRem *[]net.HardwareAddr) {
     for k, v := range desired {
         if _, exists := current[k]; !exists {
-            toAdd = append(toAdd, v)
+            *toAdd = append(*toAdd, v)
         }
     }
     for k, v := range current {
         if _, exists := desired[k]; !exists {
-            toRem = append(toRem, v)
+            *toRem = append(*toRem, v)
         }
     }
-    return
-}
-
-func mapToIPs(m map[string]net.IP) []net.IP {
-    out := make([]net.IP, 0, len(m))
-    for _, v := range m {
-        out = append(out, v)
-    }
-    return out
-}
-
-func mapToMACs(m map[string]net.HardwareAddr) []net.HardwareAddr {
-    out := make([]net.HardwareAddr, 0, len(m))
-    for _, v := range m {
-        out = append(out, v)
-    }
-    return out
 }
