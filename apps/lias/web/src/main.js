@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 3.0 (Full HIG Modals, Device Details, Analytics, Vacation Mode, Import/Export, Onboarding, Calendar Dates, Multi-Tag UI)
+// Version: 3.1 (Infra Pause Fix, Vacation Mode UI Fix, Full HIG Modals)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -519,6 +519,7 @@ class App {
   renderDeviceCard(d) {
     const dispName = d.friendly_name || d.hostname || `${d.vendor || ''} ${d.model || ''}`.trim() || d.current_mac || d.pdid;
     const tags = (d.tags && d.tags.length > 0) ? d.tags : ['generic'];
+    const isInfra = tags.includes('infrastructure');
 
     // LIAS-TAG-01 Fix: Render multi-select for tags
     const tagCheckboxes = this.tags.map(t => `
@@ -527,6 +528,9 @@ class App {
         ${t.name}
       </label>
     `).join('');
+
+    // FIX: Hide Pause button for Infrastructure devices to prevent UI confusion
+    const pauseBtnHtml = isInfra ? '' : `<button class="btn btn-danger btn-pause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px;">⏸ Pause</button>`;
 
     return `
       <div class="device-item">
@@ -554,7 +558,7 @@ class App {
             </div>
           </details>
           <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px;">
-            <button class="btn btn-danger btn-pause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px;">⏸ Pause</button>
+            ${pauseBtnHtml}
             <button class="btn btn-secondary btn-rename-device" data-pdid="${d.pdid}" data-name="${dispName}" style="padding: 6px 10px; font-size: 12px;">✏️</button>
             <button class="btn btn-secondary btn-details-device" data-pdid="${d.pdid}" style="padding: 6px 10px; font-size: 12px;">📋</button>
           </div>
@@ -568,7 +572,7 @@ class App {
     document.querySelectorAll('.device-tag-checkbox').forEach(chk => {
       chk.addEventListener('change', async (e) => {
         const deviceItem = e.target.closest('.device-item');
-        const pdid = deviceItem.querySelector('.btn-pause-device').dataset.pdid;
+        const pdid = deviceItem.querySelector('.btn-details-device').dataset.pdid;
         const selectedTags = Array.from(deviceItem.querySelectorAll('.device-tag-checkbox:checked')).map(c => c.value);
         
         // If no tags selected, default to generic
@@ -1557,6 +1561,7 @@ class App {
   }
 
   renderSettingsView(container) {
+    // FIX: Added explicit Apple HIG compliant CSS for the toggle switch to ensure visibility
     container.innerHTML = `
       <div class="card">
         <h3>System Maintenance</h3>
@@ -1564,23 +1569,79 @@ class App {
         <div style="margin-top:16px; display:flex; flex-direction:column; gap:12px;">
           <button class="btn btn-danger" id="btn-flush-nft">Flush Nftables Lancontrol Table</button>
           
-          <div style="display:flex; justify-content:space-between; align-items:center; padding: 12px; background: var(--bg-tertiary); border-radius: 8px;">
-            <div>
+          <div class="hig-toggle-row">
+            <div class="hig-toggle-text">
               <strong>Vacation Mode</strong>
-              <p style="font-size:12px; color:var(--text-secondary);">Immediately blocks all internet access for all devices (except Infrastructure).</p>
+              <p>Immediately blocks all internet access for all devices (except Infrastructure).</p>
             </div>
-            <label class="switch" style="position:relative; display:inline-block; width:50px; height:28px;">
-              <input type="checkbox" id="chk-vacation" style="opacity:0; width:0; height:0;">
-              <span class="slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:var(--bg-secondary); transition:.4s; border-radius:28px; border:1px solid var(--separator);"></span>
-            </label>
+            <div class="hig-toggle-switch">
+              <input type="checkbox" id="chk-vacation">
+              <span class="hig-slider"></span>
+            </div>
           </div>
         </div>
       </div>
       <style>
-        .switch input:checked + .slider { background-color: var(--danger); }
-        .switch input:focus + .slider { box-shadow: 0 0 1px var(--danger); }
-        .switch input:checked + .slider:before { transform: translateX(22px); }
-        .switch .slider:before { position:absolute; content:""; height:20px; width:20px; left:3px; bottom:3px; background-color:white; transition:.4s; border-radius:50%; }
+        .hig-toggle-row {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding: 16px;
+          background: var(--bg-tertiary);
+          border-radius: 12px;
+        }
+        .hig-toggle-text strong {
+          font-size: 15px;
+          font-weight: 600;
+          color: var(--text-primary);
+          display: block;
+        }
+        .hig-toggle-text p {
+          font-size: 13px;
+          color: var(--text-secondary);
+          margin-top: 4px;
+        }
+        .hig-toggle-switch {
+          position: relative;
+          display: inline-block;
+          width: 51px;
+          height: 31px;
+          flex-shrink: 0;
+        }
+        .hig-toggle-switch input {
+          opacity: 0;
+          width: 0;
+          height: 0;
+        }
+        .hig-slider {
+          position: absolute;
+          cursor: pointer;
+          top: 0;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          background-color: #e9e9ea; /* Default Apple Gray for OFF */
+          transition: .4s;
+          border-radius: 31px;
+        }
+        .hig-slider:before {
+          position: absolute;
+          content: "";
+          height: 27px;
+          width: 27px;
+          left: 2px;
+          bottom: 2px;
+          background-color: white;
+          transition: .4s;
+          border-radius: 50%;
+          box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+        input:checked + .hig-slider {
+          background-color: #34c759; /* Apple Green for ON */
+        }
+        input:checked + .hig-slider:before {
+          transform: translateX(20px);
+        }
       </style>
     `;
 
