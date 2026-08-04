@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 2.1
+// Version: 2.2
 package storage
 
 import (
@@ -134,12 +134,6 @@ func (s *Storage) initSchema() error {
         return fmt.Errorf("failed to execute schema initialization: %w", err)
     }
 
-    // Migration: Drop old single-tag table if it exists to enforce new schema (or ALTER if possible)
-    // For SQLite, dropping and recreating is safer if schema changed.
-    _, _ = s.db.Exec("DROP TABLE IF EXISTS device_tags_old")
-    // If the table exists with the old schema, we can't easily ALTER PRIMARY KEY.
-    // We assume fresh DB or handle gracefully. 
-    // To be safe, we just ensure the new schema exists.
     _, _ = s.db.Exec("ALTER TABLE policies ADD COLUMN schedule_ids TEXT NOT NULL DEFAULT ''")
     _, _ = s.db.Exec("ALTER TABLE schedules ADD COLUMN mode TEXT NOT NULL DEFAULT ''")
     _, _ = s.db.Exec("ALTER TABLE policies ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
@@ -181,7 +175,6 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
         }
     }
 
-    // LIAS-TAG-01 Fix: Hydrate multi-tags
     dtRows, err := s.db.Query("SELECT pdid, tag_id, mac FROM device_tags")
     if err == nil {
         defer dtRows.Close()
@@ -250,7 +243,6 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
     return deviceTags, macTags, nil
 }
 
-// LIAS-TAG-01 Fix: Save multiple tags for a device
 func (s *Storage) SaveDeviceTags(pdid string, tagIDs []string, mac string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -261,7 +253,6 @@ func (s *Storage) SaveDeviceTags(pdid string, tagIDs []string, mac string) error
     }
     defer func() { _ = tx.Rollback() }()
 
-    // Clear existing tags for this pdid
     _, err = tx.Exec("DELETE FROM device_tags WHERE pdid = ?", pdid)
     if err != nil {
         return err
@@ -277,7 +268,6 @@ func (s *Storage) SaveDeviceTags(pdid string, tagIDs []string, mac string) error
     return tx.Commit()
 }
 
-// Legacy single-tag save for backwards compatibility if needed
 func (s *Storage) SaveDeviceTag(pdid, tagID, mac string) error {
     return s.SaveDeviceTags(pdid, []string{tagID}, mac)
 }
@@ -289,7 +279,6 @@ func (s *Storage) MigrateDeviceTag(oldPDID, newPDID string) error {
     return err
 }
 
-// LIAS-POL-15 Fix: Migrate device-specific policies to new PDID
 func (s *Storage) MigrateDevicePolicies(oldPDID, newPDID string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -300,13 +289,11 @@ func (s *Storage) MigrateDevicePolicies(oldPDID, newPDID string) error {
     }
     defer func() { _ = tx.Rollback() }()
 
-    // Update target_id in main policies table
     _, err = tx.Exec(`UPDATE policies SET target_id = ? WHERE target_id = ? AND type = 'device'`, newPDID, oldPDID)
     if err != nil {
         return err
     }
 
-    // Update data JSON blob
     _, err = tx.Exec(`UPDATE policies SET data = json_set(data, '$.target_id', ?) WHERE target_id = ? AND type = 'device'`, newPDID, newPDID)
     if err != nil {
         return err
