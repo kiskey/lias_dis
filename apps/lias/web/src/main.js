@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 2.7 (Fixes overnight band rendering & 12hr conflict format)
+// Version: 2.8 (Full IANA Timezones, Pause Internet, Manual Rename)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -15,15 +15,8 @@ class App {
     this.searchQuery = '';
     this.wizardState = {};
 
-    // UX Timezone Mapping (Label -> IANA Value)
-    this.timezones = [
-      { label: '(UTC-08:00) Pacific Time (PT)', value: 'America/Los_Angeles' },
-      { label: '(UTC-07:00) Mountain Time (MT)', value: 'America/Denver' },
-      { label: '(UTC-06:00) Central Time (CT)', value: 'America/Chicago' },
-      { label: '(UTC-05:00) Eastern Time (ET)', value: 'America/New_York' },
-      { label: '(UTC+00:00) Coordinated Universal Time (UTC)', value: 'UTC' },
-      { label: '(UTC+05:30) India Standard Time (IST)', value: 'Asia/Kolkata' }
-    ];
+    // UI-FN-11 Fix: Generate full IANA timezone list dynamically
+    this.timezones = this.generateIANATimezones();
 
     this.initRouter();
     this.initSSE();
@@ -35,6 +28,34 @@ class App {
         this.renderCurrentView();
       }
     }, 60000);
+  }
+
+  // UI-FN-11 Fix: Generates a comprehensive list of IANA timezones
+  generateIANATimezones() {
+    try {
+      // Use Intl API to get all supported timezones
+      const timezones = Intl.supportedValuesOf('timeZone');
+      return timezones.map(tz => {
+        // Format label nicely (e.g., "America/Los_Angeles" -> "America - Los Angeles")
+        const parts = tz.split('/');
+        const region = parts[0].replace(/_/g, ' ');
+        const city = parts.slice(1).join(' / ').replace(/_/g, ' ');
+        return {
+          label: `(${region}) ${city}`,
+          value: tz
+        };
+      }).sort((a, b) => a.label.localeCompare(b.label));
+    } catch (e) {
+      console.warn("Intl.supportedValuesOf not supported, falling back to hardcoded list");
+      return [
+        { label: '(UTC-08:00) Pacific Time (PT)', value: 'America/Los_Angeles' },
+        { label: '(UTC-07:00) Mountain Time (MT)', value: 'America/Denver' },
+        { label: '(UTC-06:00) Central Time (CT)', value: 'America/Chicago' },
+        { label: '(UTC-05:00) Eastern Time (ET)', value: 'America/New_York' },
+        { label: '(UTC+00:00) Coordinated Universal Time (UTC)', value: 'UTC' },
+        { label: '(UTC+05:30) India Standard Time (IST)', value: 'Asia/Kolkata' }
+      ];
+    }
   }
 
   initRouter() {
@@ -82,6 +103,8 @@ class App {
     } else if (event.type === 'device.reidentified') {
       const payload = event.payload || {};
       this.showToast(`🔄 Device identified: ${payload.new_pdid || 'device'} (promoted from ${payload.reason || 'tentative'})`);
+    } else if (event.type === 'security.alert') {
+      this.showToast(`🚨 Security Alert: ${event.payload.details || 'Unknown alert'}`, 'danger');
     }
     this.loadData();
   }
@@ -449,7 +472,7 @@ class App {
   }
 
   renderDeviceCard(d) {
-    const dispName = d.hostname || d.friendly_name || `${d.vendor || ''} ${d.model || ''}`.trim() || d.current_mac || d.pdid;
+    const dispName = d.friendly_name || d.hostname || `${d.vendor || ''} ${d.model || ''}`.trim() || d.current_mac || d.pdid;
     const tagId = (d.tags && d.tags.length > 0) ? d.tags[0] : 'generic';
 
     return `
@@ -470,10 +493,14 @@ class App {
             </div>
           ` : ''}
         </div>
-        <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center;">
-          <select class="device-tag-select" data-pdid="${d.pdid}">
+        <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center; gap: 8px;">
+          <select class="device-tag-select" data-pdid="${d.pdid}" style="flex: 1;">
             ${this.tags.map(t => `<option value="${t.id}" ${t.id === tagId ? 'selected' : ''}>${t.name}</option>`).join('')}
           </select>
+          <!-- UI-FN-06: Pause Internet Quick Action -->
+          <button class="btn btn-danger btn-pause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="padding: 6px 10px; font-size: 12px;">⏸ Pause</button>
+          <!-- UI-FN-12: Manual Rename -->
+          <button class="btn btn-secondary btn-rename-device" data-pdid="${d.pdid}" data-name="${dispName}" style="padding: 6px 10px; font-size: 12px;">✏️</button>
         </div>
       </div>
     `;
@@ -490,6 +517,43 @@ class App {
           this.loadData();
         } catch (err) {
           this.showToast(`Failed to assign tag: ${err.message}`, 'danger');
+        }
+      });
+    });
+
+    // UI-FN-06: Bind Pause Internet
+    document.querySelectorAll('.btn-pause-device').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const pdid = e.currentTarget.dataset.pdid;
+        const name = e.currentTarget.dataset.name;
+        if (confirm(`Pause internet for ${name} for 1 hour?`)) {
+          try {
+            await API.request(`/api/v1/devices/${pdid}/pause`, { method: 'POST' });
+            this.showToast(`Internet paused for ${name}`);
+          } catch (err) {
+            this.showToast(`Failed to pause: ${err.message}`, 'danger');
+          }
+        }
+      });
+    });
+
+    // UI-FN-12: Bind Rename
+    document.querySelectorAll('.btn-rename-device').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const pdid = e.currentTarget.dataset.pdid;
+        const currentName = e.currentTarget.dataset.name;
+        const newName = prompt(`Enter new name for ${currentName}:`, currentName);
+        if (newName && newName !== currentName) {
+          try {
+            await API.request(`/api/v1/devices/${pdid}/rename`, {
+              method: 'POST',
+              body: JSON.stringify({ name: newName })
+            });
+            this.showToast(`Device renamed to ${newName}`);
+            this.loadData();
+          } catch (err) {
+            this.showToast(`Failed to rename: ${err.message}`, 'danger');
+          }
         }
       });
     });
@@ -742,7 +806,6 @@ class App {
       `;
     }
 
-    // Project all schedules into segments using the shared logic to ensure overnight continuity is handled
     let allSegments = [];
     schedules.forEach((s, sIdx) => {
       const segs = projectSchedule(s);
@@ -770,7 +833,6 @@ class App {
       `;
     }
 
-    // HIG Time Axis Header
     html += `
       <div class="timeline-axis">
         <div class="timeline-day-label"></div>
@@ -792,7 +854,6 @@ class App {
           <div class="timeline-track">
       `;
 
-      // Filter segments that belong to this specific day
       const daySegments = allSegments.filter(seg => {
         const segDayIdx = Math.floor(seg.start / 1440);
         return segDayIdx === dayIdx;
@@ -800,13 +861,11 @@ class App {
 
       daySegments.forEach(seg => {
         const startMin = seg.start % 1440;
-        // FIX: If segment ends at exactly 24:00 (1440), modulo gives 0. We must treat 0 as 1440 for width calculation.
         let endMin = seg.end % 1440;
         if (endMin === 0 && seg.end > seg.start) {
             endMin = 1440;
         }
         
-        // Convert minute indices back to HH:MM for the tooltip
         const startH = Math.floor(startMin / 60);
         const startM = startMin % 60;
         const endH = Math.floor(endMin / 60);
@@ -821,7 +880,6 @@ class App {
         html += `<div class="timeline-band" style="left:${leftPct}%; width:${widthPct}%; background:${seg.color};" title="${seg.scheduleName}: ${startStr} - ${endStr} (${seg.action})"></div>`;
       });
 
-      // Conflict bands
       conflicts.forEach(c => {
         if (c.day.substring(0, 3).toLowerCase() === day) {
           const startParts = c.overlap_start.split(':');
@@ -829,7 +887,6 @@ class App {
           const startMin = parseInt(startParts[0], 10) * 60 + parseInt(startParts[1], 10);
           const endMin = parseInt(endParts[0], 10) * 60 + parseInt(endParts[1], 10);
           
-          // Only draw if it's a valid same-day segment representation
           if (startMin < endMin) {
             const leftPct = ((startMin / 1440) * 100).toFixed(1);
             const widthPct = (((endMin - startMin) / 1440) * 100).toFixed(1);
