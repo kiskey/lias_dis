@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/tls_fingerprinter.go
-// Version: 1.4 (Enhanced TLS Fingerprinting)
+// Version: 1.5 (Fixed OS Classifier String Matching)
 package discovery
 
 import (
@@ -93,12 +93,10 @@ func (e *TLSFingerprinter) Enrich(ctx context.Context, d *models.Device) (*model
     if len(state.PeerCertificates) > 0 {
         cert := state.PeerCertificates[0]
         
-        // Hash the cert for provenance, but exclude expiry/serial for a stable config fingerprint
         h := sha256.New()
         h.Write([]byte(fmt.Sprintf("%d|%d|%s|%s|%s", state.Version, state.CipherSuite, state.NegotiatedProtocol, cert.Subject.String(), cert.Issuer.String())))
         enr.Raw["tls_server_fingerprint"] = hex.EncodeToString(h.Sum(nil))
         
-        // Extract SANs (Subject Alternative Names) for better device identification
         if len(cert.DNSNames) > 0 {
             enr.Raw["san"] = strings.Join(cert.DNSNames, ",")
             if enr.Hostname == "" {
@@ -139,9 +137,11 @@ func (e *TLSFingerprinter) Enrich(ctx context.Context, d *models.Device) (*model
     return nil, nil
 }
 
+// High 2 Fix: Replaced prefix check with strings.Contains
 func containsAny(s string, subs ...string) bool {
+    sLower := strings.ToLower(s)
     for _, sub := range subs {
-        if len(s) >= len(sub) && s[:len(sub)] == sub {
+        if strings.Contains(sLower, strings.ToLower(sub)) {
             return true
         }
     }
