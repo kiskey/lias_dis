@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/cache.go
-// Version: 2.9
+// Version: 2.10 (Added TouchLastSeen for CPU-01)
 package inventory
 
 import (
@@ -74,7 +74,6 @@ func (c *Cache) AcquireHostname(canonicalHost, pdid string) HostnameAcquisitionR
     c.mu.Lock()
     ownerPDID, exists := c.hostnameOwners[canonicalHost]
 
-    // IO-02 Fix: Only trigger listener and update map if the owner ACTUALLY changes
     if !exists || ownerPDID == pdid {
         if !exists {
             c.hostnameOwners[canonicalHost] = pdid
@@ -85,7 +84,6 @@ func (c *Cache) AcquireHostname(canonicalHost, pdid string) HostnameAcquisitionR
             }
             return AcquireSuccess
         }
-        // Already the owner, no write needed
         c.mu.Unlock()
         return AcquireSuccess
     }
@@ -374,6 +372,18 @@ func (c *Cache) Upsert(d *models.Device) {
 
     if cleanIP := strings.TrimSpace(d.CurrentIP); cleanIP != "" {
         c.ipIndex[cleanIP] = &devCopy
+    }
+}
+
+// CPU-01 Fix: Lightweight timestamp update that doesn't rebuild indices
+func (c *Cache) TouchLastSeen(pdid string, ts time.Time) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    if d, ok := c.devices[pdid]; ok {
+        d.LastSeen = ts
+        if d.FirstSeen.IsZero() {
+            d.FirstSeen = ts
+        }
     }
 }
 
