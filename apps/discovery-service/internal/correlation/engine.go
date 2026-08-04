@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 4.0
+// Version: 4.1
 package correlation
 
 import (
@@ -32,15 +32,20 @@ type Engine struct {
     orch        EnrichmentOrchestrator
     dedupMu     sync.Mutex
     lastSeenObs map[string]time.Time
+
+    // DIS-IO-01 Fix: Dirty device batching
+    dirtyMu      sync.Mutex
+    dirtyDevices map[string]*models.Device
 }
 
 func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
     deb := NewDebouncer(broker)
     return &Engine{
-        cache:       cache,
-        broker:      broker,
-        debouncer:   deb,
-        lastSeenObs: make(map[string]time.Time),
+        cache:        cache,
+        broker:       broker,
+        debouncer:    deb,
+        lastSeenObs:  make(map[string]time.Time),
+        dirtyDevices: make(map[string]*models.Device),
     }
 }
 
@@ -91,12 +96,60 @@ func (e *Engine) Run(ctx context.Context, providers []discovery.DiscoveryProvide
         go e.consume(ctx, p.Events())
     }
     go e.runStalenessSweep(ctx)
-    
-    // DIS-COR-01 Fix: Bounded deduplication memory map
     go e.runDedupSweep(ctx)
+    
+    // DIS-IO-01 Fix: Start dirty device batch flusher
+    go e.runDirtyFlusher(ctx)
 }
 
-// runDedupSweep prevents unbounded memory leak in lastSeenObs map
+func (e *Engine) runDirtyFlusher(ctx context.Context) {
+    ticker := time.NewTicker(5 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            e.flushDirty()
+        }
+    }
+}
+
+func (e *Engine) flushDirty() {
+    e.dirtyMu.Lock()
+    if len(e.dirtyDevices) == 0 {
+        e.dirtyMu.Unlock()
+        return
+    }
+    devs := make([]*models.Device, 0, len(e.dirtyDevices))
+    for _, d := range e.dirtyDevices {
+        devs = append(devs, d)
+    }
+    e.dirtyDevices = make(map[string]*models.Device)
+    e.dirtyMu.Unlock()
+
+    if e.store != nil {
+        if err := e.store.SaveDevicesBatch(devs); err != nil {
+            slog.Error("Failed to flush dirty devices batch to storage", "count", len(devs), "error", err)
+            // Re-queue? For simplicity, we drop on failure to prevent map bloat. 
+            // The next dirty event will retry.
+        }
+    }
+}
+
+func (e *Engine) markDirty(pdid string) {
+    if e.store == nil || pdid == "" {
+        return
+    }
+    d := e.cache.Get(pdid)
+    if d != nil {
+        e.dirtyMu.Lock()
+        e.dirtyDevices[pdid] = d
+        e.dirtyMu.Unlock()
+    }
+}
+
 func (e *Engine) runDedupSweep(ctx context.Context) {
     ticker := time.NewTicker(1 * time.Minute)
     defer ticker.Stop()
@@ -133,9 +186,7 @@ func (e *Engine) runStalenessSweep(ctx context.Context) {
                 if d == nil {
                     continue
                 }
-                if e.store != nil {
-                    _ = e.store.SaveDevice(d)
-                }
+                e.markDirty(pdid)
                 e.broker.Broadcast(models.NewEvent(models.EventDeviceOffline, d.PDID, models.DeviceEventPayload{
                     PDID:      d.PDID,
                     MAC:       d.CurrentMAC,
@@ -239,9 +290,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             }
             if !ipAlreadyKnown {
                 existing.AddIP(ipStr)
-                if e.store != nil {
-                    _ = e.store.SaveDevice(existing)
-                }
+                e.markDirty(existing.PDID)
             }
             return
         }
@@ -263,7 +312,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         dirty = true
     }
 
-    // GAP-D01 & DIS-SEC-06 Fix: MAC Rotation & Spoofing Detection
     if macStr != "" && d != nil && !d.HasMAC(macStr) {
         if d.CurrentIP == ipStr {
             claimRes := ValidateIPClaim(obs, d)
@@ -279,8 +327,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                 })
                 dirty = true
             } else {
-                // DIS-SEC-06: Potential MAC Spoofing Alert!
-                // A new MAC is claiming an IP currently held by an existing device, but failed validation.
                 e.broker.Broadcast(models.NewEvent(models.EventSecurityAlert, d.PDID, models.SecurityAlertPayload{
                     AlertType: "mac_spoof_detected",
                     PDID:      d.PDID,
@@ -308,7 +354,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                     d = existingOnIP 
                     dirty = true
                 } else {
-                    // DIS-SEC-06: Potential MAC Spoofing Alert on another device's IP!
                     e.broker.Broadcast(models.NewEvent(models.EventSecurityAlert, existingOnIP.PDID, models.SecurityAlertPayload{
                         AlertType: "mac_spoof_detected",
                         PDID:      existingOnIP.PDID,
@@ -374,9 +419,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             _ = e.cache.AcquireHostname(canonicalHost, d.PDID)
         }
 
-        if e.store != nil {
-            _ = e.store.SaveDevice(d)
-        }
+        e.markDirty(d.PDID)
 
         slog.Info("New tiered device correlated", "pdid", pdid, "tier", tier, "mac", macStr, "ip", ipStr)
         e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
@@ -391,6 +434,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         slog.Info("Promoting device identity tier", "old_pdid", oldPDID, "new_pdid", newPDID, "from", d.IdentityTier, "to", newTier)
 
         e.cache.Delete(oldPDID)
+        // Delete immediately from DB to prevent PDID collision on flush
         if e.store != nil {
             _ = e.store.DeleteDevice(oldPDID)
         }
@@ -401,9 +445,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         d.CanonicalHostname = canonicalHost
 
         e.cache.Upsert(d)
-        if e.store != nil {
-            _ = e.store.SaveDevice(d)
-        }
+        e.markDirty(d.PDID)
 
         migratedMACs := make([]string, len(d.MACs))
         copy(migratedMACs, d.MACs)
@@ -424,6 +466,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             d.Online = true
             d.PendingOnlineObs = nil
             e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
+            dirty = true
         } else {
             go e.scheduleDeferredOnline(d.PDID, 30*time.Second)
         }
@@ -465,8 +508,8 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     d.Touch(time.Now())
     e.cache.Upsert(d)
 
-    if dirty && e.store != nil {
-        _ = e.store.SaveDevice(d)
+    if dirty {
+        e.markDirty(d.PDID)
     }
 }
 
@@ -494,9 +537,7 @@ func (e *Engine) PromoteDeviceIdentity(pdid string) *models.Device {
         d.IdentityAnchor = newAnchor
 
         e.cache.Upsert(d)
-        if e.store != nil {
-            _ = e.store.SaveDevice(d)
-        }
+        e.markDirty(d.PDID)
 
         migratedMACs := make([]string, len(d.MACs))
         copy(migratedMACs, d.MACs)
@@ -516,10 +557,7 @@ func (e *Engine) PromoteDeviceIdentity(pdid string) *models.Device {
 }
 
 func (e *Engine) PersistDevice(pdid string) {
-    d := e.cache.Get(pdid)
-    if d != nil && e.store != nil {
-        _ = e.store.SaveDevice(d)
-    }
+    e.markDirty(pdid)
 }
 
 func (e *Engine) scheduleDeferredOnline(pdid string, delay time.Duration) {
@@ -529,11 +567,11 @@ func (e *Engine) scheduleDeferredOnline(pdid string, delay time.Duration) {
         d.Online = true
         d.PendingOnlineObs = nil
         e.cache.Upsert(d)
+        e.markDirty(pdid)
         e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
     }
 }
 
-// ApplySmartClassifications automatically categorizes routers and Amazon Echo devices.
 func ApplySmartClassifications(d *models.Device) {
     if d == nil {
         return
