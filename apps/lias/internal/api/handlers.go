@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 2.4
+// Version: 2.5
 package api
 
 import (
@@ -90,7 +90,8 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux, authToken string) {
     handler.HandleFunc("POST /api/v1/nftables/flush", h.FlushNftables)
     handler.HandleFunc("GET /api/v1/events", h.StreamEvents)
 
-    mux.Handle("/", AuthMiddleware(authToken, handler))
+    // FIX: Scope auth middleware to /api/ to avoid conflicting with root "/" static file server
+    mux.Handle("/api/", AuthMiddleware(authToken, handler))
 }
 
 func (h *Handlers) StreamEvents(w http.ResponseWriter, r *http.Request) {
