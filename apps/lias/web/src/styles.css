@@ -1,7 +1,7 @@
 /* 
  * LIAS Dashboard Styles
  * File:    apps/lias/web/src/styles.css
- * Version: 2.2 (HIG Modals & Live Activity Cards)
+ * Version: 2.4 (HIG Timeline Axis & Mobile Responsiveness)
  */
 
 :root {
@@ -258,6 +258,31 @@ input[type="time"], select {
   border: 1px solid var(--separator);
 }
 
+.timeline-axis {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--separator);
+}
+
+.timeline-axis-track {
+  position: relative;
+  flex-grow: 1;
+  height: 14px;
+}
+
+.axis-mark {
+  position: absolute;
+  top: 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
 .timeline-day-row {
   display: flex;
   align-items: center;
@@ -420,7 +445,7 @@ input[type="time"], select {
   margin-left: 4px;
 }
 
-/* GAP-UX2: Live Activity Dashboard Cards */
+/* Live Activity Dashboard Cards */
 .active-enforcements-container {
   display: flex;
   flex-direction: column;
@@ -595,6 +620,15 @@ input[type="time"], select {
   }
   .live-activity-status {
     font-size: 14px;
+  }
+  
+  /* Mobile tweaks for Timeline Axis */
+  .axis-mark {
+    font-size: 9px;
+  }
+  .timeline-day-label {
+    width: 28px;
+    font-size: 10px;
   }
 }
 
