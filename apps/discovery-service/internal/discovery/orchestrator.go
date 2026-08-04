@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/orchestrator.go
-// Version: 2.1
+// Version: 2.2
 package discovery
 
 import (
@@ -21,13 +21,11 @@ const (
     enrichmentCooldown = 1 * time.Hour
 )
 
-// DeviceManager allows the Orchestrator to trigger PDID promotion and persistence in the Engine.
 type DeviceManager interface {
     PromoteDeviceIdentity(pdid string) *models.Device
     PersistDevice(pdid string)
 }
 
-// Orchestrator manages on-demand enrichment with concurrency locking and failure backoff per PDID.
 type Orchestrator struct {
     cache          *inventory.Cache
     broker         *disAPI.Broker
@@ -35,6 +33,7 @@ type Orchestrator struct {
     fallback       Enricher
     activeLocks    sync.Map
     lastAttemptMap sync.Map
+    nmapFailures   sync.Map // ENR-06 Fix: Track nmap failures to prevent aggressive retries
     manager        DeviceManager
 }
 
@@ -64,10 +63,11 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
     if !force {
         if lastAttempt, found := o.lastAttemptMap.Load(pdid); found {
             if time.Since(lastAttempt.(time.Time)) < enrichmentCooldown {
+                // MATH-05 Fix: Only skip if the device is already fully enriched.
+                // Incomplete devices must fall through and re-enrich.
                 if dev.Vendor != "" && dev.DeviceType != "" && dev.FriendlyName != "" {
                     return
                 }
-                return
             }
         }
     }
@@ -113,7 +113,13 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
         }
     }
 
-    if (!changed || dev.Vendor == "" || dev.DeviceType == "") && o.fallback != nil {
+    // ENR-06 Fix: Check if nmap previously failed for this device before retrying
+    nmapFailedBefore := false
+    if v, ok := o.nmapFailures.Load(pdid); ok {
+        nmapFailedBefore = v.(bool)
+    }
+
+    if (!changed || dev.Vendor == "" || dev.DeviceType == "") && o.fallback != nil && !nmapFailedBefore {
         slog.Info("Primary enrichment incomplete, executing Nmap fallback", "pdid", pdid)
         ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
         res, err := o.fallback.Enrich(ctx, dev)
@@ -121,6 +127,7 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
 
         if err != nil {
             slog.Debug("Fallback enricher failed", "enricher", o.fallback.Name(), "error", err)
+            o.nmapFailures.Store(pdid, true) // Mark as failed to prevent retry storm
         } else if res != nil {
             changed = applyEnrichment(dev, res) || changed
         }
@@ -151,17 +158,14 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
     }
 }
 
-// isGenericHostname checks if a hostname looks like a default MAC-based or DHCP ID string.
-// Fix: Enhanced strict validation for MAC addresses, asterisks, and numeric strings.
 func isGenericHostname(host string) bool {
     h := strings.ToLower(strings.TrimSpace(host))
-    if h == "" || h == "*" { return true } // DHCP missing hostname
+    if h == "" || h == "*" { return true }
     if strings.HasPrefix(h, "android-") { return true }
     if strings.HasPrefix(h, "iphone") || strings.HasPrefix(h, "ipad") { return true }
     if strings.HasPrefix(h, "desktop-") || strings.HasPrefix(h, "localhost") { return true }
     if strings.Contains(h, "unknown") { return true }
     
-    // Strict Hex MAC address check (12 chars, 0-9 a-f)
     if len(h) == 12 {
         isHex := true
         for _, c := range h {
@@ -173,7 +177,6 @@ func isGenericHostname(host string) bool {
         if isHex { return true }
     }
     
-    // Check if it's purely numeric (some IoT devices use IDs)
     isNumeric := true
     for _, c := range h {
         if !(c >= '0' && c <= '9') {
@@ -186,6 +189,30 @@ func isGenericHostname(host string) bool {
     return false
 }
 
+// ENR-02 Fix: Source rank heuristic to replace flawed aggregate confidence comparison.
+func sourceRank(source string) int {
+    switch source {
+    case "netlink":
+        return 100
+    case "avahi":
+        return 90
+    case "ssdp":
+        return 85
+    case "tls":
+        return 80
+    case "dhcp":
+        return 70
+    case "netbios":
+        return 60
+    case "nmap":
+        return 50
+    case "pihole":
+        return 40
+    default:
+        return 0
+    }
+}
+
 // applyEnrichment strictly applies only material changes.
 func applyEnrichment(dev *models.Device, enr *models.Enrichment) bool {
     if dev == nil || enr == nil {
@@ -194,62 +221,72 @@ func applyEnrichment(dev *models.Device, enr *models.Enrichment) bool {
 
     changed := false
 
-    // FriendlyName: Update if it's different (handles renames)
     if enr.FriendlyName != "" && dev.FriendlyName != enr.FriendlyName {
         dev.FriendlyName = enr.FriendlyName
         changed = true
     }
 
-    // Hostname: Update if empty, OR if current is generic AND new is NOT generic, OR strictly better confidence
     if enr.Hostname != "" {
         shouldUpdate := false
         if dev.Hostname == "" {
             shouldUpdate = true
         } else if isGenericHostname(dev.Hostname) && !isGenericHostname(enr.Hostname) {
             shouldUpdate = true
-        } else if enr.Confidence > dev.Confidence {
+        } else if sourceRank(enr.Source) > sourceRank(dev.SourceInfo["hostname"].Source) { // Safe because SourceInfo defaults to empty struct
             shouldUpdate = true
         }
 
         if shouldUpdate && dev.Hostname != enr.Hostname {
             dev.Hostname = enr.Hostname
+            // ENR-04 Fix: Populate SourceInfo for provenance tracking
+            if dev.SourceInfo == nil {
+                dev.SourceInfo = make(map[string]models.SourceMeta)
+            }
+            dev.SourceInfo["hostname"] = models.SourceMeta{
+                Source:     enr.Source,
+                Confidence: enr.Confidence,
+                Timestamp:  time.Now(),
+            }
             changed = true
         }
     }
 
-    // Manufacturer: Update if empty or strictly better confidence
-    if enr.Manufacturer != "" && (dev.Manufacturer == "" || enr.Confidence > dev.Confidence) {
+    if enr.Manufacturer != "" && (dev.Manufacturer == "" || sourceRank(enr.Source) > sourceRank(dev.SourceInfo["manufacturer"].Source)) {
         if dev.Manufacturer != enr.Manufacturer {
             dev.Manufacturer = enr.Manufacturer
+            if dev.SourceInfo == nil { dev.SourceInfo = make(map[string]models.SourceMeta) }
+            dev.SourceInfo["manufacturer"] = models.SourceMeta{Source: enr.Source, Confidence: enr.Confidence, Timestamp: time.Now()}
             changed = true
         }
     }
     
-    // Vendor: Update if empty or strictly better confidence
-    if enr.Vendor != "" && (dev.Vendor == "" || enr.Confidence > dev.Confidence) {
+    if enr.Vendor != "" && (dev.Vendor == "" || sourceRank(enr.Source) > sourceRank(dev.SourceInfo["vendor"].Source)) {
         if dev.Vendor != enr.Vendor {
             dev.Vendor = enr.Vendor
+            if dev.SourceInfo == nil { dev.SourceInfo = make(map[string]models.SourceMeta) }
+            dev.SourceInfo["vendor"] = models.SourceMeta{Source: enr.Source, Confidence: enr.Confidence, Timestamp: time.Now()}
             changed = true
         }
     }
     
-    // Model: Update if empty or strictly better confidence
-    if enr.Model != "" && (dev.Model == "" || enr.Confidence > dev.Confidence) {
+    if enr.Model != "" && (dev.Model == "" || sourceRank(enr.Source) > sourceRank(dev.SourceInfo["model"].Source)) {
         if dev.Model != enr.Model {
             dev.Model = enr.Model
+            if dev.SourceInfo == nil { dev.SourceInfo = make(map[string]models.SourceMeta) }
+            dev.SourceInfo["model"] = models.SourceMeta{Source: enr.Source, Confidence: enr.Confidence, Timestamp: time.Now()}
             changed = true
         }
     }
     
-    // DeviceType: Update if empty or strictly better confidence
-    if enr.DeviceType != "" && (dev.DeviceType == "" || enr.Confidence > dev.Confidence) {
+    if enr.DeviceType != "" && (dev.DeviceType == "" || sourceRank(enr.Source) > sourceRank(dev.SourceInfo["device_type"].Source)) {
         if dev.DeviceType != enr.DeviceType {
             dev.DeviceType = enr.DeviceType
+            if dev.SourceInfo == nil { dev.SourceInfo = make(map[string]models.SourceMeta) }
+            dev.SourceInfo["device_type"] = models.SourceMeta{Source: enr.Source, Confidence: enr.Confidence, Timestamp: time.Now()}
             changed = true
         }
     }
 
-    // Services: AddService returns true ONLY if the service was not already in the list
     for _, svc := range enr.Services {
         if dev.AddService(svc) {
             changed = true
