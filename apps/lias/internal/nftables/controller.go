@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 2.3 (GAP-L-H06 Fix: Atomic set updates via pre-validation and buffer reset)
+// Version: 2.4 (Critical fixes: Zero timeout, IPv6 support, Safe reinitializeConn)
 package nftables
 
 import (
@@ -10,7 +10,6 @@ import (
     "log/slog"
     "net"
     "sync"
-    "time"
 
     "github.com/google/nftables"
     "github.com/google/nftables/expr"
@@ -66,13 +65,12 @@ func (c *Controller) Init() error {
     c.conn.FlushChain(c.chain)
 
     // 3. Create sets for allowed and blocked elements
-    timeout := 1 * time.Hour
-
+    // LIAS-NFT-02 Fix: Removed Timeout to prevent silent unblocking of dormant devices.
+    
     allowedIPsSet := &nftables.Set{
         Name:    "allowed_ips",
         Table:   c.table,
         KeyType: nftables.TypeIPAddr,
-        Timeout: timeout,
     }
     if err := c.conn.AddSet(allowedIPsSet, nil); err != nil {
         return fmt.Errorf("failed to create allowed_ips set: %w", err)
@@ -83,7 +81,6 @@ func (c *Controller) Init() error {
         Name:    "allowed_macs",
         Table:   c.table,
         KeyType: nftables.TypeEtherAddr,
-        Timeout: timeout,
     }
     if err := c.conn.AddSet(allowedMACsSet, nil); err != nil {
         return fmt.Errorf("failed to create allowed_macs set: %w", err)
@@ -94,7 +91,6 @@ func (c *Controller) Init() error {
         Name:    "blocked_ips",
         Table:   c.table,
         KeyType: nftables.TypeIPAddr,
-        Timeout: timeout,
     }
     if err := c.conn.AddSet(blockedIPsSet, nil); err != nil {
         return fmt.Errorf("failed to create blocked_ips set: %w", err)
@@ -105,12 +101,32 @@ func (c *Controller) Init() error {
         Name:    "blocked_macs",
         Table:   c.table,
         KeyType: nftables.TypeEtherAddr,
-        Timeout: timeout,
     }
     if err := c.conn.AddSet(blockedMACsSet, nil); err != nil {
         return fmt.Errorf("failed to create blocked_macs set: %w", err)
     }
     c.sets["blocked_macs"] = blockedMACsSet
+
+    // LIAS-NFT-01 Fix: Add IPv6 Sets
+    allowedIPs6Set := &nftables.Set{
+        Name:    "allowed_ips_v6",
+        Table:   c.table,
+        KeyType: nftables.TypeIP6Addr,
+    }
+    if err := c.conn.AddSet(allowedIPs6Set, nil); err != nil {
+        return fmt.Errorf("failed to create allowed_ips_v6 set: %w", err)
+    }
+    c.sets["allowed_ips_v6"] = allowedIPs6Set
+
+    blockedIPs6Set := &nftables.Set{
+        Name:    "blocked_ips_v6",
+        Table:   c.table,
+        KeyType: nftables.TypeIP6Addr,
+    }
+    if err := c.conn.AddSet(blockedIPs6Set, nil); err != nil {
+        return fmt.Errorf("failed to create blocked_ips_v6 set: %w", err)
+    }
+    c.sets["blocked_ips_v6"] = blockedIPs6Set
 
     // Interface match bytes (null-terminated interface string for iifname "eth0" matching)
     ifaceBytes := []byte(c.cfg.Interface + "\x00")
@@ -161,7 +177,7 @@ func (c *Controller) Init() error {
         },
     })
 
-    // Rule 3: BLOCK IPs on c.cfg.Interface
+    // Rule 3: BLOCK IPv4s on c.cfg.Interface
     c.conn.AddRule(&nftables.Rule{
         Table: c.table,
         Chain: c.chain,
@@ -184,7 +200,7 @@ func (c *Controller) Init() error {
         },
     })
 
-    // Rule 4: ALLOW IPs on c.cfg.Interface
+    // Rule 4: ALLOW IPv4s on c.cfg.Interface
     c.conn.AddRule(&nftables.Rule{
         Table: c.table,
         Chain: c.chain,
@@ -202,6 +218,52 @@ func (c *Controller) Init() error {
                 SourceRegister: 1,
                 SetName:        "allowed_ips",
                 SetID:          c.sets["allowed_ips"].ID,
+            },
+            &expr.Verdict{Kind: expr.VerdictAccept},
+        },
+    })
+
+    // LIAS-NFT-01 Fix: Rule 5: BLOCK IPv6s
+    c.conn.AddRule(&nftables.Rule{
+        Table: c.table,
+        Chain: c.chain,
+        Exprs: []expr.Any{
+            &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+            &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
+            &expr.Payload{
+                OperationType: expr.PayloadLoad,
+                DestRegister:  1,
+                Base:          expr.PayloadBaseNetworkHeader,
+                Offset:        8,  // IPv6 Src IP starts at byte 8
+                Len:           16, // 128 bits
+            },
+            &expr.Lookup{
+                SourceRegister: 1,
+                SetName:        "blocked_ips_v6",
+                SetID:          c.sets["blocked_ips_v6"].ID,
+            },
+            &expr.Verdict{Kind: expr.VerdictDrop},
+        },
+    })
+
+    // LIAS-NFT-01 Fix: Rule 6: ALLOW IPv6s
+    c.conn.AddRule(&nftables.Rule{
+        Table: c.table,
+        Chain: c.chain,
+        Exprs: []expr.Any{
+            &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+            &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
+            &expr.Payload{
+                OperationType: expr.PayloadLoad,
+                DestRegister:  1,
+                Base:          expr.PayloadBaseNetworkHeader,
+                Offset:        8,
+                Len:           16,
+            },
+            &expr.Lookup{
+                SourceRegister: 1,
+                SetName:        "allowed_ips_v6",
+                SetID:          c.sets["allowed_ips_v6"].ID,
             },
             &expr.Verdict{Kind: expr.VerdictAccept},
         },
@@ -238,15 +300,13 @@ func (c *Controller) FlushTable() error {
 
 // SetElements structure for transferring IP and MAC element sets.
 type SetElements struct {
-    IPs  []net.IP
-    MACs []net.HardwareAddr
+    IPs    []net.IP
+    MACs   []net.HardwareAddr
+    IPsV6  []net.IP // NEW: IPv6 support
 }
 
 // Apply flushes existing sets and atomically updates netfilter sets with new elements.
-//
-// GAP-L-H06 Fix: Pre-validates all elements before queueing flush operations. If the transaction
-// fails midway, the connection buffer is reset to prevent stale FlushSet commands from executing
-// on the next cycle without their accompanying SetAddElements payloads.
+// Note: Batching is handled by the netlink connection internally.
 func (c *Controller) Apply(allowed, blocked SetElements) error {
     c.mu.Lock()
     defer c.mu.Unlock()
@@ -284,11 +344,28 @@ func (c *Controller) Apply(allowed, blocked SetElements) error {
         }
     }
 
+    // IPv6 Elements
+    allowedIP6Els := make([]nftables.SetElement, 0, len(allowed.IPsV6))
+    for _, ip := range allowed.IPsV6 {
+        if ip6 := ip.To16(); ip6 != nil && ip.To4() == nil {
+            allowedIP6Els = append(allowedIP6Els, nftables.SetElement{Key: ip6})
+        }
+    }
+
+    blockedIP6Els := make([]nftables.SetElement, 0, len(blocked.IPsV6))
+    for _, ip := range blocked.IPsV6 {
+        if ip6 := ip.To16(); ip6 != nil && ip.To4() == nil {
+            blockedIP6Els = append(blockedIP6Els, nftables.SetElement{Key: ip6})
+        }
+    }
+
     // 2. Queue flush operations
     c.conn.FlushSet(c.sets["allowed_ips"])
     c.conn.FlushSet(c.sets["allowed_macs"])
     c.conn.FlushSet(c.sets["blocked_ips"])
     c.conn.FlushSet(c.sets["blocked_macs"])
+    c.conn.FlushSet(c.sets["allowed_ips_v6"])
+    c.conn.FlushSet(c.sets["blocked_ips_v6"])
 
     // 3. Queue add operations, handling errors to reset buffer if needed
     if len(allowedIPEls) > 0 {
@@ -315,10 +392,21 @@ func (c *Controller) Apply(allowed, blocked SetElements) error {
             return fmt.Errorf("failed to queue blocked_macs: %w", err)
         }
     }
+    if len(allowedIP6Els) > 0 {
+        if err := c.conn.SetAddElements(c.sets["allowed_ips_v6"], allowedIP6Els); err != nil {
+            c.reinitializeConn()
+            return fmt.Errorf("failed to queue allowed_ips_v6: %w", err)
+        }
+    }
+    if len(blockedIP6Els) > 0 {
+        if err := c.conn.SetAddElements(c.sets["blocked_ips_v6"], blockedIP6Els); err != nil {
+            c.reinitializeConn()
+            return fmt.Errorf("failed to queue blocked_ips_v6: %w", err)
+        }
+    }
 
     // 4. Commit transaction atomically
     if err := c.conn.Flush(); err != nil {
-        // If the kernel rejects the batch, reset the connection buffer
         c.reinitializeConn()
         return fmt.Errorf("failed to commit nftables set update: %w", err)
     }
@@ -326,14 +414,23 @@ func (c *Controller) Apply(allowed, blocked SetElements) error {
     return nil
 }
 
-// reinitializeConn safely discards the dirty netlink buffer by creating a new connection.
-// The kernel maintains the last successfully applied state, so the next Apply() cycle
-// will simply re-flush and re-add the correct elements.
+// reinitializeConn safely discards the dirty netlink buffer by creating a new connection
+// and completely rebuilding the kernel state references.
+// LIAS-NFT-09 Fix: Call Init() to repopulate c.table, c.chain, and c.sets safely.
 func (c *Controller) reinitializeConn() {
+    slog.Warn("Reinitializing nftables connection due to transaction failure")
     conn, err := nftables.New()
     if err != nil {
         slog.Error("Failed to reinitialize nftables connection", "error", err)
         return
     }
     c.conn = conn
+    
+    // Re-run Init to safely re-create or bind to the existing table/chain/sets.
+    // We must unlock temporarily because Init expects the lock.
+    c.mu.Unlock()
+    if err := c.Init(); err != nil {
+        slog.Error("Failed to safely rebuild nftables state after connection reset", "error", err)
+    }
+    c.mu.Lock()
 }
