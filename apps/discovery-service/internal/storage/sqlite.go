@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for DIS device state.
 //
 // File:    apps/discovery-service/internal/storage/sqlite.go
-// Version: 2.6
+// Version: 2.7
 package storage
 
 import (
@@ -201,7 +201,8 @@ func (s *Storage) migrateV1PDIDs() error {
     defer ownerRows.Close()
     for ownerRows.Next() {
         var host, pdid string
-        if ownerRows.Scan(&host, &pdid) == nil {
+        // FIX: syntax error fixed
+        if err := ownerRows.Scan(&host, &pdid); err == nil && host != "" {
             _, _ = s.db.Exec("INSERT OR REPLACE INTO hostname_owners (canonical_hostname, pdid, acquired_at) VALUES (?, ?, ?)", host, pdid, time.Now())
         }
     }
@@ -298,7 +299,7 @@ func (s *Storage) LoadHostnameOwners() (map[string]string, error) {
     owners := make(map[string]string)
     for rows.Next() {
         var host, pdid string
-        if err := rows.Scan(&host, &pdid) == nil && host != "" {
+        if err := rows.Scan(&host, &pdid); err == nil && host != "" {
             owners[host] = pdid
         }
     }
@@ -336,7 +337,6 @@ func (s *Storage) DeleteHostnameOwner(canonicalHost string) error {
     return err
 }
 
-// SaveDevice saves a single device using diff-based updates.
 func (s *Storage) SaveDevice(d *models.Device) error {
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -354,7 +354,6 @@ func (s *Storage) SaveDevice(d *models.Device) error {
     return tx.Commit()
 }
 
-// SaveDevicesBatch saves multiple devices in a single transaction to reduce disk I/O.
 func (s *Storage) SaveDevicesBatch(devs []*models.Device) error {
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -374,7 +373,6 @@ func (s *Storage) SaveDevicesBatch(devs []*models.Device) error {
     return tx.Commit()
 }
 
-// saveDeviceTx performs diff-based MAC/IP updates within a transaction.
 func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
     if d == nil || d.PDID == "" {
         return nil
