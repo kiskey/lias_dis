@@ -2,13 +2,14 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/tls_fingerprinter.go
-// Version: 1.2
+// Version: 1.3 (Added TLS Server Fingerprint)
 package discovery
 
 import (
     "context"
     "crypto/sha256"
     "crypto/tls"
+    "encoding/hex"
     "fmt"
     "net"
     "time"
@@ -16,7 +17,6 @@ import (
     "github.com/user/lias-dis/shared/models"
 )
 
-// TLSFingerprinter actively probes port 443 to gather TLS SNI and certificate data.
 type TLSFingerprinter struct {
     ctx    context.Context
     cancel context.CancelFunc
@@ -47,33 +47,29 @@ func (e *TLSFingerprinter) Enrich(ctx context.Context, d *models.Device) (*model
 
     addr := net.JoinHostPort(d.CurrentIP, "443")
     
-    // Resource efficiency: Dialer with strict 2-second connection timeout
     dialer := &net.Dialer{Timeout: 2 * time.Second}
 
-    // Accuracy: Provide ServerName to ensure the server responds with the correct cert
     serverName := d.Hostname
     if serverName == "" {
         serverName = d.CurrentIP
     }
 
     config := &tls.Config{
-        InsecureSkipVerify: true, // We only care about the certificate structure, not trust
+        InsecureSkipVerify: true,
         ServerName:         serverName,
         MinVersion:         tls.VersionTLS10,
         MaxVersion:         tls.VersionTLS13,
     }
 
-    // Resource efficiency: Hard cap the TLS handshake to 3 seconds
     handshakeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
     defer cancel()
 
     conn, err := tls.DialWithDialer(dialer, "tcp", addr, config)
     if err != nil {
-        return nil, nil // Device likely doesn't run HTTPS or timed out
+        return nil, nil
     }
     defer conn.Close()
 
-    // Ensure handshake completes within the context deadline
     if deadline, ok := handshakeCtx.Deadline(); ok {
         _ = conn.SetDeadline(deadline)
     }
@@ -82,11 +78,10 @@ func (e *TLSFingerprinter) Enrich(ctx context.Context, d *models.Device) (*model
 
     enr := &models.Enrichment{
         Source:     e.Name(),
-        Confidence: 0.70, // High confidence for direct TLS OS inference
+        Confidence: 0.70,
         Raw:        make(map[string]interface{}),
     }
 
-    // 1. Extract SNI (Server Name Indication) if present
     if len(state.ServerName) > 0 {
         enr.Raw["sni"] = state.ServerName
         if enr.Hostname == "" {
@@ -94,13 +89,11 @@ func (e *TLSFingerprinter) Enrich(ctx context.Context, d *models.Device) (*model
         }
     }
 
-    // 2. Simple Hash of the first certificate chain
     if len(state.PeerCertificates) > 0 {
         cert := state.PeerCertificates[0]
         hash := sha256.Sum256(cert.Raw)
-        enr.Raw["cert_sha256"] = fmt.Sprintf("%x", hash[:16])
+        enr.Raw["cert_sha256"] = hex.EncodeToString(hash[:16])
         
-        // Infer OS from Issuer/Common Name patterns
         issuer := cert.Issuer.CommonName
         subject := cert.Subject.CommonName
         
@@ -116,7 +109,6 @@ func (e *TLSFingerprinter) Enrich(ctx context.Context, d *models.Device) (*model
         }
     }
 
-    // 3. TLS Version Fingerprinting
     switch state.Version {
     case tls.VersionTLS10:
         enr.Raw["tls_version"] = "1.0"
@@ -126,6 +118,15 @@ func (e *TLSFingerprinter) Enrich(ctx context.Context, d *models.Device) (*model
         enr.Raw["tls_version"] = "1.2"
     case tls.VersionTLS13:
         enr.Raw["tls_version"] = "1.3"
+    }
+
+    // ENR-03 Fix: Compute a TLS Server Fingerprint (JA3S alternative)
+    // Since we are the client, we can only compute a server hello hash.
+    // We hash the TLS Version, CipherSuite, and the first certificate's raw bytes.
+    if len(state.PeerCertificates) > 0 {
+        h := sha256.New()
+        h.Write([]byte(fmt.Sprintf("%d|%d|%x", state.Version, state.CipherSuite, state.PeerCertificates[0].Raw)))
+        enr.Raw["tls_server_fingerprint"] = hex.EncodeToString(h.Sum(nil))[:32]
     }
 
     if len(enr.Raw) > 0 {
