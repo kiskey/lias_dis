@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/orchestrator.go
-// Version: 1.7
+// Version: 1.9
 package discovery
 
 import (
@@ -61,15 +61,15 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
         return
     }
 
-    // DIS-ENR-02 Fix: Do not skip if FriendlyName is missing, even if Vendor/Type are known
-    if !force && dev.Vendor != "" && dev.DeviceType != "" && dev.FriendlyName != "" {
-        return
-    }
-
+    // 1. Cooldown Check (Applies to both forced and passive, but forced bypasses if needed)
     if !force {
         if lastAttempt, found := o.lastAttemptMap.Load(pdid); found {
             if time.Since(lastAttempt.(time.Time)) < enrichmentCooldown {
-                slog.Debug("Device in 1-hour enrichment cool-down, skipping scan", "pdid", pdid)
+                // 2. Skip Gate: If fully enriched AND within cooldown, skip entirely.
+                if dev.Vendor != "" && dev.DeviceType != "" && dev.FriendlyName != "" {
+                    return
+                }
+                // If NOT fully enriched, but within cooldown, we still skip to prevent spamming.
                 return
             }
         }
@@ -162,11 +162,12 @@ func isGenericHostname(host string) bool {
     if strings.HasPrefix(h, "iphone") || strings.HasPrefix(h, "ipad") { return true }
     if strings.HasPrefix(h, "desktop-") || strings.HasPrefix(h, "localhost") { return true }
     if strings.Contains(h, "unknown") { return true }
-    // Check if it's just a MAC address without colons
     if len(h) == 12 && strings.Count(h, "-") == 0 { return true }
     return false
 }
 
+// applyEnrichment strictly applies only material changes.
+// Fix: Returns true ONLY if a field actually mutated to a new value.
 func applyEnrichment(dev *models.Device, enr *models.Enrichment) bool {
     if dev == nil || enr == nil {
         return false
@@ -174,15 +175,13 @@ func applyEnrichment(dev *models.Device, enr *models.Enrichment) bool {
 
     changed := false
 
-    // DIS-ENR-01 Fix: Separate FriendlyName from Hostname to avoid confidence traps.
-    // A UPnP friendlyName (e.g., "Living Room TV") should always be set if we don't have one yet.
-    if enr.FriendlyName != "" && dev.FriendlyName == "" {
+    // FriendlyName: Update if it's different (handles renames)
+    if enr.FriendlyName != "" && dev.FriendlyName != enr.FriendlyName {
         dev.FriendlyName = enr.FriendlyName
         changed = true
     }
 
-    // Hostname from enrichment (e.g., mDNS or UPnP) should overwrite L2/DHCP hostnames 
-    // if the current one is empty, looks generic, or if the enrichment confidence is explicitly higher.
+    // Hostname: Update if empty, generic, or if enrichment provides a strictly better confidence
     if enr.Hostname != "" {
         if dev.Hostname == "" || isGenericHostname(dev.Hostname) || enr.Confidence > dev.Confidence {
             if dev.Hostname != enr.Hostname {
@@ -192,26 +191,43 @@ func applyEnrichment(dev *models.Device, enr *models.Enrichment) bool {
         }
     }
 
+    // Manufacturer: Update if empty or strictly better confidence
     if enr.Manufacturer != "" && (dev.Manufacturer == "" || enr.Confidence > dev.Confidence) {
-        dev.Manufacturer = enr.Manufacturer
-        changed = true
+        if dev.Manufacturer != enr.Manufacturer {
+            dev.Manufacturer = enr.Manufacturer
+            changed = true
+        }
     }
+    
+    // Vendor: Update if empty or strictly better confidence
     if enr.Vendor != "" && (dev.Vendor == "" || enr.Confidence > dev.Confidence) {
-        dev.Vendor = enr.Vendor
-        changed = true
+        if dev.Vendor != enr.Vendor {
+            dev.Vendor = enr.Vendor
+            changed = true
+        }
     }
+    
+    // Model: Update if empty or strictly better confidence
     if enr.Model != "" && (dev.Model == "" || enr.Confidence > dev.Confidence) {
-        dev.Model = enr.Model
-        changed = true
+        if dev.Model != enr.Model {
+            dev.Model = enr.Model
+            changed = true
+        }
     }
+    
+    // DeviceType: Update if empty or strictly better confidence
     if enr.DeviceType != "" && (dev.DeviceType == "" || enr.Confidence > dev.Confidence) {
-        dev.DeviceType = enr.DeviceType
-        changed = true
+        if dev.DeviceType != enr.DeviceType {
+            dev.DeviceType = enr.DeviceType
+            changed = true
+        }
     }
 
+    // Services: AddService returns true ONLY if the service was not already in the list
     for _, svc := range enr.Services {
-        dev.AddService(svc)
-        changed = true
+        if dev.AddService(svc) {
+            changed = true
+        }
     }
 
     return changed
