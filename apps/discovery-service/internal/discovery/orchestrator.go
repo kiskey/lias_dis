@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/orchestrator.go
-// Version: 1.5
+// Version: 1.6
 package discovery
 
 import (
@@ -141,7 +141,6 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
         
         o.cache.Upsert(finalDev)
         
-        // I/O Fix: Persist enrichment data to SQLite
         if o.manager != nil {
             o.manager.PersistDevice(finalDev.PDID)
         }
