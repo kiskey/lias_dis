@@ -1,7 +1,7 @@
 // Binary lias implements the LAN Internet Access Scheduler.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 2.2
+// Version: 2.3
 package main
 
 import (
@@ -72,7 +72,10 @@ func main() {
 
     tagMgr := tags.NewManager()
     polEng := policy.NewEngine()
-    schedEng := schedule.NewEngine(cache)
+    
+    // FIX: Pass polEng and trigger to schedule.NewEngine to satisfy the new signature
+    // This fixes GAP-L-CR04 (NextStateChange computation) and GAP-L-H05 (Immediate sync trigger)
+    schedEng := schedule.NewEngine(cache, polEng, trigger)
 
     var store *storage.Storage
     st, err := storage.NewStorage(cfg.Storage.Path)
