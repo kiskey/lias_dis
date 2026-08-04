@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/broker.go
-// Version: 1.1 (Added ResetBackoff channel for SSE)
+// Version: 1.2 (Implemented SignalSSEConnected)
 package api
 
 import (
@@ -129,6 +129,15 @@ func (b *Broker) replayEventsLocked(client *Client, lastEventID int64) {
     }
     if count > 0 {
         slog.Info("Replayed missed SSE events for LIAS client", "client_id", client.ID, "count", count)
+    }
+}
+
+// SignalSSEConnected implements the EventBroadcaster interface.
+// It sends a non-blocking signal to reset the SSE exponential backoff timer.
+func (b *Broker) SignalSSEConnected() {
+    select {
+    case b.ResetBackoff <- struct{}{}:
+    default:
     }
 }
 
