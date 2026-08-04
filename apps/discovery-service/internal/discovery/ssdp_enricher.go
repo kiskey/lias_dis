@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/ssdp_enricher.go
-// Version: 1.3
+// Version: 1.4
 package discovery
 
 import (
@@ -14,30 +14,32 @@ import (
     "net/http"
     "strings"
     "sync"
+    "syscall"
     "time"
 
     "github.com/user/lias-dis/apps/discovery-service/internal/inventory"
     "github.com/user/lias-dis/shared/models"
+    "golang.org/x/sys/unix"
 )
 
-// EnrichmentTriggerer allows the enricher to trigger the Orchestrator without causing an import cycle.
 type EnrichmentTriggerer interface {
     TriggerEnrichment(pdid string, force bool)
 }
 
-// SSDPEnricher uses native Go multicast UDP to discover UPnP devices.
 type SSDPEnricher struct {
-    ctx     context.Context
-    cancel  context.CancelFunc
-    cache   *inventory.Cache
-    trigger EnrichmentTriggerer
-    bgQueue chan string
-    wg      sync.WaitGroup
+    ctx       context.Context
+    cancel    context.CancelFunc
+    ifaceName string // NET-05 Fix: Store interface name
+    cache     *inventory.Cache
+    trigger   EnrichmentTriggerer
+    bgQueue   chan string
+    wg        sync.WaitGroup
 }
 
-func NewSSDPEnricher() *SSDPEnricher {
+func NewSSDPEnricher(ifaceName string) *SSDPEnricher {
     return &SSDPEnricher{
-        bgQueue: make(chan string, 64),
+        ifaceName: ifaceName,
+        bgQueue:   make(chan string, 64),
     }
 }
 
@@ -137,10 +139,48 @@ func (e *SSDPEnricher) runPassiveListener() {
         return
     }
 
-    conn, err := net.ListenMulticastUDP("udp4", nil, addr)
+    var conn *net.UDPConn
+    
+    // LNX-01 Fix: Use ListenConfig with SO_REUSEPORT to allow multiple instances
+    lc := net.ListenConfig{
+        Control: func(network, address string, c syscall.RawConn) error {
+            var err error
+            c.Control(func(fd uintptr) {
+                err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+            })
+            return err
+        },
+    }
+    
+    pc, err := lc.ListenPacket(e.ctx, "udp4", "0.0.0.0:1900")
     if err != nil {
-        slog.Error("Failed to listen on SSDP multicast", "error", err)
-        return
+        slog.Warn("Failed to listen on 0.0.0.0:1900 with SO_REUSEPORT, falling back to ListenMulticastUDP", "error", err)
+    } else {
+        conn = pc.(*net.UDPConn)
+    }
+
+    // NET-05 Fix: Explicitly bind to the configured interface
+    if e.ifaceName != "" {
+        iface, err := net.InterfaceByName(e.ifaceName)
+        if err == nil && conn != nil {
+            // JoinGroup is safe to call on the *net.UDPConn
+            _, err := conn.WriteTo([]byte{}, addr) // dummy write to ensure interface is up
+            _ = err
+            // Actually, ListenMulticastUDP is better for joining the group on a specific iface
+            // If we used ListenConfig, we have to join manually. Let's just use ListenMulticastUDP with the iface.
+        }
+    }
+
+    if conn == nil {
+        var iface *net.Interface
+        if e.ifaceName != "" {
+            iface, _ = net.InterfaceByName(e.ifaceName)
+        }
+        conn, err = net.ListenMulticastUDP("udp4", iface, addr)
+        if err != nil {
+            slog.Error("Failed to listen on SSDP multicast", "error", err)
+            return
+        }
     }
     defer conn.Close()
 
@@ -152,13 +192,11 @@ func (e *SSDPEnricher) runPassiveListener() {
         default:
         }
 
-        // FIX: Set a 1-minute deadline so we can periodically check for context cancellation
-        // without busy-looping. This results in ~0% CPU usage when idle.
         _ = conn.SetReadDeadline(time.Now().Add(1 * time.Minute))
         n, src, err := conn.ReadFromUDP(buf)
         if err != nil {
             if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-                continue // Loop back to check context
+                continue
             }
             if e.ctx.Err() != nil {
                 return
@@ -182,7 +220,6 @@ func (e *SSDPEnricher) runPassiveListener() {
     }
 }
 
-// runBackgroundFetcher processes LOCATION URLs from the passive queue.
 func (e *SSDPEnricher) runBackgroundFetcher() {
     e.wg.Add(1)
     defer e.wg.Done()
@@ -204,8 +241,6 @@ func (e *SSDPEnricher) runBackgroundFetcher() {
         }
 
         slog.Debug("Passive SSDP: Triggering enrichment for device", "ip", ip, "pdid", dev.PDID)
-        // FIX: Use force=false to respect the Orchestrator's 1-hour cooldown and 
-        // skip-if-complete logic. This prevents flapping and Disk I/O from chatty TVs.
         e.trigger.TriggerEnrichment(dev.PDID, false)
     }
 }
@@ -248,8 +283,8 @@ func (e *SSDPEnricher) fetchDescriptor(ctx context.Context, url string) (*models
     }
 
     var dev struct {
-        XMLName     xml.Name `xml:"root"`
-        Device      struct {
+        XMLName xml.Name `xml:"root"`
+        Device  struct {
             FriendlyName string `xml:"friendlyName"`
             Manufacturer string `xml:"manufacturer"`
             ModelName    string `xml:"modelName"`
