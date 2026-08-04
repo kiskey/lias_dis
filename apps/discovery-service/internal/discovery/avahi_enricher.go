@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/avahi_enricher.go
-// Version: 1.3 (Persistent mDNS Listener)
+// Version: 1.4 (Verified Persistent Listener)
 package discovery
 
 import (
@@ -22,7 +22,7 @@ type AvahiEnricher struct {
     ctx     context.Context
     cancel  context.CancelFunc
     mu      sync.RWMutex
-    records map[string][]avahiRecord // Key: IP or Hostname
+    records map[string][]avahiRecord
 }
 
 type avahiRecord struct {
@@ -53,7 +53,7 @@ func (e *AvahiEnricher) Stop() error {
     return nil
 }
 
-// ENR-05 Fix: Run a persistent avahi-browse in the background to avoid spawning a process per enrichment
+// ENR-05 Fix: Run a persistent avahi-browse in the background.
 func (e *AvahiEnricher) runPersistentListener() {
     for {
         select {
@@ -104,7 +104,6 @@ func (e *AvahiEnricher) runPersistentListener() {
 
         _ = cmd.Wait()
         
-        // If the context is done, exit. Otherwise, wait and retry.
         select {
         case <-e.ctx.Done():
             return
