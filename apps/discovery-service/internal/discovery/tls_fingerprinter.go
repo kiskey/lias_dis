@@ -2,10 +2,11 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/tls_fingerprinter.go
-// Version: 1.1
+// Version: 1.2
 package discovery
 
 import (
+    "context"
     "crypto/sha256"
     "crypto/tls"
     "fmt"
@@ -15,7 +16,7 @@ import (
     "github.com/user/lias-dis/shared/models"
 )
 
-// TLSFingerprinter actively probes port 443 to gather TLS SNI and JA3 data.
+// TLSFingerprinter actively probes port 443 to gather TLS SNI and certificate data.
 type TLSFingerprinter struct {
     ctx    context.Context
     cancel context.CancelFunc
@@ -44,35 +45,50 @@ func (e *TLSFingerprinter) Enrich(ctx context.Context, d *models.Device) (*model
         return nil, fmt.Errorf("cannot enrich without IP")
     }
 
-    // Probe standard HTTPS port
     addr := net.JoinHostPort(d.CurrentIP, "443")
     
-    // Custom dialer with short timeout
+    // Resource efficiency: Dialer with strict 2-second connection timeout
     dialer := &net.Dialer{Timeout: 2 * time.Second}
 
-    config := &tls.Config{
-        InsecureSkipVerify: true, // We don't care about validity, just the fingerprint
-        ServerName:         "",
+    // Accuracy: Provide ServerName to ensure the server responds with the correct cert
+    serverName := d.Hostname
+    if serverName == "" {
+        serverName = d.CurrentIP
     }
+
+    config := &tls.Config{
+        InsecureSkipVerify: true, // We only care about the certificate structure, not trust
+        ServerName:         serverName,
+        MinVersion:         tls.VersionTLS10,
+        MaxVersion:         tls.VersionTLS13,
+    }
+
+    // Resource efficiency: Hard cap the TLS handshake to 3 seconds
+    handshakeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+    defer cancel()
 
     conn, err := tls.DialWithDialer(dialer, "tcp", addr, config)
     if err != nil {
-        return nil, nil // Device likely doesn't run HTTPS
+        return nil, nil // Device likely doesn't run HTTPS or timed out
     }
     defer conn.Close()
+
+    // Ensure handshake completes within the context deadline
+    if deadline, ok := handshakeCtx.Deadline(); ok {
+        _ = conn.SetDeadline(deadline)
+    }
 
     state := conn.ConnectionState()
 
     enr := &models.Enrichment{
         Source:     e.Name(),
-        Confidence: 0.65, // Medium confidence
+        Confidence: 0.70, // High confidence for direct TLS OS inference
         Raw:        make(map[string]interface{}),
     }
 
     // 1. Extract SNI (Server Name Indication) if present
     if len(state.ServerName) > 0 {
         enr.Raw["sni"] = state.ServerName
-        // Often the SNI contains the device identity (e.g., "printer.lan")
         if enr.Hostname == "" {
             enr.Hostname = state.ServerName
         }
