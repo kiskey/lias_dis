@@ -1,7 +1,7 @@
 // Package policy implements the rule evaluation engine for LIAS.
 //
 // File:    apps/lias/internal/policy/engine.go
-// Version: 2.3
+// Version: 2.4
 package policy
 
 import (
@@ -34,6 +34,7 @@ func NewEngine() *Engine {
                 Type:     models.PolicyTypeGlobal,
                 Action:   models.ActionSchedule,
                 Priority: 0,
+                Enabled:  true,
             },
         },
     }
@@ -49,6 +50,16 @@ func (e *Engine) DeletePolicy(id string) {
     e.mu.Lock()
     defer e.mu.Unlock()
     delete(e.policies, id)
+}
+
+// GetPolicy retrieves a specific policy by its ID.
+// FIX: Added missing method required by handlers.ToggleVacationMode
+func (e *Engine) GetPolicy(id string) (models.Policy, bool) {
+    e.mu.RLock()
+    defer e.mu.RUnlock()
+
+    p, exists := e.policies[id]
+    return p, exists
 }
 
 func (e *Engine) ListPolicies() []models.Policy {
@@ -106,6 +117,9 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
     // 3. DEVICE-SPECIFIC POLICY
     var bestDevPolicy *models.Policy
     for _, p := range e.policies {
+        if !p.Enabled {
+            continue
+        }
         if p.Type == models.PolicyTypeDevice && p.TargetID == d.PDID {
             if bestDevPolicy == nil || p.Priority > bestDevPolicy.Priority {
                 pCopy := p
@@ -121,6 +135,9 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
     var bestTagPol *models.Policy
     for _, tagID := range d.Tags {
         for _, p := range e.policies {
+            if !p.Enabled {
+                continue
+            }
             if p.Type == models.PolicyTypeTag && p.TargetID == tagID {
                 if bestTagPol == nil || p.Priority > bestTagPol.Priority {
                     pCopy := p
@@ -163,12 +180,14 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
 
     // 2. Global Kill-Switch Check: ONLY ActionBlock acts as global override
     if globalPol, ok := e.policies["global_default"]; ok {
-        if globalPol.Action == models.ActionBlock {
+        if !globalPol.Enabled && globalPol.Action == models.ActionBlock {
+            // If disabled, we skip it. But if it's enabled and Block, we return Block.
+        } else if globalPol.Enabled && globalPol.Action == models.ActionBlock {
             return models.ActionBlock
         }
 
         // 2b. Global Allow override
-        if globalPol.Action == models.ActionAllow {
+        if globalPol.Enabled && globalPol.Action == models.ActionAllow {
             return models.ActionAllow
         }
     }
@@ -176,6 +195,9 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
     // 3. Evaluate Device-Specific Policies
     var bestDevPolicy *models.Policy
     for _, p := range e.policies {
+        if !p.Enabled {
+            continue
+        }
         if p.Type == models.PolicyTypeDevice && p.TargetID == d.PDID {
             if bestDevPolicy == nil || p.Priority > bestDevPolicy.Priority {
                 pCopy := p
@@ -190,10 +212,13 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
         return bestDevPolicy.Action
     }
 
-    // 4. Evaluate Tag-Group Policies (GAP-L-H01 Fix: Priority-based selection aligned with GetEffectivePolicy)
+    // 4. Evaluate Tag-Group Policies
     var bestTagPolicy *models.Policy
     for _, tagID := range d.Tags {
         for _, p := range e.policies {
+            if !p.Enabled {
+                continue
+            }
             if p.Type == models.PolicyTypeTag && p.TargetID == tagID {
                 if bestTagPolicy == nil || p.Priority > bestTagPolicy.Priority {
                     pCopy := p
@@ -212,7 +237,7 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
 
     // 5. Fallback to Global Default Policy
     if globalPol, ok := e.policies["global_default"]; ok {
-        if globalPol.Action == models.ActionSchedule && schedEval != nil {
+        if globalPol.Enabled && globalPol.Action == models.ActionSchedule && schedEval != nil {
             return schedEval.EvaluateBundle(globalPol.GetScheduleIDs())
         }
         return globalPol.Action
