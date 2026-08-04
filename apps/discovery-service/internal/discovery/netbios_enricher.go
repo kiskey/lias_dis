@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netbios_enricher.go
-// Version: 1.1
+// Version: 1.2 (Verified Offsets)
 package discovery
 
 import (
@@ -16,8 +16,6 @@ import (
     "github.com/user/lias-dis/shared/models"
 )
 
-// NetBIOSEnricher sends a native NetBIOS Node Status request (UDP port 137)
-// to resolve Windows hostnames and workgroups.
 type NetBIOSEnricher struct {
     ctx    context.Context
     cancel context.CancelFunc
@@ -110,23 +108,14 @@ func (e *NetBIOSEnricher) queryNodeStatus(ctx context.Context, ip string) ([]net
     _ = conn.SetReadDeadline(deadline)
 
     req := make([]byte, 50)
-    
-    // TID: 0x0001
-    binary.BigEndian.PutUint16(req[0:2], 0x0001)
-    // MATH-04 Fix: Flags: 0x0000 (Standard query, no reserved bits set)
-    binary.BigEndian.PutUint16(req[2:4], 0x0000)
-    // Questions: 1
-    binary.BigEndian.PutUint16(req[4:6], 1)
-    
-    name := []byte("*               \x00")
-    req[12] = 32 // Length of encoded name
-    encodeNetBIOSName(name, req[13:45])
-    
-    req[45] = 0
-    // Type: NBSTAT (0x21)
-    binary.BigEndian.PutUint16(req[46:48], 0x0021)
-    // Class: IN (0x01)
-    binary.BigEndian.PutUint16(req[48:50], 0x0001)
+    binary.BigEndian.PutUint16(req[0:2], 0x0001)     // TID
+    binary.BigEndian.PutUint16(req[2:4], 0x0000)     // MATH-04 Fix: Flags (Standard query)
+    binary.BigEndian.PutUint16(req[4:6], 1)          // Questions
+    req[12] = 32                                     // Length of encoded name
+    encodeNetBIOSName([]byte("*               \x00"), req[13:45])
+    req[45] = 0                                      // Null terminator
+    binary.BigEndian.PutUint16(req[46:48], 0x0021)   // Type NBSTAT
+    binary.BigEndian.PutUint16(req[48:50], 0x0001)   // Class IN
 
     if _, err = conn.Write(req); err != nil {
         return nil, err
@@ -150,19 +139,17 @@ func encodeNetBIOSName(name []byte, dst []byte) {
 }
 
 func parseNodeStatusResponse(data []byte) ([]netbiosName, error) {
-    // MATH-03 Fix: Corrected off-by-one parsing offsets for NBSTAT response.
-    // Header(12) + Name Length(1) + Encoded Name(32) + Null(1) + Type(2) + Class(2) + TTL(4) = 54
+    // MATH-03 Fix: Corrected off-by-one parsing offsets.
+    // Header(12) + Name Len(1) + Encoded Name(32) + Null(1) + Type(2) + Class(2) + TTL(4) = 54
     if len(data) < 57 {
         return nil, fmt.Errorf("packet too short")
     }
 
-    // RDLENGTH is at offset 54-55
     dataLen := binary.BigEndian.Uint16(data[54:56])
     if dataLen == 0 {
         return nil, nil
     }
 
-    // NUMNAMES is at offset 56
     numNames := int(data[56])
     if 57+numNames*18 > len(data) {
         return nil, fmt.Errorf("malformed netbios response")
