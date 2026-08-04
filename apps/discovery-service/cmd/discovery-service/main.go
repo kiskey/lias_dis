@@ -1,7 +1,7 @@
 // Binary discovery-service implements the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 2.4
+// Version: 2.5
 package main
 
 import (
@@ -108,7 +108,7 @@ func main() {
     }
 
     var primaries []discovery.Enricher
-    var ssdpEnricher *discovery.SSDPEnricher // Keep a reference for wiring
+    var ssdpEnricher *discovery.SSDPEnricher
     
     if cfg.Discovery.Enrichment.AvahiEnabled {
         e := discovery.NewAvahiEnricher()
@@ -116,12 +116,18 @@ func main() {
         primaries = append(primaries, e)
     }
     if cfg.Discovery.Enrichment.SSDPEnabled {
-        ssdpEnricher = discovery.NewSSDPEnricher()
+        ssdpEnricher = discovery.NewSSDPEnricher(cfg.Discovery.Interface) // NET-05 Fix: Pass interface
         _ = ssdpEnricher.Start(ctx)
         primaries = append(primaries, ssdpEnricher)
     }
     if cfg.Discovery.Enrichment.NetbiosEnabled {
         e := discovery.NewNetBIOSEnricher()
+        _ = e.Start(ctx)
+        primaries = append(primaries, e)
+    }
+    // NET-01 & ENR-01 Fix: Wire the TLS Fingerprinter
+    if cfg.Discovery.Enrichment.TLSEnabled {
+        e := discovery.NewTLSFingerprinter()
         _ = e.Start(ctx)
         primaries = append(primaries, e)
     }
@@ -138,8 +144,6 @@ func main() {
     
     orch.SetDeviceManager(eng)
 
-    // DIS-ENR-03 Fix: Wire the SSDP enricher with cache and orchestrator references
-    // so its passive listener can trigger enrichment safely.
     if ssdpEnricher != nil {
         ssdpEnricher.SetCache(cache)
         ssdpEnricher.SetEnrichmentTriggerer(orch)
