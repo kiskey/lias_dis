@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 4.3 (Corrected Tier type revert)
+// Version: 4.4 (Applied CPU-01 TouchLastSeen)
 package correlation
 
 import (
@@ -490,11 +490,13 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         dirty = true
     }
 
-    d.Touch(time.Now())
-    e.cache.Upsert(d)
-
+    // CPU-01 Fix: Only Upsert if dirty. Otherwise, just touch LastSeen in cache.
     if dirty {
+        d.Touch(time.Now())
+        e.cache.Upsert(d)
         e.markDirty(d.PDID)
+    } else {
+        e.cache.TouchLastSeen(d.PDID, time.Now())
     }
 }
 
@@ -516,7 +518,7 @@ func (e *Engine) promoteDevice(d *models.Device, newTier models.IdentityTier, ne
         if err := e.store.ReplaceDevicePDID(oldPDID, newPDID, d); err != nil {
             slog.Error("Atomic PDID replacement failed", "old", oldPDID, "new", newPDID, "error", err)
             d.PDID = oldPDID
-            d.IdentityTier = models.TierL7 // Corrected type reference
+            d.IdentityTier = models.TierL7
             return
         }
     }
