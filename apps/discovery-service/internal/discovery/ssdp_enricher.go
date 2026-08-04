@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/ssdp_enricher.go
-// Version: 1.4
+// Version: 1.5 (Fixed Build Error and SO_REUSEPORT Multicast)
 package discovery
 
 import (
@@ -131,7 +131,6 @@ func (e *SSDPEnricher) searchSSDP(ctx context.Context, targetIP string) (string,
     }
 }
 
-// runPassiveListener listens for SSDP NOTIFY packets on the multicast address.
 func (e *SSDPEnricher) runPassiveListener() {
     addr, err := net.ResolveUDPAddr("udp4", "239.255.255.250:1900")
     if err != nil {
@@ -139,50 +138,47 @@ func (e *SSDPEnricher) runPassiveListener() {
         return
     }
 
-    var conn *net.UDPConn
-    
-    // LNX-01 Fix: Use ListenConfig with SO_REUSEPORT to allow multiple instances
+    var iface *net.Interface
+    if e.ifaceName != "" {
+        iface, err = net.InterfaceByName(e.ifaceName)
+        if err != nil {
+            slog.Warn("Failed to find interface for SSDP multicast, binding to all", "iface", e.ifaceName, "error", err)
+        }
+    }
+
+    // LNX-01 Fix: Use ListenConfig with SO_REUSEPORT
     lc := net.ListenConfig{
         Control: func(network, address string, c syscall.RawConn) error {
-            var err error
-            c.Control(func(fd uintptr) {
-                err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+            var opErr error
+            err := c.Control(func(fd uintptr) {
+                opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
             })
-            return err
+            if err != nil {
+                return err
+            }
+            return opErr
         },
     }
-    
+
     pc, err := lc.ListenPacket(e.ctx, "udp4", "0.0.0.0:1900")
     if err != nil {
-        slog.Warn("Failed to listen on 0.0.0.0:1900 with SO_REUSEPORT, falling back to ListenMulticastUDP", "error", err)
+        slog.Error("Failed to listen on SSDP port 1900", "error", err)
+        return
+    }
+    defer pc.Close()
+
+    conn := pc.(*net.UDPConn)
+
+    // NET-05 Fix: Join multicast group on specific interface
+    if iface != nil {
+        if err := conn.JoinGroup(iface, addr); err != nil {
+            slog.Warn("Failed to join SSDP multicast group on specific interface", "iface", e.ifaceName, "error", err)
+        }
     } else {
-        conn = pc.(*net.UDPConn)
-    }
-
-    // NET-05 Fix: Explicitly bind to the configured interface
-    if e.ifaceName != "" {
-        iface, err := net.InterfaceByName(e.ifaceName)
-        if err == nil && conn != nil {
-            // JoinGroup is safe to call on the *net.UDPConn
-            _, err := conn.WriteTo([]byte{}, addr) // dummy write to ensure interface is up
-            _ = err
-            // Actually, ListenMulticastUDP is better for joining the group on a specific iface
-            // If we used ListenConfig, we have to join manually. Let's just use ListenMulticastUDP with the iface.
+        if err := conn.JoinGroup(nil, addr); err != nil {
+            slog.Warn("Failed to join SSDP multicast group", "error", err)
         }
     }
-
-    if conn == nil {
-        var iface *net.Interface
-        if e.ifaceName != "" {
-            iface, _ = net.InterfaceByName(e.ifaceName)
-        }
-        conn, err = net.ListenMulticastUDP("udp4", iface, addr)
-        if err != nil {
-            slog.Error("Failed to listen on SSDP multicast", "error", err)
-            return
-        }
-    }
-    defer conn.Close()
 
     buf := make([]byte, 4096)
     for {
