@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 2.2
+// Version: 2.3 (PRAGMA DSN, WAL Checkpoint, Flow Logs Retention)
 package storage
 
 import (
@@ -36,13 +36,11 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, fmt.Errorf("failed to create database directory: %w", err)
     }
 
-    db, err := sql.Open("sqlite", dbPath)
+    // IO-06 Fix: Apply PRAGMAs via DSN to ensure all pool connections use WAL and NORMAL synchronous mode
+    dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=journal_mode(WAL)", dbPath)
+    db, err := sql.Open("sqlite", dsn)
     if err != nil {
         return nil, fmt.Errorf("failed to open sqlite database: %w", err)
-    }
-
-    if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;"); err != nil {
-        slog.Warn("Failed to set PRAGMAs on LIAS database", "error", err)
     }
 
     s := &Storage{
@@ -55,8 +53,33 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, err
     }
 
+    // LNX-06 Fix: WAL checkpoint on startup to recover from crashes and prevent -wal file bloat
+    if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+        slog.Warn("Failed to truncate WAL on startup", "error", err)
+    }
+
+    // IO-07 Fix: Start flow logs retention loop
+    go s.flowLogsRetentionLoop()
+
     slog.Info("SQLite storage engine initialized", "path", dbPath)
     return s, nil
+}
+
+func (s *Storage) flowLogsRetentionLoop() {
+    ticker := time.NewTicker(24 * time.Hour)
+    defer ticker.Stop()
+
+    for {
+        s.mu.Lock()
+        _, err := s.db.Exec("DELETE FROM flow_logs WHERE timestamp < datetime('now', '-30 days')")
+        s.mu.Unlock()
+
+        if err != nil {
+            slog.Warn("Failed to clean up old flow logs", "error", err)
+        }
+
+        <-ticker.C
+    }
 }
 
 func (s *Storage) initSchema() error {
@@ -72,7 +95,6 @@ func (s *Storage) initSchema() error {
         builtin INTEGER NOT NULL
     );
 
-    -- LIAS-TAG-01 Fix: Schema supports multi-tag per device
     CREATE TABLE IF NOT EXISTS device_tags (
         pdid TEXT NOT NULL,
         tag_id TEXT NOT NULL,
