@@ -1,7 +1,7 @@
 // Package nftables provides unit tests for the LIAS nftables builder diffing logic.
 //
 // File:    apps/lias/internal/nftables/nftables_test.go
-// Version: 1.1
+// Version: 1.2
 package nftables
 
 import (
@@ -22,7 +22,6 @@ func TestDiffIPs(t *testing.T) {
     toAdd := make([]net.IP, 0)
     toRem := make([]net.IP, 0)
     
-    // FIX: Updated to new pointer-based signature
     diffIPs(desired, current, &toAdd, &toRem)
 
     if len(toAdd) != 1 || !toAdd[0].Equal(net.ParseIP("192.168.1.12")) {
@@ -42,7 +41,6 @@ func TestDiffIPsEmpty(t *testing.T) {
     toAdd := make([]net.IP, 0)
     toRem := make([]net.IP, 0)
     
-    // FIX: Updated to new pointer-based signature
     diffIPs(desired, current, &toAdd, &toRem)
 
     if len(toAdd) != 0 {
@@ -70,13 +68,13 @@ func TestDiffMACs(t *testing.T) {
     toAdd := make([]net.HardwareAddr, 0)
     toRem := make([]net.HardwareAddr, 0)
     
-    // FIX: Updated to new pointer-based signature
     diffMACs(desired, current, &toAdd, &toRem)
 
-    if len(toAdd) != 1 || !toAdd[0].String() == mac3.String() {
+    // FIX: Replaced invalid ! operator syntax with !=
+    if len(toAdd) != 1 || toAdd[0].String() != mac3.String() {
         t.Errorf("Expected to add %s, got %v", mac3.String(), toAdd)
     }
-    if len(toRem) != 1 || !toRem[0].String() == mac2.String() {
+    if len(toRem) != 1 || toRem[0].String() != mac2.String() {
         t.Errorf("Expected to remove %s, got %v", mac2.String(), toRem)
     }
 }
