@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 2.9 (Full HIG Modals, Device Details, Analytics, Vacation Mode, Import/Export)
+// Version: 3.0 (Full HIG Modals, Device Details, Analytics, Vacation Mode, Import/Export, Onboarding, Calendar Dates, Multi-Tag UI)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -22,12 +22,48 @@ class App {
     this.initSSE();
     this.loadData();
 
+    // UI-UX-05 Fix: First-run onboarding wizard
+    if (!localStorage.getItem('lias_onboarded')) {
+      this.openOnboardingWizard();
+    }
+
     // Auto-refresh dashboard view every minute to update live enforcements dynamically
     setInterval(() => {
       if (this.currentView === 'dashboard') {
         this.renderCurrentView();
       }
     }, 60000);
+  }
+
+  // UI-UX-05 Fix: Onboarding Wizard
+  openOnboardingWizard() {
+    this.openModal('Welcome to LIAS', `
+      <div style="text-align: center; padding: 10px;">
+        <div style="font-size: 48px; margin-bottom: 16px;">🛡️</div>
+        <h3 style="font-size: 20px; font-weight: 700; margin-bottom: 12px;">Secure Your Network in 3 Steps</h3>
+        <p style="font-size: 14px; color: var(--text-secondary); margin-bottom: 24px;">LIAS protects your family's internet access. Let's get started!</p>
+        
+        <div style="text-align: left; background: var(--bg-tertiary); padding: 16px; border-radius: 12px; margin-bottom: 16px;">
+          <p style="font-weight: 600; margin-bottom: 4px;">1. Tag Your Router</p>
+          <p style="font-size: 13px; color: var(--text-secondary);">Assign the "Infrastructure" tag to your router/gateway to prevent accidental lockouts.</p>
+        </div>
+        
+        <div style="text-align: left; background: var(--bg-tertiary); padding: 16px; border-radius: 12px; margin-bottom: 16px;">
+          <p style="font-weight: 600; margin-bottom: 4px;">2. Create a Schedule</p>
+          <p style="font-size: 13px; color: var(--text-secondary);">Set up a "Bedtime" schedule (e.g., Block 22:00 to 06:00).</p>
+        </div>
+
+        <div style="text-align: left; background: var(--bg-tertiary); padding: 16px; border-radius: 12px; margin-bottom: 24px;">
+          <p style="font-weight: 600; margin-bottom: 4px;">3. Apply to Devices</p>
+          <p style="font-size: 13px; color: var(--text-secondary);">Tag your kids' devices as "Kids" and attach the schedule policy.</p>
+        </div>
+      </div>
+    `, `<button class="btn btn-primary" id="onboarding-done" style="width: 100%;">Got It!</button>`);
+    
+    document.getElementById('onboarding-done').addEventListener('click', () => {
+      localStorage.setItem('lias_onboarded', 'true');
+      this.closeModal();
+    });
   }
 
   // UI-FN-11 Fix: Generates a comprehensive list of IANA timezones
@@ -417,9 +453,16 @@ class App {
     this.tags.forEach(t => { grouped[t.id] = []; });
 
     this.devices.forEach(d => {
-      const tagId = (d.tags && d.tags.length > 0) ? d.tags[0] : 'generic';
-      if (!grouped[tagId]) grouped[tagId] = [];
-      grouped[tagId].push(d);
+      // LIAS-TAG-01 Fix: Handle multiple tags per device
+      if (d.tags && d.tags.length > 0) {
+        d.tags.forEach(tagId => {
+          if (!grouped[tagId]) grouped[tagId] = [];
+          grouped[tagId].push(d);
+        });
+      } else {
+        if (!grouped['generic']) grouped['generic'] = [];
+        grouped['generic'].push(d);
+      }
     });
 
     let html = `
@@ -475,7 +518,15 @@ class App {
 
   renderDeviceCard(d) {
     const dispName = d.friendly_name || d.hostname || `${d.vendor || ''} ${d.model || ''}`.trim() || d.current_mac || d.pdid;
-    const tagId = (d.tags && d.tags.length > 0) ? d.tags[0] : 'generic';
+    const tags = (d.tags && d.tags.length > 0) ? d.tags : ['generic'];
+
+    // LIAS-TAG-01 Fix: Render multi-select for tags
+    const tagCheckboxes = this.tags.map(t => `
+      <label style="display:flex; align-items:center; gap:6px; font-size:12px; padding:4px 0;">
+        <input type="checkbox" class="device-tag-checkbox" value="${t.id}" ${tags.includes(t.id) ? 'checked' : ''}>
+        ${t.name}
+      </label>
+    `).join('');
 
     return `
       <div class="device-item">
@@ -495,29 +546,40 @@ class App {
             </div>
           ` : ''}
         </div>
-        <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center; gap: 8px;">
-          <select class="device-tag-select" data-pdid="${d.pdid}" style="flex: 1;">
-            ${this.tags.map(t => `<option value="${t.id}" ${t.id === tagId ? 'selected' : ''}>${t.name}</option>`).join('')}
-          </select>
-          <button class="btn btn-danger btn-pause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="padding: 6px 10px; font-size: 12px;">⏸ Pause</button>
-          <button class="btn btn-secondary btn-rename-device" data-pdid="${d.pdid}" data-name="${dispName}" style="padding: 6px 10px; font-size: 12px;">✏️</button>
-          <button class="btn btn-secondary btn-details-device" data-pdid="${d.pdid}" style="padding: 6px 10px; font-size: 12px;">📋</button>
+        <div style="margin-top:12px; display:flex; flex-direction:column; gap:8px;">
+          <details style="background: var(--bg-tertiary); padding: 8px 12px; border-radius: 8px; cursor: pointer;">
+            <summary style="font-size: 12px; font-weight: 600;">Assign Tags (${tags.length})</summary>
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:4px; margin-top:8px;">
+              ${tagCheckboxes}
+            </div>
+          </details>
+          <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px;">
+            <button class="btn btn-danger btn-pause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px;">⏸ Pause</button>
+            <button class="btn btn-secondary btn-rename-device" data-pdid="${d.pdid}" data-name="${dispName}" style="padding: 6px 10px; font-size: 12px;">✏️</button>
+            <button class="btn btn-secondary btn-details-device" data-pdid="${d.pdid}" style="padding: 6px 10px; font-size: 12px;">📋</button>
+          </div>
         </div>
       </div>
     `;
   }
 
   bindDeviceTagDropdowns() {
-    document.querySelectorAll('.device-tag-select').forEach(sel => {
-      sel.addEventListener('change', async (e) => {
-        const pdid = e.currentTarget.dataset.pdid;
-        const tagId = e.currentTarget.value;
+    // LIAS-TAG-01 Fix: Save tags on checkbox change
+    document.querySelectorAll('.device-tag-checkbox').forEach(chk => {
+      chk.addEventListener('change', async (e) => {
+        const deviceItem = e.target.closest('.device-item');
+        const pdid = deviceItem.querySelector('.btn-pause-device').dataset.pdid;
+        const selectedTags = Array.from(deviceItem.querySelectorAll('.device-tag-checkbox:checked')).map(c => c.value);
+        
+        // If no tags selected, default to generic
+        if (selectedTags.length === 0) selectedTags.push('generic');
+        
         try {
-          await API.assignDeviceTag(pdid, tagId);
-          this.showToast(`Tag reassigned successfully`);
+          await API.assignDeviceTag(pdid, selectedTags);
+          this.showToast(`Tags updated successfully`);
           this.loadData();
         } catch (err) {
-          this.showToast(`Failed to assign tag: ${err.message}`, 'danger');
+          this.showToast(`Failed to assign tags: ${err.message}`, 'danger');
         }
       });
     });
@@ -1285,7 +1347,7 @@ class App {
           <button class="btn btn-secondary" id="btn-add-rule">+ Add Rule</button>
         </div>
 
-        <div id="sched-rules-container" style="display:flex; flex-direction:column; gap:12px; max-height:260px; overflow-y:auto;">
+        <div id="sched-rules-container" style="display:flex; flex-direction:column; gap:12px; max-height:300px; overflow-y:auto;">
           ${s.rules.map((r, idx) => this.renderScheduleRuleRow(r, idx)).join('')}
         </div>
       </div>
@@ -1299,6 +1361,7 @@ class App {
     this.bindScheduleModalEvents(s);
   }
 
+  // LIAS-SCH-09 Fix: Added Calendar Date inputs to rule row
   renderScheduleRuleRow(rule, idx) {
     const isOvernight = rule.start_time && rule.end_time && rule.end_time <= rule.start_time;
     const daysArr = (rule.days || []).map(d => d.toLowerCase().substring(0, 3));
@@ -1312,30 +1375,33 @@ class App {
             <select class="day-mode-select" style="font-size:11px; padding:4px 8px;">
               <option value="range">Continuous Day Range</option>
               <option value="specific">Specific Days</option>
+              <option value="calendar">Calendar Dates</option>
             </select>
             <button class="btn btn-danger btn-remove-rule" data-idx="${idx}" style="padding:4px 8px; font-size:11px;">Remove</button>
           </div>
         </div>
+        
+        <div class="rule-mode-container" style="display:flex; flex-direction:column; gap:8px;">
+          <div class="day-range-picker" style="display:flex; gap:8px; align-items:center;">
+            <label style="font-size:11px; font-weight:700;">From:</label>
+            <select class="range-from" style="flex:1; font-size:12px; padding:6px;">${['mon','tue','wed','thu','fri','sat','sun'].map(d => `<option value="${d}" ${daysArr[0] === d ? 'selected' : ''}>${d.toUpperCase()}</option>`).join('')}</select>
+            <label style="font-size:11px; font-weight:700;">To:</label>
+            <select class="range-to" style="flex:1; font-size:12px; padding:6px;">${['mon','tue','wed','thu','fri','sat','sun'].map(d => `<option value="${d}" ${daysArr[daysArr.length - 1] === d ? 'selected' : ''}>${d.toUpperCase()}</option>`).join('')}</select>
+          </div>
 
-        <div class="day-range-picker" style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
-          <label style="font-size:11px; font-weight:700;">From:</label>
-          <select class="range-from" style="flex:1; font-size:12px; padding:6px;">
-            ${['mon','tue','wed','thu','fri','sat','sun'].map(d => `<option value="${d}" ${daysArr[0] === d ? 'selected' : ''}>${d.toUpperCase()}</option>`).join('')}
-          </select>
-          <label style="font-size:11px; font-weight:700;">To:</label>
-          <select class="range-to" style="flex:1; font-size:12px; padding:6px;">
-            ${['mon','tue','wed','thu','fri','sat','sun'].map(d => `<option value="${d}" ${daysArr[daysArr.length - 1] === d ? 'selected' : ''}>${d.toUpperCase()}</option>`).join('')}
-          </select>
+          <div class="day-chip-group specific-days-picker" style="display:none; flex-wrap:wrap; gap:4px;">
+            ${['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'].map(day => `<div class="day-chip ${daysArr.includes(day) ? 'selected' : ''}" data-day="${day}">${day.toUpperCase()}</div>`).join('')}
+          </div>
+
+          <div class="calendar-picker" style="display:none; gap:8px; align-items:center;">
+            <label style="font-size:11px; font-weight:700;">Start Date:</label>
+            <input type="date" class="rule-start-date" value="${rule.start_date || ''}" style="flex:1; font-size:12px; padding:6px;">
+            <label style="font-size:11px; font-weight:700;">End Date:</label>
+            <input type="date" class="rule-end-date" value="${rule.end_date || ''}" style="flex:1; font-size:12px; padding:6px;">
+          </div>
         </div>
 
-        <div class="day-chip-group specific-days-picker" style="display:none; margin-bottom:8px;">
-          ${['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'].map(day => {
-            const sel = daysArr.includes(day);
-            return `<div class="day-chip ${sel ? 'selected' : ''}" data-day="${day}">${day.toUpperCase()}</div>`;
-          }).join('')}
-        </div>
-
-        <div style="display:flex; gap:8px; align-items:center;">
+        <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
           <input type="time" class="rule-start" value="${rule.start_time}" style="flex:1;" ${isAllDay ? 'disabled' : ''}>
           <span>to</span>
           <input type="time" class="rule-end" value="${rule.end_time}" style="flex:1;" ${isAllDay ? 'disabled' : ''}>
@@ -1360,21 +1426,25 @@ class App {
   bindScheduleModalEvents(s) {
     document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
 
+    // LIAS-SCH-09 Fix: Handle mode switching (Range/Specific/Calendar)
     document.querySelectorAll('.day-mode-select').forEach(sel => {
       sel.addEventListener('change', (e) => {
         const row = e.target.closest('.rule-row');
-        const isRange = e.target.value === 'range';
-        row.querySelector('.day-range-picker').style.display = isRange ? 'flex' : 'none';
-        row.querySelector('.specific-days-picker').style.display = isRange ? 'none' : 'flex';
+        const mode = e.target.value;
+        row.querySelector('.day-range-picker').style.display = mode === 'range' ? 'flex' : 'none';
+        row.querySelector('.specific-days-picker').style.display = mode === 'specific' ? 'flex' : 'none';
+        row.querySelector('.calendar-picker').style.display = mode === 'calendar' ? 'flex' : 'none';
       });
+      // Trigger initial state if dates exist
+      const row = sel.closest('.rule-row');
+      if (row.querySelector('.rule-start-date').value) {
+        sel.value = 'calendar';
+        sel.dispatchEvent(new Event('change'));
+      }
     });
 
-    document.querySelectorAll('.day-chip').forEach(chip => {
-      chip.addEventListener('click', (e) => {
-        e.currentTarget.classList.toggle('selected');
-      });
-    });
-
+    document.querySelectorAll('.day-chip').forEach(chip => chip.addEventListener('click', (e) => e.currentTarget.classList.toggle('selected')));
+    
     document.querySelectorAll('.rule-start, .rule-end').forEach(input => {
       input.addEventListener('change', () => {
         const row = input.closest('.rule-row');
@@ -1382,9 +1452,7 @@ class App {
         const end = row.querySelector('.rule-end').value;
         const container = row.querySelector('.overnight-container');
         const allDayChk = row.querySelector('.rule-all-day');
-
         if (allDayChk && allDayChk.checked) return;
-
         if (start && end && end <= start) {
           container.innerHTML = `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${this.formatTimeTo12hr(end)} the FOLLOWING day</div>`;
         } else {
@@ -1399,17 +1467,10 @@ class App {
         const startInput = row.querySelector('.rule-start');
         const endInput = row.querySelector('.rule-end');
         const overnightContainer = row.querySelector('.overnight-container');
-        
         if (e.target.checked) {
-          startInput.value = '00:00';
-          endInput.value = '23:59';
-          startInput.disabled = true;
-          endInput.disabled = true;
-          overnightContainer.innerHTML = '';
-        } else {
-          startInput.disabled = false;
-          endInput.disabled = false;
-        }
+          startInput.value = '00:00'; endInput.value = '23:59';
+          startInput.disabled = true; endInput.disabled = true; overnightContainer.innerHTML = '';
+        } else { startInput.disabled = false; endInput.disabled = false; }
       });
     });
 
@@ -1429,57 +1490,41 @@ class App {
       });
     }
 
-    document.querySelectorAll('.btn-remove-rule').forEach(btn => {
-      btn.addEventListener('click', (e) => {
-        const row = e.currentTarget.closest('.rule-row');
-        row.remove();
-      });
-    });
-
+    document.querySelectorAll('.btn-remove-rule').forEach(btn => btn.addEventListener('click', (e) => e.currentTarget.closest('.rule-row').remove()));
+    
     document.getElementById('modal-save-sched').addEventListener('click', async () => {
       const name = document.getElementById('sched-name').value.trim();
-      if (!name) {
-        this.showToast('Schedule name is required', 'danger');
-        return;
-      }
-
+      if (!name) { this.showToast('Schedule name is required', 'danger'); return; }
       const mode = document.getElementById('sched-mode').value;
       const timezone = document.getElementById('sched-tz').value;
-
       const rules = [];
       document.querySelectorAll('.rule-row').forEach(row => {
         const start = row.querySelector('.rule-start').value;
         const end = row.querySelector('.rule-end').value;
         const action = row.querySelector('.rule-action').value;
-        const mode = row.querySelector('.day-mode-select').value;
-
+        const modeSelect = row.querySelector('.day-mode-select').value;
+        
         let days = [];
-        if (mode === 'range') {
-          const fromDay = row.querySelector('.range-from').value;
-          const toDay = row.querySelector('.range-to').value;
-          days = expandDayRange(fromDay, toDay);
+        let startDate = '';
+        let endDate = '';
+
+        if (modeSelect === 'calendar') {
+            startDate = row.querySelector('.rule-start-date').value;
+            endDate = row.querySelector('.rule-end-date').value;
+            days = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']; // Dummy days to pass validation
+        } else if (modeSelect === 'range') {
+            days = expandDayRange(row.querySelector('.range-from').value, row.querySelector('.range-to').value);
         } else {
-          days = Array.from(row.querySelectorAll('.day-chip.selected')).map(c => c.dataset.day);
+            days = Array.from(row.querySelectorAll('.day-chip.selected')).map(c => c.dataset.day);
         }
 
-        if (start && end && days.length > 0) {
-          rules.push({ days, start_time: start, end_time: end, action });
+        if (start && end && (days.length > 0 || (startDate && endDate))) {
+            rules.push({ days, start_time: start, end_time: end, action, start_date: startDate, end_date: endDate });
         }
       });
-
-      s.name = name;
-      s.mode = mode;
-      s.timezone = timezone;
-      s.rules = rules;
-
-      try {
-        await API.saveSchedule(s);
-        this.showToast('Schedule saved successfully');
-        this.closeModal();
-        this.loadData();
-      } catch (err) {
-        this.showToast(`Failed to save schedule: ${err.message}`, 'danger');
-      }
+      s.name = name; s.mode = mode; s.timezone = timezone; s.rules = rules;
+      try { await API.saveSchedule(s); this.showToast('Schedule saved successfully'); this.closeModal(); this.loadData(); }
+      catch (err) { this.showToast(`Failed to save schedule: ${err.message}`, 'danger'); }
     });
   }
 
