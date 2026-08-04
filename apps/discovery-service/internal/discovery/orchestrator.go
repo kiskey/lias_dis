@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/orchestrator.go
-// Version: 1.9
+// Version: 2.1
 package discovery
 
 import (
@@ -61,15 +61,12 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
         return
     }
 
-    // 1. Cooldown Check (Applies to both forced and passive, but forced bypasses if needed)
     if !force {
         if lastAttempt, found := o.lastAttemptMap.Load(pdid); found {
             if time.Since(lastAttempt.(time.Time)) < enrichmentCooldown {
-                // 2. Skip Gate: If fully enriched AND within cooldown, skip entirely.
                 if dev.Vendor != "" && dev.DeviceType != "" && dev.FriendlyName != "" {
                     return
                 }
-                // If NOT fully enriched, but within cooldown, we still skip to prevent spamming.
                 return
             }
         }
@@ -155,19 +152,41 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
 }
 
 // isGenericHostname checks if a hostname looks like a default MAC-based or DHCP ID string.
+// Fix: Enhanced strict validation for MAC addresses, asterisks, and numeric strings.
 func isGenericHostname(host string) bool {
-    h := strings.ToLower(host)
-    if h == "" { return true }
+    h := strings.ToLower(strings.TrimSpace(host))
+    if h == "" || h == "*" { return true } // DHCP missing hostname
     if strings.HasPrefix(h, "android-") { return true }
     if strings.HasPrefix(h, "iphone") || strings.HasPrefix(h, "ipad") { return true }
     if strings.HasPrefix(h, "desktop-") || strings.HasPrefix(h, "localhost") { return true }
     if strings.Contains(h, "unknown") { return true }
-    if len(h) == 12 && strings.Count(h, "-") == 0 { return true }
+    
+    // Strict Hex MAC address check (12 chars, 0-9 a-f)
+    if len(h) == 12 {
+        isHex := true
+        for _, c := range h {
+            if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+                isHex = false
+                break
+            }
+        }
+        if isHex { return true }
+    }
+    
+    // Check if it's purely numeric (some IoT devices use IDs)
+    isNumeric := true
+    for _, c := range h {
+        if !(c >= '0' && c <= '9') {
+            isNumeric = false
+            break
+        }
+    }
+    if isNumeric { return true }
+    
     return false
 }
 
 // applyEnrichment strictly applies only material changes.
-// Fix: Returns true ONLY if a field actually mutated to a new value.
 func applyEnrichment(dev *models.Device, enr *models.Enrichment) bool {
     if dev == nil || enr == nil {
         return false
@@ -181,13 +200,20 @@ func applyEnrichment(dev *models.Device, enr *models.Enrichment) bool {
         changed = true
     }
 
-    // Hostname: Update if empty, generic, or if enrichment provides a strictly better confidence
+    // Hostname: Update if empty, OR if current is generic AND new is NOT generic, OR strictly better confidence
     if enr.Hostname != "" {
-        if dev.Hostname == "" || isGenericHostname(dev.Hostname) || enr.Confidence > dev.Confidence {
-            if dev.Hostname != enr.Hostname {
-                dev.Hostname = enr.Hostname
-                changed = true
-            }
+        shouldUpdate := false
+        if dev.Hostname == "" {
+            shouldUpdate = true
+        } else if isGenericHostname(dev.Hostname) && !isGenericHostname(enr.Hostname) {
+            shouldUpdate = true
+        } else if enr.Confidence > dev.Confidence {
+            shouldUpdate = true
+        }
+
+        if shouldUpdate && dev.Hostname != enr.Hostname {
+            dev.Hostname = enr.Hostname
+            changed = true
         }
     }
 
