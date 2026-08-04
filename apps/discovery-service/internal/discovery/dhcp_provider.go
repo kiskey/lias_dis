@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/dhcp_provider.go
-// Version: 1.4
+// Version: 1.5 (Fixed SSH Security and DHCP Option 55 Parsing)
 package discovery
 
 import (
@@ -16,13 +16,13 @@ import (
     "net/http"
     "os"
     "os/exec"
+    "strconv"
     "strings"
     "time"
 
     "github.com/user/lias-dis/apps/discovery-service/internal/config"
 )
 
-// DHCPProvider reads DHCP lease files to map hostnames and MACs to IPs.
 type DHCPProvider struct {
     cfg    config.DHCPConfig
     ctx    context.Context
@@ -90,7 +90,8 @@ func (p *DHCPProvider) poll() {
         }
         
         target := fmt.Sprintf("%s@%s", user, p.cfg.SSHHost)
-        cmd := exec.CommandContext(p.ctx, "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", target, "cat /tmp/dhcp.leases")
+        // NET-07 Fix: Use accept-new instead of no to prevent MITM while allowing first-use
+        cmd := exec.CommandContext(p.ctx, "ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=5", target, "cat /tmp/dhcp.leases")
         
         var stdout bytes.Buffer
         cmd.Stdout = &stdout
@@ -133,7 +134,6 @@ func (p *DHCPProvider) poll() {
     scanner := bufio.NewScanner(reader)
     for scanner.Scan() {
         line := scanner.Text()
-        // Format: <expiry> <mac> <ip> <hostname> <client_id> [<option_55_hex>]
         parts := strings.Fields(line)
         if len(parts) < 4 {
             continue
@@ -166,7 +166,6 @@ func (p *DHCPProvider) poll() {
             Raw:        make(map[string]interface{}),
         }
 
-        // DIS-PROV-11 Fix: DHCP Option 55 Fingerprinting
         if len(parts) > 5 {
             opt55 := parts[5]
             obs.Raw["dhcp_option_55"] = opt55
@@ -176,7 +175,6 @@ func (p *DHCPProvider) poll() {
                 obs.Confidence = 0.70
             }
         } else if len(parts) > 4 {
-            // Some routers store client_id instead of option 55
             obs.Raw["client_id"] = parts[4]
         }
         
@@ -188,25 +186,35 @@ func (p *DHCPProvider) poll() {
     }
 }
 
-// fingerprintOSFromDHCP provides passive OS identification based on DHCP Parameter Request List (Option 55).
-// Reference: https://docs.microsoft.com/en-us/windows-server/troubleshoot/dynamic-host-configuration-protocol-basics
+// ENR-07 Fix: Parse DHCP Option 55 as decimal byte list
 func fingerprintOSFromDHCP(opt55 string) string {
-    opt55Lower := strings.ToLower(opt55)
-    
+    bytesStr := strings.Split(opt55, ",")
+    set := make(map[byte]bool)
+    for _, b := range bytesStr {
+        n, err := strconv.Atoi(strings.TrimSpace(b))
+        if err == nil {
+            set[byte(n)] = true
+        }
+    }
+
     // Typical Windows request: 1,15,3,6,44,46,47,31,33,121,249
-    if strings.Contains(opt55Lower, "1f") && strings.Contains(opt55Lower, "21") && strings.Contains(opt55Lower, "2c") {
+    // 31=Perform Router Discovery, 33=Static Route, 44=NetBIOS over TCP/IP Name Server
+    if set[31] && set[33] && set[44] {
         return "Windows"
     }
     // Typical macOS / iOS request: 1,121,3,6,15,119,252,95,44
-    if strings.Contains(opt55Lower, "77") && strings.Contains(opt55Lower, "fc") && strings.Contains(opt55Lower, "5f") {
+    // 119=Domain Search, 252=Web Proxy Auto-Discovery, 95=LDAP
+    if set[119] && set[252] && set[95] {
         return "Apple macOS/iOS"
     }
     // Typical Android request: 1,33,3,6,15,28,51,58,59
-    if strings.Contains(opt55Lower, "21") && strings.Contains(opt55Lower, "1c") && !strings.Contains(opt55Lower, "2c") {
+    // 28=Broadcast Address, 51=IP Address Lease Time
+    if set[28] && set[51] && !set[44] {
         return "Android"
     }
     // Typical Linux (dhclient): 1,28,2,5,3,6,12,15,119
-    if strings.Contains(opt55Lower, "01") && strings.Contains(opt55Lower, "1c") && strings.Contains(opt55Lower, "06") && !strings.Contains(opt55Lower, "77") {
+    // 2=Time Offset, 5=Name Server
+    if set[1] && set[28] && set[2] && set[5] && !set[119] {
         return "Linux"
     }
 
