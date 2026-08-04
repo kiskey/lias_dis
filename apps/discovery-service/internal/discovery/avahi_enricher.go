@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/avahi_enricher.go
-// Version: 1.2
+// Version: 1.3 (Persistent mDNS Listener)
 package discovery
 
 import (
@@ -12,33 +12,40 @@ import (
     "log/slog"
     "os/exec"
     "strings"
+    "sync"
     "time"
 
     "github.com/user/lias-dis/shared/models"
 )
 
-// AvahiEnricher uses system `avahi-browse` to discover mDNS services
-// and resolve friendly device names.
 type AvahiEnricher struct {
-    ctx    context.Context
-    cancel context.CancelFunc
+    ctx     context.Context
+    cancel  context.CancelFunc
+    mu      sync.RWMutex
+    records map[string][]avahiRecord // Key: IP or Hostname
 }
 
-// NewAvahiEnricher initializes the Avahi enricher.
+type avahiRecord struct {
+    FriendlyName string
+    Hostname     string
+    ServiceType  string
+    IP           string
+}
+
 func NewAvahiEnricher() *AvahiEnricher {
-    return &AvahiEnricher{}
+    return &AvahiEnricher{
+        records: make(map[string][]avahiRecord),
+    }
 }
 
-// Name returns the provider's identifier.
 func (e *AvahiEnricher) Name() string { return "avahi" }
 
-// Start satisfies the Provider interface.
 func (e *AvahiEnricher) Start(ctx context.Context) error {
     e.ctx, e.cancel = context.WithCancel(ctx)
+    go e.runPersistentListener()
     return nil
 }
 
-// Stop satisfies the Provider interface.
 func (e *AvahiEnricher) Stop() error {
     if e.cancel != nil {
         e.cancel()
@@ -46,85 +53,108 @@ func (e *AvahiEnricher) Stop() error {
     return nil
 }
 
-// Enrich executes avahi-browse and parses mDNS records matching the target device.
-// DIS-ENR-04 Fix: Relaxed matching logic to catch records even if IP or Hostname is slightly misaligned.
+// ENR-05 Fix: Run a persistent avahi-browse in the background to avoid spawning a process per enrichment
+func (e *AvahiEnricher) runPersistentListener() {
+    for {
+        select {
+        case <-e.ctx.Done():
+            return
+        default:
+        }
+
+        // -a: all services, -r: resolve, -p: parse-friendly, -k: keep alive
+        cmd := exec.CommandContext(e.ctx, "avahi-browse", "-a", "-r", "-p", "-k")
+        stdout, err := cmd.StdoutPipe()
+        if err != nil {
+            slog.Debug("Failed to create pipe for avahi-browse", "error", err)
+            time.Sleep(30 * time.Second)
+            continue
+        }
+
+        if err := cmd.Start(); err != nil {
+            slog.Debug("Avahi-browse execution skipped (avahi-tools not installed?)", "error", err)
+            time.Sleep(30 * time.Second)
+            continue
+        }
+
+        scanner := bufio.NewScanner(stdout)
+        for scanner.Scan() {
+            line := scanner.Text()
+            parts := strings.Split(line, ";")
+            if len(parts) < 9 || parts[0] != "=" {
+                continue
+            }
+
+            rec := avahiRecord{
+                FriendlyName: parts[3],
+                ServiceType:  parts[4],
+                Hostname:     normalizeDomain(parts[6]),
+                IP:           parts[7],
+            }
+
+            e.mu.Lock()
+            if rec.IP != "" {
+                e.records[rec.IP] = append(e.records[rec.IP], rec)
+            }
+            if rec.Hostname != "" {
+                e.records[rec.Hostname] = append(e.records[rec.Hostname], rec)
+            }
+            e.mu.Unlock()
+        }
+
+        _ = cmd.Wait()
+        
+        // If the context is done, exit. Otherwise, wait and retry.
+        select {
+        case <-e.ctx.Done():
+            return
+        case <-time.After(5 * time.Second):
+        }
+    }
+}
+
 func (e *AvahiEnricher) Enrich(ctx context.Context, d *models.Device) (*models.Enrichment, error) {
     if d == nil || (d.CurrentIP == "" && d.Hostname == "") {
         return nil, fmt.Errorf("cannot enrich without IP or Hostname")
     }
 
-    timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second) // Increased timeout
-    defer cancel()
+    targetHostNormalized := normalizeDomain(d.Hostname)
+    targetIPStr := d.CurrentIP
 
-    // -a: all services, -r: resolve, -p: parse-friendly, -t: terminate
-    cmd := exec.CommandContext(timeoutCtx, "avahi-browse", "-a", "-r", "-p", "-t")
-    stdout, err := cmd.StdoutPipe()
-    if err != nil {
-        return nil, fmt.Errorf("failed to create pipe: %w", err)
+    var foundRecords []avahiRecord
+
+    e.mu.RLock()
+    if targetIPStr != "" {
+        if recs, ok := e.records[targetIPStr]; ok {
+            foundRecords = append(foundRecords, recs...)
+        }
     }
+    if targetHostNormalized != "" {
+        if recs, ok := e.records[targetHostNormalized]; ok {
+            foundRecords = append(foundRecords, recs...)
+        }
+    }
+    e.mu.RUnlock()
 
-    if err := cmd.Start(); err != nil {
-        slog.Debug("Avahi-browse execution skipped (avahi-tools not installed?)", "error", err)
+    if len(foundRecords) == 0 {
         return nil, nil
     }
 
     enr := &models.Enrichment{
-        Source:     "avahi",
+        Source:     e.Name(),
         Confidence: 0.75,
         Raw:        make(map[string]interface{}),
     }
 
     var foundServices []string
-    targetHostNormalized := normalizeDomain(d.Hostname)
-    
-    // DIS-ENR-04 Fix: Check if the IP or hostname appears anywhere in the raw output line
-    // to avoid missing records due to strict structural parsing.
-    targetIPStr := d.CurrentIP
-    targetHostStr := targetHostNormalized
-
-    scanner := bufio.NewScanner(stdout)
-    for scanner.Scan() {
-        line := scanner.Text()
-        // Format: =;<interface>;<protocol>;<name>;<type>;<domain>;<hostname>;<address>;<port>;[txt]
-        parts := strings.Split(line, ";")
-        if len(parts) < 9 || parts[0] != "=" {
-            continue
+    for _, rec := range foundRecords {
+        if enr.FriendlyName == "" && rec.FriendlyName != "" {
+            enr.FriendlyName = rec.FriendlyName
         }
-
-        friendlyName := parts[3]
-        serviceType := parts[4]
-        mDnsHost := normalizeDomain(parts[6])
-        ipAddress := parts[7]
-
-        // Relaxed matching: If IP matches, OR if hostname matches, OR if the target IP is in the line, OR target host is in the line
-        matchFound := false
-        if targetIPStr != "" && ipAddress == targetIPStr {
-            matchFound = true
+        if enr.Hostname == "" && rec.Hostname != "" {
+            enr.Hostname = rec.Hostname
         }
-        if !matchFound && targetHostStr != "" && mDnsHost != "" && (targetHostStr == mDnsHost || strings.Contains(mDnsHost, targetHostStr) || strings.Contains(targetHostStr, mDnsHost)) {
-            matchFound = true
-        }
-        if !matchFound && targetIPStr != "" && strings.Contains(line, targetIPStr) {
-            matchFound = true
-        }
-
-        if matchFound {
-            // DIS-ENR-01 Fix: Prefer the mDNS service instance name as FriendlyName
-            if enr.FriendlyName == "" && friendlyName != "" {
-                enr.FriendlyName = friendlyName
-            }
-            if enr.Hostname == "" && parts[6] != "" {
-                enr.Hostname = parts[6]
-            }
-
-            foundServices = append(foundServices, serviceType)
-        }
-    }
-
-    _ = cmd.Wait()
-
-    if len(foundServices) == 0 && enr.FriendlyName == "" {
-        return nil, nil
+        foundServices = append(foundServices, rec.ServiceType)
     }
 
     enr.Services = foundServices
@@ -133,7 +163,6 @@ func (e *AvahiEnricher) Enrich(ctx context.Context, d *models.Device) (*models.E
     return enr, nil
 }
 
-// normalizeDomain strips .local suffixes and converts domains to lowercase for reliable comparisons.
 func normalizeDomain(domain string) string {
     d := strings.ToLower(strings.TrimSpace(domain))
     d = strings.TrimSuffix(d, ".")
@@ -141,36 +170,25 @@ func normalizeDomain(domain string) string {
     return d
 }
 
-// ClassifyDeviceFromMDNSServices infers device types based on mDNS service signatures.
 func ClassifyDeviceFromMDNSServices(services []string) string {
     for _, s := range services {
         svc := strings.ToLower(s)
 
-        // Printers & Scanners
         if strings.Contains(svc, "_ipp") || strings.Contains(svc, "_printer") || strings.Contains(svc, "_pdl-datastream") {
             return "printer"
         }
-
-        // Smart TVs & Media Streamers
         if strings.Contains(svc, "_airplay") || strings.Contains(svc, "_googlecast") || strings.Contains(svc, "_raop") {
             return "tv"
         }
-
-        // Smart Home & IoT Protocols
         if strings.Contains(svc, "_hap") || strings.Contains(svc, "_homekit") || strings.Contains(svc, "_matter") {
             return "iot"
         }
-
-        // Audio Hardware
         if strings.Contains(svc, "_sonos") || strings.Contains(svc, "_spotify-connect") || strings.Contains(svc, "_soundtouch") {
             return "audio"
         }
-
-        // Network Storage / Servers
         if strings.Contains(svc, "_smb") || strings.Contains(svc, "_afpovertcp") || strings.Contains(svc, "_nfs") {
             return "server"
         }
     }
-
     return ""
 }
