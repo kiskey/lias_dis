@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/cache.go
-// Version: 1.9
+// Version: 2.0
 package sync
 
 import (
@@ -21,10 +21,10 @@ type LocalDevice struct {
 }
 
 type Cache struct {
-    mu         sync.Mutex // Mutex protecting all read/write map operations
+    mu         sync.Mutex
     devices    map[string]*LocalDevice
-    stickyTags map[string]string // PDID -> TagID
-    stickyMACs map[string]string // MAC -> TagID
+    stickyTags map[string]string
+    stickyMACs map[string]string
 }
 
 func NewCache() *Cache {
@@ -35,7 +35,6 @@ func NewCache() *Cache {
     }
 }
 
-// LoadStickyTags populates the in-memory sticky tag mappings from SQLite storage on startup.
 func (c *Cache) LoadStickyTags(pdidTags, macTags map[string]string) {
     c.mu.Lock()
     defer c.mu.Unlock()
@@ -55,26 +54,22 @@ func (c *Cache) LoadStickyTags(pdidTags, macTags map[string]string) {
     }
 }
 
-// applyStickyTagLocked MUST be called while holding c.mu.Lock().
 func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
     assignedTag := "generic"
 
-    // 1. Direct PDID match
     if tag, found := c.stickyTags[d.PDID]; found && tag != "" {
         assignedTag = tag
     } else {
-        // 2. Multi-MAC fallback: Check ALL accumulated MAC addresses on the device record
         for _, mac := range d.MACs {
             cleanMAC := strings.ToLower(strings.TrimSpace(mac))
             if macTag, found := c.stickyMACs[cleanMAC]; found && macTag != "" {
                 assignedTag = macTag
-                c.stickyTags[d.PDID] = assignedTag // Auto-repair stickyTags map for current PDID
+                c.stickyTags[d.PDID] = assignedTag
                 break
             }
         }
     }
 
-    // 3. Fallback to DIS or existing tag
     if assignedTag == "generic" {
         if len(d.Tags) > 0 && d.Tags[0] != "" {
             assignedTag = d.Tags[0]
@@ -86,7 +81,6 @@ func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
     d.Tags = []string{assignedTag}
     d.Device.Tags = []string{assignedTag}
 
-    // 4. Backfill stickyMACs for all known MAC addresses (including rotated Private MACs)
     if assignedTag != "generic" {
         for _, mac := range d.MACs {
             cleanMAC := strings.ToLower(strings.TrimSpace(mac))
@@ -97,21 +91,15 @@ func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
     }
 }
 
-// MigrateDeviceIdentity migrates sticky tags and removes the old PDID record during a promotion event (GAP-L02).
 func (c *Cache) MigrateDeviceIdentity(oldPDID, newPDID string, migratedMACs []string) {
     c.mu.Lock()
     defer c.mu.Unlock()
 
-    // 1. Migrate sticky tag from old PDID to new PDID
     if tag, found := c.stickyTags[oldPDID]; found {
         c.stickyTags[newPDID] = tag
         delete(c.stickyTags, oldPDID)
     }
 
-    // 2. Ensure MAC-based sticky tags are preserved
-    // (stickyMACs already keyed by MAC, not PDID, so no migration needed)
-
-    // 3. Remove old device entry
     delete(c.devices, oldPDID)
 }
 
@@ -145,6 +133,18 @@ func (c *Cache) List() []LocalDevice {
             ptr.Device.Tags = devCopy.Device.Tags
         }
         list = append(list, devCopy)
+    }
+    return list
+}
+
+// ListPDIDs returns a slice of all PDIDs currently in the cache.
+func (c *Cache) ListPDIDs() []string {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    list := make([]string, 0, len(c.devices))
+    for pdid := range c.devices {
+        list = append(list, pdid)
     }
     return list
 }
