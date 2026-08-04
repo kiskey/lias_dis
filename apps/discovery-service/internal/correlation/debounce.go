@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/debounce.go
-// Version: 2.6 (Fixed typo in confirmedRecords)
+// Version: 2.7 (Added MigratePDID)
 package correlation
 
 import (
@@ -192,6 +192,22 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
         p.Confirmations = len(p.SourceGroups)
     } else {
         p.Confirmations = len(p.Sources)
+    }
+}
+
+// Critical 3 Fix: MigratePDID updates the keys and PDID fields of pending events
+// when a device is promoted to a new identity tier.
+func (d *Debouncer) MigratePDID(oldPDID, newPDID string) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+
+    for key, p := range d.pending {
+        if p.PDID == oldPDID {
+            newKey := newPDID + ":" + string(p.EventType)
+            p.PDID = newPDID
+            d.pending[newKey] = p
+            delete(d.pending, key)
+        }
     }
 }
 
