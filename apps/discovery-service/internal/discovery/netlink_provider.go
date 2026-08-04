@@ -2,13 +2,15 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 2.2
+// Version: 2.3 (Interface Hotplug, Bounded Probes, Kernel Tuning Check)
 package discovery
 
 import (
     "context"
+    "fmt"
     "log/slog"
     "net"
+    "os"
     "sync"
     "time"
 
@@ -25,13 +27,15 @@ type NetlinkProvider struct {
     iface     string
     targetIdx int
     mu        sync.RWMutex
+    probeSem  chan struct{} // NET-09 Fix: Bounded worker pool
 }
 
 func NewNetlinkProvider(iface string) *NetlinkProvider {
     return &NetlinkProvider{
-        events: make(chan Observation, 256),
-        done:   make(chan struct{}),
-        iface:  iface,
+        events:   make(chan Observation, 256),
+        done:     make(chan struct{}),
+        iface:    iface,
+        probeSem: make(chan struct{}, 10), // Limit to 10 concurrent probes
     }
 }
 
@@ -40,16 +44,8 @@ func (p *NetlinkProvider) Name() string { return "netlink" }
 func (p *NetlinkProvider) Start(ctx context.Context) error {
     p.ctx, p.cancel = context.WithCancel(ctx)
 
-    if p.iface != "" {
-        link, err := netlink.LinkByName(p.iface)
-        if err != nil {
-            slog.Warn("Target interface not found immediately", "iface", p.iface, "error", err)
-            p.targetIdx = 0
-        } else {
-            p.targetIdx = link.Attrs().Index
-            slog.Info("Netlink provider bound to interface", "iface", p.iface, "index", p.targetIdx)
-        }
-    }
+    p.resolveInterface()
+    p.checkGcStaleTime() // LNX-05 Fix
 
     go p.runSubscriptionLoop()
     go p.monitorStaleNeighbors()
@@ -57,16 +53,72 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
     return nil
 }
 
-// runSubscriptionLoop robustly maintains the netlink subscription.
-// If the netlink socket dies (kernel error, resource exhaustion), it reconnects.
+func (p *NetlinkProvider) resolveInterface() {
+    if p.iface == "" {
+        return
+    }
+    link, err := netlink.LinkByName(p.iface)
+    if err != nil {
+        slog.Warn("Target interface not found, will retry", "iface", p.iface, "error", err)
+        p.mu.Lock()
+        p.targetIdx = 0
+        p.mu.Unlock()
+        return
+    }
+    p.mu.Lock()
+    p.targetIdx = link.Attrs().Index
+    p.mu.Unlock()
+    slog.Info("Netlink provider bound to interface", "iface", p.iface, "index", link.Attrs().Index)
+}
+
+func (p *NetlinkProvider) checkGcStaleTime() {
+    if p.iface == "" {
+        return
+    }
+    // LNX-05 Fix: Read /proc/sys/net/ipv4/neigh/<iface>/gc_stale_time
+    path := "/proc/sys/net/ipv4/neigh/" + p.iface + "/gc_stale_time"
+    data, err := os.ReadFile(path)
+    if err == nil {
+        var val int
+        _, err := fmt.Sscanf(string(data), "%d", &val)
+        if err == nil && val < 180 {
+            slog.Warn("Kernel neighbor gc_stale_time is lower than DIS staleThreshold (180s). Devices may flap between online/offline.",
+                "iface", p.iface, "gc_stale_time", val, "path", path)
+        }
+    }
+}
+
 func (p *NetlinkProvider) runSubscriptionLoop() {
     defer close(p.done)
+
+    // NET-06 Fix: Retry loop for interface resolution
+    ifaceRetry := time.NewTicker(30 * time.Second)
+    defer ifaceRetry.Stop()
 
     for {
         select {
         case <-p.ctx.Done():
             return
+        case <-ifaceRetry.C:
+            p.mu.RLock()
+            idx := p.targetIdx
+            p.mu.RUnlock()
+            if idx == 0 {
+                p.resolveInterface()
+            }
         default:
+        }
+
+        p.mu.RLock()
+        idx := p.targetIdx
+        p.mu.RUnlock()
+        if idx == 0 {
+            select {
+            case <-p.ctx.Done():
+                return
+            case <-time.After(5 * time.Second):
+                continue
+            }
         }
 
         ch := make(chan netlink.NeighUpdate)
@@ -115,7 +167,6 @@ func (p *NetlinkProvider) runSubscriptionLoop() {
     }
 }
 
-// monitorStaleNeighbors periodically audits kernel neighbor states for both IPv4 and IPv6.
 func (p *NetlinkProvider) monitorStaleNeighbors() {
     ticker := time.NewTicker(20 * time.Second)
     defer ticker.Stop()
@@ -131,11 +182,17 @@ func (p *NetlinkProvider) monitorStaleNeighbors() {
 }
 
 func (p *NetlinkProvider) auditKernelNeighbors() {
-    // DIS-PROV-16 Fix: Audit both IPv4 and IPv6 neighbor tables
+    p.mu.RLock()
+    idx := p.targetIdx
+    p.mu.RUnlock()
+    if idx == 0 {
+        return
+    }
+
     families := []int{netlink.FAMILY_V4, netlink.FAMILY_V6}
 
     for _, fam := range families {
-        neighs, err := netlink.NeighList(p.targetIdx, fam)
+        neighs, err := netlink.NeighList(idx, fam)
         if err != nil {
             continue
         }
@@ -166,13 +223,21 @@ func (p *NetlinkProvider) auditKernelNeighbors() {
             }
 
             if (n.State & (unix.NUD_STALE | unix.NUD_DELAY)) != 0 && n.IP != nil {
-                go p.probeNeighborIP(n.IP)
+                // NET-09 Fix: Use bounded worker pool for probing
+                select {
+                case p.probeSem <- struct{}{}:
+                    go func(ip net.IP) {
+                        defer func() { <-p.probeSem }()
+                        p.probeNeighborIP(ip)
+                    }(n.IP)
+                default:
+                    // Pool full, skip probe to prevent goroutine explosion
+                }
             }
         }
     }
 }
 
-// probeNeighborIP transmits an active L2 probe packet to force kernel ARP state resolution.
 func (p *NetlinkProvider) probeNeighborIP(ip net.IP) {
     addr := net.JoinHostPort(ip.String(), "80")
     conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
@@ -184,7 +249,11 @@ func (p *NetlinkProvider) probeNeighborIP(ip net.IP) {
 func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
     n := update.Neigh
 
-    if p.targetIdx > 0 && n.LinkIndex != p.targetIdx {
+    p.mu.RLock()
+    idx := p.targetIdx
+    p.mu.RUnlock()
+
+    if idx > 0 && n.LinkIndex != idx {
         return
     }
 
