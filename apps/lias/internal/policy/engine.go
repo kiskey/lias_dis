@@ -1,7 +1,7 @@
 // Package policy implements the rule evaluation engine for LIAS.
 //
 // File:    apps/lias/internal/policy/engine.go
-// Version: 2.2
+// Version: 2.3
 package policy
 
 import (
@@ -10,17 +10,6 @@ import (
     liasSync "github.com/user/lias-dis/apps/lias/internal/sync"
     "github.com/user/lias-dis/shared/models"
 )
-
-// Policy Precedence Chain (Enhancement 4.0 §12):
-// 1. Infrastructure Immunity — always Allow, cannot be overridden
-// 2a. Global Kill-Switch (Block) — overrides all non-infra policies
-// 2b. Global Allow Override — overrides all non-infra policies (P5/P7)
-// 3. Device-Specific Policy — highest priority non-global policy
-// 4. Tag-Group Policy — per-tag policies (fail-closed OR for multiple tags)
-// 5. Global Schedule Fallback — when global is Schedule, evaluate global bundle
-//
-// Key invariant: Global Allow/Block always overrides tag/device schedules.
-// Global Schedule defers to per-tag schedules for each tagged group.
 
 type PolicyEvaluator interface {
     EvaluateAction(d *liasSync.LocalDevice, sched ScheduleEvaluator) models.Action
@@ -36,7 +25,6 @@ type Engine struct {
     policies map[string]models.Policy
 }
 
-// NewEngine initializes policy engine with 'global_default' defaulted to ActionSchedule.
 func NewEngine() *Engine {
     return &Engine{
         policies: map[string]models.Policy{
@@ -105,7 +93,7 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
         }
     }
 
-    // 2b. GLOBAL ALLOW OVERRIDE (GAP-L01)
+    // 2b. GLOBAL ALLOW OVERRIDE
     if hasGlobal && globalPol.Action == models.ActionAllow {
         return models.Policy{
             ID:     "global_allow_override",
@@ -130,23 +118,19 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
     }
 
     // 4. TAG-GROUP POLICIES
-    var tagPolicies []models.Policy
+    var bestTagPol *models.Policy
     for _, tagID := range d.Tags {
         for _, p := range e.policies {
             if p.Type == models.PolicyTypeTag && p.TargetID == tagID {
-                tagPolicies = append(tagPolicies, p)
+                if bestTagPol == nil || p.Priority > bestTagPol.Priority {
+                    pCopy := p
+                    bestTagPol = &pCopy
+                }
             }
         }
     }
-
-    if len(tagPolicies) > 0 {
-        bestTagPol := tagPolicies[0]
-        for _, p := range tagPolicies {
-            if p.Priority > bestTagPol.Priority {
-                bestTagPol = p
-            }
-        }
-        return bestTagPol
+    if bestTagPol != nil {
+        return *bestTagPol
     }
 
     // 5. GLOBAL POLICY FALLBACK
@@ -183,9 +167,7 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
             return models.ActionBlock
         }
 
-        // 2b. NEW: Global Allow override (P5, P7) (GAP-L01)
-        // If global is explicitly Allow, all non-infrastructure devices are allowed
-        // regardless of their tag/device policies.
+        // 2b. Global Allow override
         if globalPol.Action == models.ActionAllow {
             return models.ActionAllow
         }
@@ -208,28 +190,24 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
         return bestDevPolicy.Action
     }
 
-    // 4. Evaluate Tag-Group Policies
-    var tagActions []models.Action
+    // 4. Evaluate Tag-Group Policies (GAP-L-H01 Fix: Priority-based selection aligned with GetEffectivePolicy)
+    var bestTagPolicy *models.Policy
     for _, tagID := range d.Tags {
         for _, p := range e.policies {
             if p.Type == models.PolicyTypeTag && p.TargetID == tagID {
-                act := p.Action
-                if act == models.ActionSchedule && schedEval != nil {
-                    act = schedEval.EvaluateBundle(p.GetScheduleIDs())
+                if bestTagPolicy == nil || p.Priority > bestTagPolicy.Priority {
+                    pCopy := p
+                    bestTagPolicy = &pCopy
                 }
-                tagActions = append(tagActions, act)
             }
         }
     }
 
-    // Fail-Closed Rule for multiple tag policies: If ANY attached policy resolves to BLOCK, drop traffic.
-    if len(tagActions) > 0 {
-        for _, act := range tagActions {
-            if act == models.ActionBlock {
-                return models.ActionBlock
-            }
+    if bestTagPolicy != nil {
+        if bestTagPolicy.Action == models.ActionSchedule && schedEval != nil {
+            return schedEval.EvaluateBundle(bestTagPolicy.GetScheduleIDs())
         }
-        return models.ActionAllow
+        return bestTagPolicy.Action
     }
 
     // 5. Fallback to Global Default Policy
