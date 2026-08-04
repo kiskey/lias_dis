@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 2.3 (Interface Hotplug, Bounded Probes, Kernel Tuning Check)
+// Version: 2.4 (Audited and Verified)
 package discovery
 
 import (
@@ -75,7 +75,6 @@ func (p *NetlinkProvider) checkGcStaleTime() {
     if p.iface == "" {
         return
     }
-    // LNX-05 Fix: Read /proc/sys/net/ipv4/neigh/<iface>/gc_stale_time
     path := "/proc/sys/net/ipv4/neigh/" + p.iface + "/gc_stale_time"
     data, err := os.ReadFile(path)
     if err == nil {
@@ -91,7 +90,6 @@ func (p *NetlinkProvider) checkGcStaleTime() {
 func (p *NetlinkProvider) runSubscriptionLoop() {
     defer close(p.done)
 
-    // NET-06 Fix: Retry loop for interface resolution
     ifaceRetry := time.NewTicker(30 * time.Second)
     defer ifaceRetry.Stop()
 
@@ -223,7 +221,6 @@ func (p *NetlinkProvider) auditKernelNeighbors() {
             }
 
             if (n.State & (unix.NUD_STALE | unix.NUD_DELAY)) != 0 && n.IP != nil {
-                // NET-09 Fix: Use bounded worker pool for probing
                 select {
                 case p.probeSem <- struct{}{}:
                     go func(ip net.IP) {
@@ -231,7 +228,7 @@ func (p *NetlinkProvider) auditKernelNeighbors() {
                         p.probeNeighborIP(ip)
                     }(n.IP)
                 default:
-                    // Pool full, skip probe to prevent goroutine explosion
+                    // Pool full, skip probe
                 }
             }
         }
