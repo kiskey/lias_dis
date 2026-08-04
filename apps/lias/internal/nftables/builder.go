@@ -1,10 +1,11 @@
 // Package nftables implements the isolated firewall controller for LIAS.
 //
 // File:    apps/lias/internal/nftables/builder.go
-// Version: 1.9 (ResetState on Reinit)
+// Version: 2.0 (Added log/slog import)
 package nftables
 
 import (
+    "log/slog"
     "net"
     "sync"
 
@@ -153,7 +154,14 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
         b.currentBlockedIP6s = desiredBlockedIP6s
     } else {
         // If Apply failed and triggered a reinit, reset our state so the next sync repopulates everything.
-        b.ResetState()
+        // We must unlock briefly to call ResetState which acquires the lock, or just inline it.
+        b.currentAllowedIPs = make(map[string]net.IP)
+        b.currentBlockedIPs = make(map[string]net.IP)
+        b.currentAllowedMACs = make(map[string]net.HardwareAddr)
+        b.currentBlockedMACs = make(map[string]net.HardwareAddr)
+        b.currentAllowedIP6s = make(map[string]net.IP)
+        b.currentBlockedIP6s = make(map[string]net.IP)
+        slog.Info("Builder state reset due to Apply failure. Next sync will be a full repopulation.")
     }
 
     return err
