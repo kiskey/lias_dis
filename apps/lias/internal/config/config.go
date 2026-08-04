@@ -3,7 +3,7 @@
 // defined in Appendix A of the implementation specification.
 //
 // File:    apps/lias/internal/config/config.go
-// Version: 1.0
+// Version: 1.1
 package config
 
 import (
@@ -85,11 +85,11 @@ func Load(path string) (*Config, error) {
     if cfg.Nftables.TableName == "" {
         cfg.Nftables.TableName = "lancontrol"
     }
+    // GAP-L-H03 Fix: Default to "persist" to prevent fail-open during service restarts
     if cfg.Nftables.ShutdownBehavior == "" {
-        cfg.Nftables.ShutdownBehavior = "flush"
+        cfg.Nftables.ShutdownBehavior = "persist"
     }
     if cfg.Schedules.Timezone == "" {
-        // Default to UTC if not specified, or load local system time
         cfg.Schedules.Timezone = "UTC"
     }
     if cfg.Storage.Path == "" {
