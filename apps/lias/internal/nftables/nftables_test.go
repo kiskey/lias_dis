@@ -1,7 +1,7 @@
 // Package nftables provides unit tests for the LIAS nftables builder diffing logic.
 //
 // File:    apps/lias/internal/nftables/nftables_test.go
-// Version: 1.0
+// Version: 1.1
 package nftables
 
 import (
@@ -19,7 +19,11 @@ func TestDiffIPs(t *testing.T) {
         "192.168.1.12": net.ParseIP("192.168.1.12"),
     }
 
-    toAdd, toRem := diffIPs(desired, current)
+    toAdd := make([]net.IP, 0)
+    toRem := make([]net.IP, 0)
+    
+    // FIX: Updated to new pointer-based signature
+    diffIPs(desired, current, &toAdd, &toRem)
 
     if len(toAdd) != 1 || !toAdd[0].Equal(net.ParseIP("192.168.1.12")) {
         t.Errorf("Expected to add 192.168.1.12, got %v", toAdd)
@@ -35,7 +39,11 @@ func TestDiffIPsEmpty(t *testing.T) {
     }
     desired := map[string]net.IP{}
 
-    toAdd, toRem := diffIPs(desired, current)
+    toAdd := make([]net.IP, 0)
+    toRem := make([]net.IP, 0)
+    
+    // FIX: Updated to new pointer-based signature
+    diffIPs(desired, current, &toAdd, &toRem)
 
     if len(toAdd) != 0 {
         t.Errorf("Expected 0 additions, got %d", len(toAdd))
@@ -59,7 +67,11 @@ func TestDiffMACs(t *testing.T) {
         mac3.String(): mac3,
     }
 
-    toAdd, toRem := diffMACs(desired, current)
+    toAdd := make([]net.HardwareAddr, 0)
+    toRem := make([]net.HardwareAddr, 0)
+    
+    // FIX: Updated to new pointer-based signature
+    diffMACs(desired, current, &toAdd, &toRem)
 
     if len(toAdd) != 1 || !toAdd[0].String() == mac3.String() {
         t.Errorf("Expected to add %s, got %v", mac3.String(), toAdd)
