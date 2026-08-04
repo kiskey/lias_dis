@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 2.3 (PRAGMA DSN, WAL Checkpoint, Flow Logs Retention)
+// Version: 2.4 (Added missing sync import)
 package storage
 
 import (
@@ -36,7 +36,6 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, fmt.Errorf("failed to create database directory: %w", err)
     }
 
-    // IO-06 Fix: Apply PRAGMAs via DSN to ensure all pool connections use WAL and NORMAL synchronous mode
     dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=journal_mode(WAL)", dbPath)
     db, err := sql.Open("sqlite", dsn)
     if err != nil {
@@ -53,12 +52,10 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, err
     }
 
-    // LNX-06 Fix: WAL checkpoint on startup to recover from crashes and prevent -wal file bloat
     if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
         slog.Warn("Failed to truncate WAL on startup", "error", err)
     }
 
-    // IO-07 Fix: Start flow logs retention loop
     go s.flowLogsRetentionLoop()
 
     slog.Info("SQLite storage engine initialized", "path", dbPath)
