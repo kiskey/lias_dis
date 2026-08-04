@@ -1,7 +1,7 @@
 // Binary discovery-service implements the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 2.2
+// Version: 2.3
 package main
 
 import (
@@ -134,14 +134,14 @@ func main() {
     orch := discovery.NewOrchestrator(cache, broker, primaries, fallback)
     eng.SetOrchestrator(orch)
     
-    // Wire the DeviceManager (Engine) to the Orchestrator
     orch.SetDeviceManager(eng)
 
     eng.Run(ctx, providers)
 
     mux := http.NewServeMux()
     handlers := disAPI.NewHandlers(cache, broker, orch)
-    handlers.RegisterRoutes(mux)
+    // FIX: Pass the auth token to RegisterRoutes for middleware wrapping
+    handlers.RegisterRoutes(mux, cfg.HTTP.AuthToken)
 
     mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")
