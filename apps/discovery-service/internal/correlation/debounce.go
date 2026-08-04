@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/debounce.go
-// Version: 2.5
+// Version: 2.6 (Fixed typo in confirmedRecords)
 package correlation
 
 import (
@@ -19,7 +19,7 @@ import (
 
 type PendingEventStore interface {
     SavePendingEvent(pdid, eventType string, payload []byte, firstSeen, lastSeen time.Time, confirmations int, sources string) error
-    DeletePendingEventsBatch(records []PendingEventRecord) error // IO-08 Fix: Batch delete
+    DeletePendingEventsBatch(records []PendingEventRecord) error
 }
 
 type PendingChange struct {
@@ -193,9 +193,6 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
     } else {
         p.Confirmations = len(p.Sources)
     }
-
-    // IO-01 Fix: Removed per-Submit DB write.
-    // Pending events are written to DB in the Flush loop for crash recovery.
 }
 
 func (d *Debouncer) Flush() {
@@ -206,7 +203,6 @@ func (d *Debouncer) Flush() {
     var confirmedRecords []PendingEventRecord
 
     for key, p := range d.pending {
-        // IO-01 Fix: Write pending state to DB here for crash recovery
         if d.store != nil {
             payloadBytes, _ := json.Marshal(p.Payload)
             sourcesStr := strings.Join(p.ConfirmedBy, ",")
@@ -218,7 +214,7 @@ func (d *Debouncer) Flush() {
             evt := models.NewEvent(p.EventType, p.PDID, p.Payload)
             d.broker.Broadcast(evt)
             
-            confirmedRecords = append(confirmedRecordes, PendingEventRecord{
+            confirmedRecords = append(confirmedRecords, PendingEventRecord{
                 PDID:      p.PDID,
                 EventType: string(p.EventType),
             })
@@ -226,7 +222,6 @@ func (d *Debouncer) Flush() {
         }
     }
 
-    // IO-08 Fix: Batch delete confirmed events from DB
     if d.store != nil && len(confirmedRecords) > 0 {
         _ = d.store.DeletePendingEventsBatch(confirmedRecords)
     }
