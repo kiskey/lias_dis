@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 2.6 (LAN traffic bypass for blocked devices)
+// Version: 2.7 (Corrected LAN bypass destination IP offsets and bitwise CIDR matching)
 package nftables
 
 import (
@@ -131,11 +131,23 @@ func (c *Controller) addRules(ifaceBytes []byte) {
         }
 
         isV4 := ipNet.IP.To4() != nil
-        offset := uint32(8)  // IPv6 Src offset
-        length := uint32(16) // IPv6 length
+        var offset uint32
+        var length uint32
+        var maskBytes []byte
+        var networkBytes []byte
+
         if isV4 {
-            offset = 12 // IPv4 Src offset
+            offset = 16 // IPv4 Destination IP offset (bytes)
             length = 4  // IPv4 length
+            maskBytes = make([]byte, 4)
+            copy(maskBytes, ipNet.Mask)
+            networkBytes = ipNet.IP.To4()
+        } else {
+            offset = 24 // IPv6 Destination IP offset (bytes)
+            length = 16 // IPv6 length
+            maskBytes = make([]byte, 16)
+            copy(maskBytes, ipNet.Mask)
+            networkBytes = ipNet.IP.To16()
         }
 
         // Must match iifname AND destination subnet
@@ -152,8 +164,20 @@ func (c *Controller) addRules(ifaceBytes []byte) {
                     Offset:        offset,
                     Len:           length,
                 },
-                &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ipNet.Mask},
-                &expr.Cmp{Op: expr.CmpOpGt, Register: 1, Data: ipNet.IP}, // Checks if IP >= network base
+                // Bitwise AND the destination IP with the subnet mask
+                &expr.Bitwise{
+                    SourceRegister: 1,
+                    DestRegister:   1,
+                    Len:            length,
+                    Mask:           maskBytes,
+                    Xor:            []byte{},
+                },
+                // Compare the masked result to the network base address
+                &expr.Cmp{
+                    Op:       expr.CmpOpEq,
+                    Register: 1,
+                    Data:     networkBytes,
+                },
                 &expr.Verdict{Kind: expr.VerdictAccept},
             },
         })
@@ -181,7 +205,7 @@ func (c *Controller) addRules(ifaceBytes []byte) {
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
-        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
+        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4}, // Src IP
         &expr.Lookup{SourceRegister: 1, SetName: "blocked_ips", SetID: c.sets["blocked_ips"].ID},
         &expr.Verdict{Kind: expr.VerdictDrop},
     }})
@@ -190,7 +214,7 @@ func (c *Controller) addRules(ifaceBytes []byte) {
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
-        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
+        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4}, // Src IP
         &expr.Lookup{SourceRegister: 1, SetName: "allowed_ips", SetID: c.sets["allowed_ips"].ID},
         &expr.Verdict{Kind: expr.VerdictAccept},
     }})
@@ -199,7 +223,7 @@ func (c *Controller) addRules(ifaceBytes []byte) {
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
-        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 16},
+        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 16}, // Src IP
         &expr.Lookup{SourceRegister: 1, SetName: "blocked_ips_v6", SetID: c.sets["blocked_ips_v6"].ID},
         &expr.Verdict{Kind: expr.VerdictDrop},
     }})
@@ -208,7 +232,7 @@ func (c *Controller) addRules(ifaceBytes []byte) {
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
-        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 16},
+        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 16}, // Src IP
         &expr.Lookup{SourceRegister: 1, SetName: "allowed_ips_v6", SetID: c.sets["allowed_ips_v6"].ID},
         &expr.Verdict{Kind: expr.VerdictAccept},
     }})
