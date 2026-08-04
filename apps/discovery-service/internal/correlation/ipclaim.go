@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/ipclaim.go
-// Version: 1.1
+// Version: 1.2
 package correlation
 
 import (
@@ -20,15 +20,22 @@ type IPClaimResult int
 const (
     // ClaimAttach attaches the new MAC to the existing device record (MAC rotation).
     ClaimAttach IPClaimResult = iota
-    // ClaimCreateNew treats the observation as a DHCP reassignment and creates a new device.
+    // ClaimCreateNew treats the observation as a spoofing attempt and alerts.
     ClaimCreateNew
+    // ClaimCreateNewSilent treats the observation as a legitimate DHCP reassignment (no alert).
+    ClaimCreateNewSilent
 )
 
 // ValidateIPClaim determines whether an incoming observation with MAC M_new at IP I
 // belongs to an existing device record P_existing (which has not yet recorded M_new).
 func ValidateIPClaim(obs discovery.Observation, existing *models.Device) IPClaimResult {
     if existing == nil || obs.MAC == nil {
-        return ClaimCreateNew
+        return ClaimCreateNewSilent
+    }
+
+    // NET-02 Fix: If the existing device is offline and stale, treat as silent DHCP reassignment
+    if !existing.Online && time.Since(existing.LastSeen) > 5*time.Minute {
+        return ClaimCreateNewSilent
     }
 
     macStr := obs.MAC.String()
@@ -72,19 +79,8 @@ func ValidateIPClaim(obs discovery.Observation, existing *models.Device) IPClaim
         }
     }
 
-    // 3. mDNS reverse-confirmation (GAP-D10)
-    if !hasL7Confirmation && obs.Source == "avahi" {
-        if mdnsHost, ok := obs.Raw["mdns_host"].(string); ok && mdnsHost != "" {
-            if ips, err := net.LookupHost(mdnsHost); err == nil {
-                for _, ip := range ips {
-                    if ip == existing.CurrentIP {
-                        hasL7Confirmation = true
-                        break
-                    }
-                }
-            }
-        }
-    }
+    // ENR-08 Fix: Removed dead mDNS reverse-confirmation code that relied on obs.Raw["mdns_host"]
+    // which is never populated at the observation stage.
 
     // Sub-case 2a: L7 confirmation matches AND existing device was active recently (< 60s ago)
     if hasL7Confirmation && time.Since(existing.LastSeen) < 60*time.Second {
