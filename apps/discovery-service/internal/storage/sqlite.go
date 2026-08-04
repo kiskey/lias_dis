@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for DIS device state.
 //
 // File:    apps/discovery-service/internal/storage/sqlite.go
-// Version: 2.8
+// Version: 2.9 (Fixed Batch Save Transaction Corruption)
 package storage
 
 import (
@@ -44,7 +44,6 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, fmt.Errorf("failed to create database directory: %w", err)
     }
 
-    // IO-06 Fix: Apply PRAGMAs via DSN to ensure all pool connections use WAL and NORMAL synchronous mode
     dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=journal_mode(WAL)", dbPath)
     db, err := sql.Open("sqlite", dsn)
     if err != nil {
@@ -61,7 +60,6 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, err
     }
 
-    // LNX-06 Fix: WAL checkpoint on startup to recover from crashes and prevent -wal file bloat
     if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
         slog.Warn("Failed to truncate WAL on startup", "error", err)
     }
@@ -366,10 +364,21 @@ func (s *Storage) SaveDevicesBatch(devs []*models.Device) error {
     }
     defer func() { _ = tx.Rollback() }()
 
-    for _, d := range devs {
-        if err := s.saveDeviceTx(tx, d); err != nil {
-            slog.Error("Failed to save device in batch, continuing", "pdid", d.PDID, "error", err)
+    for i, d := range devs {
+        // Critical 1 Fix: Use SAVEPOINT to allow individual failures without aborting the batch
+        spName := fmt.Sprintf("sp_%d", i)
+        if _, err := tx.Exec("SAVEPOINT " + spName); err != nil {
+            slog.Error("Failed to create savepoint, aborting batch", "error", err)
+            return err
         }
+
+        if err := s.saveDeviceTx(tx, d); err != nil {
+            slog.Error("Failed to save device in batch, rolling back savepoint", "pdid", d.PDID, "error", err)
+            _, _ = tx.Exec("ROLLBACK TO " + spName)
+            _, _ = tx.Exec("RELEASE " + spName)
+            continue
+        }
+        _, _ = tx.Exec("RELEASE " + spName)
     }
 
     return tx.Commit()
@@ -470,7 +479,6 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
     return nil
 }
 
-// IO-05 Fix: Atomic PDID replacement to prevent data loss during identity promotion
 func (s *Storage) ReplaceDevicePDID(oldPDID, newPDID string, d *models.Device) error {
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -538,7 +546,6 @@ func (s *Storage) SavePendingEvent(pdid, eventType string, payload []byte, first
     return err
 }
 
-// IO-08 Fix: Batch delete pending events to reduce transactions
 func (s *Storage) DeletePendingEventsBatch(records []PendingEventRecord) error {
     s.mu.Lock()
     defer s.mu.Unlock()
