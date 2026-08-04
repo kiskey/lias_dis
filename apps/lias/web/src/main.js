@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 2.6 (HIG Time Axis & Accurate Overnight Timeline Rendering)
+// Version: 2.7 (Fixes overnight band rendering & 12hr conflict format)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -800,7 +800,11 @@ class App {
 
       daySegments.forEach(seg => {
         const startMin = seg.start % 1440;
-        const endMin = seg.end % 1440;
+        // FIX: If segment ends at exactly 24:00 (1440), modulo gives 0. We must treat 0 as 1440 for width calculation.
+        let endMin = seg.end % 1440;
+        if (endMin === 0 && seg.end > seg.start) {
+            endMin = 1440;
+        }
         
         // Convert minute indices back to HH:MM for the tooltip
         const startH = Math.floor(startMin / 60);
