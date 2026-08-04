@@ -1,10 +1,11 @@
 // Package correlation implements unit tests for the DIS correlation engine.
 //
 // File:    apps/discovery-service/internal/correlation/engine_test.go
-// Version: 1.0
+// Version: 1.1
 package correlation
 
 import (
+    "fmt"
     "testing"
     "time"
 )
@@ -46,10 +47,11 @@ func TestDedupMapBounding(t *testing.T) {
         lastSeenObs: make(map[string]time.Time),
     }
 
-    // Populate map with 1000 fake observations
+    // Populate map with 1000 fake unique observations
     for i := 0; i < 1000; i++ {
-        mac := "aa:bb:cc:dd:ee:" + string(rune(i%256))
-        ip := "192.168.1." + string(rune(i%256))
+        // FIX: Use Sprintf to guarantee 1000 unique MAC/IP strings
+        mac := fmt.Sprintf("aa:bb:cc:dd:ee:%02x", i)
+        ip := fmt.Sprintf("192.168.1.%d", i)
         eng.isDuplicateObservation(mac, ip, true)
     }
 
