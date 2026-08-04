@@ -2,12 +2,13 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/orchestrator.go
-// Version: 1.6
+// Version: 1.7
 package discovery
 
 import (
     "context"
     "log/slog"
+    "strings"
     "sync"
     "time"
 
@@ -60,7 +61,8 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
         return
     }
 
-    if !force && dev.Vendor != "" && dev.DeviceType != "" {
+    // DIS-ENR-02 Fix: Do not skip if FriendlyName is missing, even if Vendor/Type are known
+    if !force && dev.Vendor != "" && dev.DeviceType != "" && dev.FriendlyName != "" {
         return
     }
 
@@ -152,6 +154,19 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
     }
 }
 
+// isGenericHostname checks if a hostname looks like a default MAC-based or DHCP ID string.
+func isGenericHostname(host string) bool {
+    h := strings.ToLower(host)
+    if h == "" { return true }
+    if strings.HasPrefix(h, "android-") { return true }
+    if strings.HasPrefix(h, "iphone") || strings.HasPrefix(h, "ipad") { return true }
+    if strings.HasPrefix(h, "desktop-") || strings.HasPrefix(h, "localhost") { return true }
+    if strings.Contains(h, "unknown") { return true }
+    // Check if it's just a MAC address without colons
+    if len(h) == 12 && strings.Count(h, "-") == 0 { return true }
+    return false
+}
+
 func applyEnrichment(dev *models.Device, enr *models.Enrichment) bool {
     if dev == nil || enr == nil {
         return false
@@ -159,14 +174,24 @@ func applyEnrichment(dev *models.Device, enr *models.Enrichment) bool {
 
     changed := false
 
-    if enr.Hostname != "" && (dev.Hostname == "" || enr.Confidence > dev.Confidence) {
-        dev.Hostname = enr.Hostname
-        changed = true
-    }
-    if enr.FriendlyName != "" && dev.FriendlyName != enr.FriendlyName {
+    // DIS-ENR-01 Fix: Separate FriendlyName from Hostname to avoid confidence traps.
+    // A UPnP friendlyName (e.g., "Living Room TV") should always be set if we don't have one yet.
+    if enr.FriendlyName != "" && dev.FriendlyName == "" {
         dev.FriendlyName = enr.FriendlyName
         changed = true
     }
+
+    // Hostname from enrichment (e.g., mDNS or UPnP) should overwrite L2/DHCP hostnames 
+    // if the current one is empty, looks generic, or if the enrichment confidence is explicitly higher.
+    if enr.Hostname != "" {
+        if dev.Hostname == "" || isGenericHostname(dev.Hostname) || enr.Confidence > dev.Confidence {
+            if dev.Hostname != enr.Hostname {
+                dev.Hostname = enr.Hostname
+                changed = true
+            }
+        }
+    }
+
     if enr.Manufacturer != "" && (dev.Manufacturer == "" || enr.Confidence > dev.Confidence) {
         dev.Manufacturer = enr.Manufacturer
         changed = true
