@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/cache.go
-// Version: 2.1
+// Version: 2.2 (Fixed Get/List side-effects)
 package sync
 
 import (
@@ -21,10 +21,10 @@ type LocalDevice struct {
 }
 
 type Cache struct {
-    mu         sync.Mutex
+    mu         sync.RWMutex // CPU-03 Fix: Use RWMutex
     devices    map[string]*LocalDevice
-    stickyTags map[string][]string // LIAS-TAG-01 Fix: Multi-tag support
-    stickyMACs map[string][]string // LIAS-TAG-01 Fix: Multi-tag support
+    stickyTags map[string][]string
+    stickyMACs map[string][]string
 }
 
 func NewCache() *Cache {
@@ -71,7 +71,6 @@ func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
         }
     }
 
-    // Fallback to existing or generic
     if len(d.Tags) == 0 {
         if len(d.Device.Tags) > 0 {
             d.Tags = d.Device.Tags
@@ -94,43 +93,35 @@ func (c *Cache) MigrateDeviceIdentity(oldPDID, newPDID string, migratedMACs []st
     delete(c.devices, oldPDID)
 }
 
+// CPU-03 Fix: Get uses RLock and does not mutate the cache.
 func (c *Cache) Get(pdid string) *LocalDevice {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+    c.mu.RLock()
+    defer c.mu.RUnlock()
 
     d, ok := c.devices[pdid]
     if !ok {
         return nil
     }
     devCopy := *d
-    c.applyStickyTagLocked(&devCopy)
-    if ptr, exists := c.devices[pdid]; exists {
-        ptr.Tags = devCopy.Tags
-        ptr.Device.Tags = devCopy.Device.Tags
-    }
     return &devCopy
 }
 
+// CPU-03 Fix: List uses RLock and does not mutate the cache.
 func (c *Cache) List() []LocalDevice {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+    c.mu.RLock()
+    defer c.mu.RUnlock()
 
     list := make([]LocalDevice, 0, len(c.devices))
-    for pdid, d := range c.devices {
+    for _, d := range c.devices {
         devCopy := *d
-        c.applyStickyTagLocked(&devCopy)
-        if ptr, exists := c.devices[pdid]; exists {
-            ptr.Tags = devCopy.Tags
-            ptr.Device.Tags = devCopy.Device.Tags
-        }
         list = append(list, devCopy)
     }
     return list
 }
 
 func (c *Cache) ListPDIDs() []string {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+    c.mu.RLock()
+    defer c.mu.RUnlock()
 
     list := make([]string, 0, len(c.devices))
     for pdid := range c.devices {
@@ -178,7 +169,6 @@ func (c *Cache) SetPolicy(pdid string, p *models.Policy) {
     }
 }
 
-// LIAS-TAG-01 Fix: SetTags accepts a slice of tags
 func (c *Cache) SetTags(pdid string, tags []string) {
     c.mu.Lock()
     defer c.mu.Unlock()
