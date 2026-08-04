@@ -2,7 +2,7 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 2.7 (Corrected LAN bypass destination IP offsets and bitwise CIDR matching)
+// Version: 2.8 (Fixed Bitwise Xor length to prevent netlink EINVAL)
 package nftables
 
 import (
@@ -170,7 +170,7 @@ func (c *Controller) addRules(ifaceBytes []byte) {
                     DestRegister:   1,
                     Len:            length,
                     Mask:           maskBytes,
-                    Xor:            []byte{},
+                    Xor:            make([]byte, length), // FIX: Must be explicitly zeroed to match Len
                 },
                 // Compare the masked result to the network base address
                 &expr.Cmp{
