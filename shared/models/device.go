@@ -1,7 +1,7 @@
 // Package models defines canonical data structures shared between DIS and LIAS.
 //
 // File:    shared/models/device.go
-// Version: 2.1
+// Version: 2.2
 package models
 
 import (
@@ -45,7 +45,7 @@ type Device struct {
     LastSeen          time.Time             `json:"last_seen"`
     Confidence        float64               `json:"confidence"`
     Tags              []string              `json:"tags"`
-    UserID            string                `json:"user_id,omitempty"` // SYS-FEAT-03 Fix: Per-user mapping
+    UserID            string                `json:"user_id,omitempty"`
     SourceInfo        map[string]SourceMeta `json:"source_info,omitempty"`
 }
 
@@ -165,17 +165,20 @@ func (d *Device) HasMAC(macStr string) bool {
     return false
 }
 
-func (d *Device) AddService(svc string) {
+// AddService appends a service identifier, deduplicating against existing entries.
+// Fix: Returns true if the service was newly added, preventing false positive state changes.
+func (d *Device) AddService(svc string) bool {
     if d == nil || svc == "" {
-        return
+        return false
     }
     cleanSvc := strings.TrimSpace(svc)
     for _, existing := range d.Services {
         if existing == cleanSvc {
-            return
+            return false
         }
     }
     d.Services = append(d.Services, cleanSvc)
+    return true
 }
 
 func (d *Device) Touch(ts time.Time) {
