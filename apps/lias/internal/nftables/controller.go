@@ -2,16 +2,14 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 2.9 (Fixed Race in Reinit, Explicit Accept, Capabilities Check)
+// Version: 3.0 (Corrected CapGet signature)
 package nftables
 
 import (
     "fmt"
     "log/slog"
     "net"
-    "os"
     "sync"
-    "syscall"
 
     "github.com/google/nftables"
     "github.com/google/nftables/expr"
@@ -40,11 +38,12 @@ func (c *Controller) Init() error {
     defer c.mu.Unlock()
 
     // LNX-02 Fix: Check for CAP_NET_ADMIN
-    hdr, err := unix.CapGet(&unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3})
-    if err != nil {
+    hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+    var data unix.CapUserData
+    if err := unix.CapGet(&hdr, &data); err != nil {
         return fmt.Errorf("failed to check capabilities: %w", err)
     }
-    if hdr.Effective&unix.CAP_NET_ADMIN == 0 {
+    if data.Effective&unix.CAP_NET_ADMIN == 0 {
         return fmt.Errorf("LIAS requires CAP_NET_ADMIN to manage nftables. Run as root or grant capabilities")
     }
 
@@ -126,7 +125,6 @@ func (c *Controller) Init() error {
     ifaceBytes := []byte(c.cfg.Interface + "\x00")
 
     // LNX-04 Fix: Audit nftables priorities
-    // We check if any existing netdev table has a higher priority (lower number)
     existingChains, err := conn.ListChains()
     if err == nil {
         for _, ec := range existingChains {
@@ -389,8 +387,6 @@ func (c *Controller) queueElements(setName string, toAdd, toRem interface{}, isM
 func (c *Controller) reinitializeConn() {
     slog.Warn("Reinitializing nftables connection due to transaction failure")
     
-    // Hold the lock across the entire reinitialization to prevent concurrent Apply calls
-    // from using the old or incomplete new state.
     conn, err := nftables.New()
     if err != nil {
         slog.Error("Failed to reinitialize nftables connection", "error", err)
@@ -398,15 +394,10 @@ func (c *Controller) reinitializeConn() {
     }
     c.conn = conn
     
-    // Clear existing sets and table references
     c.table = nil
     c.chain = nil
     c.sets = make(map[string]*nftables.Set)
     
-    // Unlock before calling Init to prevent deadlock, as Init acquires the lock.
-    // However, to be strictly race-free, we should hold the lock. 
-    // Let's refactor Init's body to not lock, or just accept the brief unlock.
-    // Actually, Init locks. So we must unlock.
     c.mu.Unlock()
     if err := c.Init(); err != nil {
         slog.Error("Failed to safely rebuild nftables state after connection reset", "error", err)
