@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 3.9
+// Version: 4.0
 package correlation
 
 import (
@@ -91,6 +91,31 @@ func (e *Engine) Run(ctx context.Context, providers []discovery.DiscoveryProvide
         go e.consume(ctx, p.Events())
     }
     go e.runStalenessSweep(ctx)
+    
+    // DIS-COR-01 Fix: Bounded deduplication memory map
+    go e.runDedupSweep(ctx)
+}
+
+// runDedupSweep prevents unbounded memory leak in lastSeenObs map
+func (e *Engine) runDedupSweep(ctx context.Context) {
+    ticker := time.NewTicker(1 * time.Minute)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            e.dedupMu.Lock()
+            now := time.Now()
+            for k, t := range e.lastSeenObs {
+                if now.Sub(t) > 5*time.Minute {
+                    delete(e.lastSeenObs, k)
+                }
+            }
+            e.dedupMu.Unlock()
+        }
+    }
 }
 
 func (e *Engine) runStalenessSweep(ctx context.Context) {
@@ -203,10 +228,8 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     cleanHost := discovery.UnescapeHostname(obs.Hostname)
     canonicalHost := CanonicalizeHostname(cleanHost)
 
-    // Gap 4 Fix: Moved Pi-hole IP history gate BEFORE ghost prevention check
     if obs.Source == "pihole" && ipStr != "" {
         if existing := e.cache.GetByIP(ipStr); existing != nil {
-            // I/O Fix: Only save if the IP is actually new to the history
             ipAlreadyKnown := false
             for _, ip := range existing.IPs {
                 if ip == ipStr {
@@ -224,7 +247,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         }
     }
 
-    // Network Engineer Fix: Prevent ghost tentative devices.
     if macStr == "" && canonicalHost == "" {
         return
     }
@@ -233,17 +255,15 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         return
     }
 
-    // 1. Query Existing Device
     d := e.cache.GetByMACOrIP(macStr, ipStr)
     dirty := false
 
-    // Gap 5 Fix: Update CurrentMAC if it's stale/empty but MAC is in cluster
     if macStr != "" && d != nil && d.HasMAC(macStr) && d.CurrentMAC != macStr {
         e.cache.SetCurrentMAC(d.PDID, macStr)
         dirty = true
     }
 
-    // GAP-D01: MAC Rotation & IP-Claim Validation for existing devices
+    // GAP-D01 & DIS-SEC-06 Fix: MAC Rotation & Spoofing Detection
     if macStr != "" && d != nil && !d.HasMAC(macStr) {
         if d.CurrentIP == ipStr {
             claimRes := ValidateIPClaim(obs, d)
@@ -259,6 +279,16 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                 })
                 dirty = true
             } else {
+                // DIS-SEC-06: Potential MAC Spoofing Alert!
+                // A new MAC is claiming an IP currently held by an existing device, but failed validation.
+                e.broker.Broadcast(models.NewEvent(models.EventSecurityAlert, d.PDID, models.SecurityAlertPayload{
+                    AlertType: "mac_spoof_detected",
+                    PDID:      d.PDID,
+                    Details:   fmt.Sprintf("MAC %s claimed IP %s currently held by %s (MAC %s)", macStr, ipStr, d.PDID, d.CurrentMAC),
+                    Timestamp: time.Now(),
+                }))
+                slog.Warn("Potential MAC spoofing detected", "existing_pdid", d.PDID, "existing_mac", d.CurrentMAC, "spoof_mac", macStr, "ip", ipStr)
+                
                 e.cache.RemoveIPIndex(ipStr)
                 d = nil
             }
@@ -275,9 +305,18 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                         OldMAC:    oldMAC,
                         Timestamp: time.Now(),
                     })
-                    d = existingOnIP // Reassign d to the attached device
+                    d = existingOnIP 
                     dirty = true
                 } else {
+                    // DIS-SEC-06: Potential MAC Spoofing Alert on another device's IP!
+                    e.broker.Broadcast(models.NewEvent(models.EventSecurityAlert, existingOnIP.PDID, models.SecurityAlertPayload{
+                        AlertType: "mac_spoof_detected",
+                        PDID:      existingOnIP.PDID,
+                        Details:   fmt.Sprintf("MAC %s claimed IP %s held by %s", macStr, ipStr, existingOnIP.PDID),
+                        Timestamp: time.Now(),
+                    }))
+                    slog.Warn("Potential cross-device MAC spoofing detected", "target_pdid", existingOnIP.PDID, "spoof_mac", macStr, "ip", ipStr)
+                    
                     e.cache.RemoveIPIndex(ipStr)
                     d = nil
                 }
@@ -285,7 +324,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         }
     }
 
-    // Step 3: Hostname Ownership Lock check
     if canonicalHost != "" {
         if d != nil {
             ownerPDID, exists := e.cache.GetHostnameOwner(canonicalHost)
@@ -306,7 +344,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         }
     }
 
-    // 2. New Device Creation
     if d == nil {
         tier, anchor := inventory.DeriveTierAndAnchor(macStr, canonicalHost, obs.Vendor)
         pdid := inventory.GeneratePDID(tier, anchor)
@@ -337,7 +374,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             _ = e.cache.AcquireHostname(canonicalHost, d.PDID)
         }
 
-        // New devices are always dirty
         if e.store != nil {
             _ = e.store.SaveDevice(d)
         }
@@ -347,7 +383,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         return
     }
 
-    // 3. Identity Promotion State Machine
     newTier, newAnchor := inventory.DeriveTierAndAnchor(macStr, canonicalHost, obs.Vendor)
     if inventory.CanPromote(d.IdentityTier, newTier) {
         oldPDID := d.PDID
@@ -366,7 +401,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         d.CanonicalHostname = canonicalHost
 
         e.cache.Upsert(d)
-        // Promotions are always dirty
         if e.store != nil {
             _ = e.store.SaveDevice(d)
         }
@@ -384,7 +418,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         return
     }
 
-    // 4. Asymmetric Online Flap Fix
     if !d.Online && obs.Online && canTriggerOnline(obs.Source) {
         d.PendingOnlineObs = append(d.PendingOnlineObs, obs.Source)
         if len(d.PendingOnlineObs) >= 2 || hasL2AndL3Confirmation(d.PendingOnlineObs) {
@@ -396,7 +429,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         }
     }
 
-    // 5. Update Record & Submit to Debouncer
     if cleanHost != "" && !HostnamesAreEquivalent(d.Hostname, cleanHost) {
         oldHost := d.Hostname
         if d.CanonicalHostname != "" {
@@ -433,13 +465,11 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     d.Touch(time.Now())
     e.cache.Upsert(d)
 
-    // Network Engineer Fix: Only persist to SQLite if material identity data changed
     if dirty && e.store != nil {
         _ = e.store.SaveDevice(d)
     }
 }
 
-// PromoteDeviceIdentity checks if a device's identity tier can be promoted based on current enrichment data.
 func (e *Engine) PromoteDeviceIdentity(pdid string) *models.Device {
     d := e.cache.Get(pdid)
     if d == nil {
@@ -485,7 +515,6 @@ func (e *Engine) PromoteDeviceIdentity(pdid string) *models.Device {
     return d
 }
 
-// PersistDevice saves the device state to storage.
 func (e *Engine) PersistDevice(pdid string) {
     d := e.cache.Get(pdid)
     if d != nil && e.store != nil {
@@ -500,7 +529,6 @@ func (e *Engine) scheduleDeferredOnline(pdid string, delay time.Duration) {
         d.Online = true
         d.PendingOnlineObs = nil
         e.cache.Upsert(d)
-        // Do not save here to avoid disk thrash on transient state; will be saved on next dirty event or staleness sweep
         e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
     }
 }
