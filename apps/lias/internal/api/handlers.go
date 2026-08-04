@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 2.7
+// Version: 2.8
 package api
 
 import (
@@ -452,7 +452,14 @@ func (h *Handlers) ImportPolicies(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    h.polEng.ReloadPolicies(h.store)
+    // FIX: Reload hydrated state into engine without causing an import cycle
+    var policies []models.Policy
+    if err := json.Unmarshal(data, &policies); err == nil {
+        for _, p := range policies {
+            h.polEng.UpsertPolicy(p)
+        }
+    }
+
     h.tryTrigger()
     
     w.Header().Set("Content-Type", "application/json")
