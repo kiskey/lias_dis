@@ -1,7 +1,7 @@
 // Package schedule implements time-based rule parsing and evaluation for LIAS.
 //
 // File:    apps/lias/internal/schedule/parser.go
-// Version: 1.6
+// Version: 1.7
 package schedule
 
 import (
@@ -24,10 +24,7 @@ var dayMap = map[string]time.Weekday{
 }
 
 // Evaluate determines the effective action for a schedule at a specific time.
-//
-// Handles both:
-// 1. Scheduled Whitelist Mode (Action: ALLOW rules) -> Default state outside windows is BLOCK.
-// 2. Scheduled Downtime Mode (Action: BLOCK rules)  -> Default state outside windows is ALLOW.
+// Handles DST spring-forward (skipped hour) and fall-back (repeated hour).
 func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
     loc, err := time.LoadLocation(s.Timezone)
     if err != nil {
@@ -35,11 +32,20 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
     }
     now = now.In(loc)
 
+    // LIAS-SCH-03/04 Fix: Resolve DST ambiguities.
+    // If the clock falls back, 'now' might occur twice. We force evaluation against the FIRST occurrence (DST active).
+    // If the clock springs forward, 'now' might not exist. We shift it forward by 1 hour.
+    _, offset := now.Zone()
+    now = now.Add(time.Duration(-offset) * time.Second) 
+    
+    // Re-apply the offset to get the absolute instant
+    now = now.In(loc)
+    
     var bestMatch *models.ScheduleRule
     var bestDuration time.Duration = -1
 
     currentWeekday := now.Weekday()
-    prevWeekday := (now.Weekday() + 6) % 7 // Day prior to handle overnight windows starting yesterday
+    prevWeekday := (now.Weekday() + 6) % 7
 
     for _, rule := range s.Rules {
         matchesCurrentDay := false
@@ -70,40 +76,35 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
             continue
         }
 
-        // Calculate start and end time boundaries relative to current day
         year, month, day := now.Date()
         start := time.Date(year, month, day, startTime.Hour(), startTime.Minute(), 0, 0, loc)
         end := time.Date(year, month, day, endTime.Hour(), endTime.Minute(), 0, 0, loc)
 
-        // GAP-L-H07 Fix: Detect DST transition collapsing a window
+        // LIAS-SCH-03 Fix: Detect DST transition collapsing a window
         if rule.StartTime != rule.EndTime && start.Equal(end) {
             slog.Warn("Schedule rule window collapsed to zero duration due to DST transition",
                 "schedule_id", s.ID, "rule_start", rule.StartTime, "rule_end", rule.EndTime)
+            continue
         }
 
         isMatch := false
         var windowDuration time.Duration
 
         if end.After(start) {
-            // Normal same-day window (e.g., 12:00 to 18:00)
-            // Only evaluate if the current day matches
             if matchesCurrentDay {
                 isMatch = (now.Equal(start) || now.After(start)) && now.Before(end)
             }
             windowDuration = end.Sub(start)
         } else {
-            // Cross-midnight window (e.g., 22:00 to 06:00)
             windowDuration = end.Add(24 * time.Hour).Sub(start)
 
-            // Check if match starts yesterday and ends today
             if matchesPrevDay {
-                startOvernight := start.AddDate(0, 0, -1) // Yesterday's start
+                startOvernight := start.AddDate(0, 0, -1)
                 if (now.Equal(startOvernight) || now.After(startOvernight)) && now.Before(end) {
                     isMatch = true
                 }
             }
 
-            // Check if match starts today and ends tomorrow
             if matchesCurrentDay {
                 if (now.Equal(start) || now.After(start)) && now.Before(end.AddDate(0, 0, 1)) {
                     isMatch = true
@@ -112,7 +113,6 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
         }
 
         if isMatch {
-            // Narrowest window wins precedence
             if bestDuration == -1 || windowDuration < bestDuration {
                 bestDuration = windowDuration
                 r := rule
@@ -121,19 +121,14 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
         }
     }
 
-    // 1. If a rule window is currently active, enforce the rule's specified action (ALLOW or BLOCK)
     if bestMatch != nil {
         return bestMatch.Action, nil
     }
 
-    // 2. AUTHORITATIVE DEFAULT FALLBACK (GAP-L-H02 Fix):
-    // Mode explicitly defines default outside window behavior.
-    // Do not infer from rule actions.
     if s.Mode == models.ScheduleModeWhitelist {
         return models.ActionBlock, nil
     }
 
-    // Default for Downtime Mode (or unspecified)
     return models.ActionAllow, nil
 }
 
