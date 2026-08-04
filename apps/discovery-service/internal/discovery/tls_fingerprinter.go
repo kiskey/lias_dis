@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/tls_fingerprinter.go
-// Version: 1.3 (Added TLS Server Fingerprint)
+// Version: 1.4 (Enhanced TLS Fingerprinting)
 package discovery
 
 import (
@@ -12,6 +12,7 @@ import (
     "encoding/hex"
     "fmt"
     "net"
+    "strings"
     "time"
 
     "github.com/user/lias-dis/shared/models"
@@ -91,8 +92,19 @@ func (e *TLSFingerprinter) Enrich(ctx context.Context, d *models.Device) (*model
 
     if len(state.PeerCertificates) > 0 {
         cert := state.PeerCertificates[0]
-        hash := sha256.Sum256(cert.Raw)
-        enr.Raw["cert_sha256"] = hex.EncodeToString(hash[:16])
+        
+        // Hash the cert for provenance, but exclude expiry/serial for a stable config fingerprint
+        h := sha256.New()
+        h.Write([]byte(fmt.Sprintf("%d|%d|%s|%s|%s", state.Version, state.CipherSuite, state.NegotiatedProtocol, cert.Subject.String(), cert.Issuer.String())))
+        enr.Raw["tls_server_fingerprint"] = hex.EncodeToString(h.Sum(nil))
+        
+        // Extract SANs (Subject Alternative Names) for better device identification
+        if len(cert.DNSNames) > 0 {
+            enr.Raw["san"] = strings.Join(cert.DNSNames, ",")
+            if enr.Hostname == "" {
+                enr.Hostname = cert.DNSNames[0]
+            }
+        }
         
         issuer := cert.Issuer.CommonName
         subject := cert.Subject.CommonName
@@ -118,15 +130,6 @@ func (e *TLSFingerprinter) Enrich(ctx context.Context, d *models.Device) (*model
         enr.Raw["tls_version"] = "1.2"
     case tls.VersionTLS13:
         enr.Raw["tls_version"] = "1.3"
-    }
-
-    // ENR-03 Fix: Compute a TLS Server Fingerprint (JA3S alternative)
-    // Since we are the client, we can only compute a server hello hash.
-    // We hash the TLS Version, CipherSuite, and the first certificate's raw bytes.
-    if len(state.PeerCertificates) > 0 {
-        h := sha256.New()
-        h.Write([]byte(fmt.Sprintf("%d|%d|%x", state.Version, state.CipherSuite, state.PeerCertificates[0].Raw)))
-        enr.Raw["tls_server_fingerprint"] = hex.EncodeToString(h.Sum(nil))[:32]
     }
 
     if len(enr.Raw) > 0 {
