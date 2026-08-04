@@ -1,14 +1,10 @@
 /**
  * LIAS REST API Client & Real-time EventSource Subscriber
  * File:    apps/lias/web/src/api.js
- * Version: 2.2 (Strict audit: Merged v2.1 completeness + v2.2 enhancements)
+ * Version: 2.3 (Added Unpause Device Internet)
  */
 
 export const API = {
-    /**
-     * Internal generic fetch helper handling JSON responses, status validation,
-     * and attaching 409 Conflict metadata to thrown errors.
-     */
     async request(endpoint, options = {}) {
         const config = {
             headers: {
@@ -67,31 +63,39 @@ export const API = {
         return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}`);
     },
 
-    async getDeviceLogs(pdid) { // UI-FN-01 Fix
+    async getDeviceLogs(pdid) {
         return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/logs`);
     },
 
-    async assignDeviceTag(pdid, tagId) {
+    async assignDeviceTag(pdid, tagIds) {
+        const payload = Array.isArray(tagIds) ? { tag_ids: tagIds } : { tag_id: tagIds };
         return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/tags`, {
             method: 'POST',
-            body: JSON.stringify({ tag_id: tagId })
+            body: JSON.stringify(payload)
         });
     },
 
-    async pauseDeviceInternet(pdid) { // UI-FN-06 Fix
+    async pauseDeviceInternet(pdid) {
         return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/pause`, {
             method: 'POST'
         });
     },
 
-    async renameDevice(pdid, name) { // UI-FN-12 Fix
+    // Fix 1: Added Unpause Device Internet
+    async unpauseDeviceInternet(pdid) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/pause`, {
+            method: 'DELETE'
+        });
+    },
+
+    async renameDevice(pdid, name) {
         return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/rename`, {
             method: 'POST',
             body: JSON.stringify({ name })
         });
     },
 
-    async assignDeviceUser(pdid, userId) { // SYS-FEAT-03 Fix
+    async assignDeviceUser(pdid, userId) {
         return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/user`, {
             method: 'POST',
             body: JSON.stringify({ user_id: userId })
@@ -149,9 +153,7 @@ export const API = {
             try {
                 return await this.updatePolicy(policyData.id, policyData);
             } catch (err) {
-                // If update failed due to 409 Conflict, rethrow immediately
                 if (err.status === 409) throw err;
-                // Fall back to create if policy record doesn't exist yet
                 return await this.createPolicy(policyData);
             }
         }
@@ -171,9 +173,7 @@ export const API = {
         });
     },
 
-    // LIAS-POL-08 Fix: Policy Import/Export
     async exportPolicies() {
-        // Use raw fetch for blob download
         const response = await fetch('/api/v1/policies/export');
         if (!response.ok) throw new Error('Failed to export policies');
         return response.blob();
@@ -225,7 +225,7 @@ export const API = {
     },
 
     // --- USER ENDPOINTS ---
-    async createUser(userData) { // SYS-FEAT-03 Fix
+    async createUser(userData) {
         return await this.request('/api/v1/users', {
             method: 'POST',
             body: JSON.stringify(userData)
@@ -233,11 +233,11 @@ export const API = {
     },
 
     // --- SYSTEM & REPORTING ENDPOINTS ---
-    async getNetworkStats() { // UI-FN-08 Fix
+    async getNetworkStats() {
         return await this.request('/api/v1/stats');
     },
 
-    async toggleVacationMode(enabled) { // LIAS-POL-12 Fix
+    async toggleVacationMode(enabled) {
         return await this.request('/api/v1/vacation', {
             method: 'POST',
             body: JSON.stringify({ enabled })
@@ -272,8 +272,8 @@ export const API = {
             'device.fingerprint_updated',
             'device.ip_changed',
             'device.mac_changed',
-            'device.reidentified', // GAP-I01
-            'security.alert'       // DIS-SEC-06
+            'device.reidentified',
+            'security.alert'
         ];
 
         eventTypes.forEach(evtType => {
