@@ -1,7 +1,7 @@
 // Package nftables implements the isolated firewall controller for LIAS.
 //
 // File:    apps/lias/internal/nftables/builder.go
-// Version: 1.8 (Pure incremental diffing)
+// Version: 1.9 (ResetState on Reinit)
 package nftables
 
 import (
@@ -38,6 +38,22 @@ func NewBuilder(cache *liasSync.Cache, controller *Controller) *Builder {
         currentAllowedIP6s: make(map[string]net.IP),
         currentBlockedIP6s: make(map[string]net.IP),
     }
+}
+
+// NET-03 Fix: Reset internal state when the kernel connection is lost/reinitialized.
+// This forces the next Sync to compute a full diff (all adds, no removes), repopulating the kernel sets.
+func (b *Builder) ResetState() {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    b.currentAllowedIPs = make(map[string]net.IP)
+    b.currentBlockedIPs = make(map[string]net.IP)
+    b.currentAllowedMACs = make(map[string]net.HardwareAddr)
+    b.currentBlockedMACs = make(map[string]net.HardwareAddr)
+    b.currentAllowedIP6s = make(map[string]net.IP)
+    b.currentBlockedIP6s = make(map[string]net.IP)
+    
+    slog.Info("Builder state reset. Next sync will be a full repopulation.")
 }
 
 func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.ScheduleEvaluator) error {
@@ -110,7 +126,6 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
         BlockedIP6sToRem:  make([]net.IP, 0),
     }
 
-    // Compute Diffs
     diffIPs(desiredAllowedIPs, b.currentAllowedIPs, &diff.AllowedIPsToAdd, &diff.AllowedIPsToRem)
     diffIPs(desiredBlockedIPs, b.currentBlockedIPs, &diff.BlockedIPsToAdd, &diff.BlockedIPsToRem)
     diffMACs(desiredAllowedMACs, b.currentAllowedMACs, &diff.AllowedMACsToAdd, &diff.AllowedMACsToRem)
@@ -118,7 +133,6 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
     diffIPs(desiredAllowedIP6s, b.currentAllowedIP6s, &diff.AllowedIP6sToAdd, &diff.AllowedIP6sToRem)
     diffIPs(desiredBlockedIP6s, b.currentBlockedIP6s, &diff.BlockedIP6sToAdd, &diff.BlockedIP6sToRem)
 
-    // If completely empty, skip
     if len(diff.AllowedIPsToAdd) == 0 && len(diff.AllowedIPsToRem) == 0 &&
         len(diff.BlockedIPsToAdd) == 0 && len(diff.BlockedIPsToRem) == 0 &&
         len(diff.AllowedMACsToAdd) == 0 && len(diff.AllowedMACsToRem) == 0 &&
@@ -137,6 +151,9 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
         b.currentBlockedMACs = desiredBlockedMACs
         b.currentAllowedIP6s = desiredAllowedIP6s
         b.currentBlockedIP6s = desiredBlockedIP6s
+    } else {
+        // If Apply failed and triggered a reinit, reset our state so the next sync repopulates everything.
+        b.ResetState()
     }
 
     return err
