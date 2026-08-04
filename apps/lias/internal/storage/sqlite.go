@@ -1,24 +1,33 @@
-// Package storage provides CGO-free SQLite persistence for LIAS configuration state.
+// Package storage provides CGO-free SQLite persistence for DIS device state.
 //
-// File:    apps/lias/internal/storage/sqlite.go
-// Version: 1.8
+// File:    apps/discovery-service/internal/storage/sqlite.go
+// Version: 2.6
 package storage
 
 import (
     "database/sql"
-    "encoding/json"
     "fmt"
     "log/slog"
     "os"
     "path/filepath"
+    "strings"
     "sync"
+    "time"
 
-    "github.com/user/lias-dis/apps/lias/internal/policy"
-    "github.com/user/lias-dis/apps/lias/internal/schedule"
-    "github.com/user/lias-dis/apps/lias/internal/tags"
+    "github.com/user/lias-dis/apps/discovery-service/internal/inventory"
     "github.com/user/lias-dis/shared/models"
     _ "modernc.org/sqlite"
 )
+
+type PendingEventRecord struct {
+    PDID          string
+    EventType     string
+    Payload       []byte
+    FirstSeen     time.Time
+    LastSeen      time.Time
+    Confirmations int
+    Sources       string
+}
 
 type Storage struct {
     mu     sync.Mutex
@@ -28,7 +37,7 @@ type Storage struct {
 
 func NewStorage(dbPath string) (*Storage, error) {
     if dbPath == "" {
-        dbPath = "/var/lib/lias/state.db"
+        dbPath = "/var/lib/dis/state.db"
     }
 
     if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
@@ -40,9 +49,8 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, fmt.Errorf("failed to open sqlite database: %w", err)
     }
 
-    // Enable WAL mode and busy timeout to eliminate write lock contention
-    if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
-        slog.Warn("Failed to set PRAGMAs on LIAS database", "error", err)
+    if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;"); err != nil {
+        slog.Warn("Failed to set PRAGMAs on DIS database", "error", err)
     }
 
     s := &Storage{
@@ -55,7 +63,11 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, err
     }
 
-    slog.Info("SQLite storage engine initialized", "path", dbPath)
+    if err := s.migrateV1PDIDs(); err != nil {
+        slog.Warn("v1 to v2 PDID migration encountered an error", "error", err)
+    }
+
+    slog.Info("DIS SQLite storage engine initialized", "path", dbPath)
     return s, nil
 }
 
@@ -64,190 +76,237 @@ func (s *Storage) initSchema() error {
     defer s.mu.Unlock()
 
     query := `
-    CREATE TABLE IF NOT EXISTS tags (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        color TEXT NOT NULL,
-        precedence INTEGER NOT NULL,
-        builtin INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS device_tags (
+    CREATE TABLE IF NOT EXISTS devices (
         pdid TEXT PRIMARY KEY,
-        tag_id TEXT NOT NULL,
-        mac TEXT NOT NULL DEFAULT ''
+        identity_tier TEXT NOT NULL DEFAULT 'tentative',
+        identity_anchor TEXT NOT NULL DEFAULT '',
+        canonical_hostname TEXT NOT NULL DEFAULT '',
+        current_mac TEXT NOT NULL DEFAULT '',
+        current_ip TEXT NOT NULL DEFAULT '',
+        hostname TEXT NOT NULL DEFAULT '',
+        friendly_name TEXT NOT NULL DEFAULT '',
+        manufacturer TEXT NOT NULL DEFAULT '',
+        vendor TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL DEFAULT '',
+        device_type TEXT NOT NULL DEFAULT '',
+        confidence REAL NOT NULL DEFAULT 0.0,
+        first_seen DATETIME NOT NULL,
+        last_seen DATETIME NOT NULL,
+        online INTEGER NOT NULL DEFAULT 1
     );
 
-    CREATE TABLE IF NOT EXISTS policies (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        type TEXT NOT NULL,
-        target_id TEXT,
-        action TEXT NOT NULL,
-        schedule_id TEXT,
-        schedule_ids TEXT NOT NULL DEFAULT '',
-        priority INTEGER NOT NULL,
-        data TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS device_macs (
+        pdid TEXT NOT NULL,
+        mac TEXT PRIMARY KEY,
+        FOREIGN KEY(pdid) REFERENCES devices(pdid) ON DELETE CASCADE
     );
 
-    CREATE TABLE IF NOT EXISTS schedules (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        mode TEXT NOT NULL DEFAULT '',
-        timezone TEXT NOT NULL,
-        rules TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS device_ips (
+        pdid TEXT NOT NULL,
+        ip TEXT PRIMARY KEY,
+        FOREIGN KEY(pdid) REFERENCES devices(pdid) ON DELETE CASCADE
     );
 
-    CREATE INDEX IF NOT EXISTS idx_device_tags_mac ON device_tags(mac);
+    CREATE TABLE IF NOT EXISTS hostname_owners (
+        canonical_hostname TEXT PRIMARY KEY,
+        pdid TEXT NOT NULL,
+        acquired_at DATETIME NOT NULL,
+        FOREIGN KEY(pdid) REFERENCES devices(pdid) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pdid TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        first_seen DATETIME NOT NULL,
+        last_seen DATETIME NOT NULL,
+        confirmations INTEGER NOT NULL DEFAULT 1,
+        sources TEXT NOT NULL DEFAULT ''
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_mac_pdid ON device_macs(pdid);
+    CREATE INDEX IF NOT EXISTS idx_ip_pdid ON device_ips(pdid);
+    CREATE INDEX IF NOT EXISTS idx_pending_pdid ON pending_events(pdid, event_type);
     `
 
     _, err := s.db.Exec(query)
     if err != nil {
-        return fmt.Errorf("failed to execute schema initialization: %w", err)
+        return fmt.Errorf("failed to execute DIS schema initialization: %w", err)
     }
 
-    // Additive migrations for existing databases
-    _, _ = s.db.Exec("ALTER TABLE policies ADD COLUMN schedule_ids TEXT NOT NULL DEFAULT ''")
-    _, _ = s.db.Exec("ALTER TABLE schedules ADD COLUMN mode TEXT NOT NULL DEFAULT ''")
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_tier TEXT NOT NULL DEFAULT 'tentative'")
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_anchor TEXT NOT NULL DEFAULT ''")
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN canonical_hostname TEXT NOT NULL DEFAULT ''")
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN current_mac TEXT NOT NULL DEFAULT ''")
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN current_ip TEXT NOT NULL DEFAULT ''")
 
     return nil
 }
 
-func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, schedEng *schedule.Engine) (map[string]string, map[string]string, error) {
+func (s *Storage) migrateV1PDIDs() error {
     s.mu.Lock()
     defer s.mu.Unlock()
 
-    deviceTags := make(map[string]string)
-    macTags := make(map[string]string)
+    var needsMigration int
+    err := s.db.QueryRow(
+        "SELECT COUNT(*) FROM devices WHERE pdid NOT LIKE 'pdid_bia_%' AND pdid NOT LIKE 'pdid_l7_%' AND pdid NOT LIKE 'pdid_tent_%'",
+    ).Scan(&needsMigration)
+    if err != nil || needsMigration == 0 {
+        return nil
+    }
 
-    // 1. Hydrate Tags
-    rows, err := s.db.Query("SELECT id, name, color, precedence, builtin FROM tags")
-    if err == nil {
-        defer rows.Close()
-        for rows.Next() {
-            var t tags.Tag
-            var builtin int
-            if err := rows.Scan(&t.ID, &t.Name, &t.Color, &t.Precedence, &builtin); err == nil {
-                t.Builtin = builtin == 1
-                _ = tagMgr.RestoreTag(t)
-            }
+    slog.Info("Starting v1→v2 PDID migration", "v1_devices", needsMigration)
+
+    rows, err := s.db.Query("SELECT pdid, current_mac, hostname, vendor FROM devices WHERE pdid NOT LIKE 'pdid_bia_%' AND pdid NOT LIKE 'pdid_l7_%' AND pdid NOT LIKE 'pdid_tent_%'")
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+
+    type migrationEntry struct {
+        OldPDID, NewPDID, Tier, Anchor, CanonicalHost string
+    }
+    var migrations []migrationEntry
+
+    for rows.Next() {
+        var oldPDID, mac, hostname, vendor string
+        if err := rows.Scan(&oldPDID, &mac, &hostname, &vendor); err != nil {
+            continue
+        }
+
+        canonicalHost := canonicalizeHostnameLocal(hostname)
+        tier, anchor := inventory.DeriveTierAndAnchor(mac, canonicalHost, vendor)
+        newPDID := inventory.GeneratePDID(tier, anchor)
+
+        migrations = append(migrations, migrationEntry{
+            OldPDID: oldPDID, NewPDID: newPDID,
+            Tier: string(tier), Anchor: anchor, CanonicalHost: canonicalHost,
+        })
+    }
+
+    for _, m := range migrations {
+        tx, _ := s.db.Begin()
+        _, _ = tx.Exec(`INSERT INTO devices (pdid, identity_tier, identity_anchor, canonical_hostname, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online)
+                        SELECT ?, ?, ?, ?, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online FROM devices WHERE pdid = ?`,
+            m.NewPDID, m.Tier, m.Anchor, m.CanonicalHost, m.OldPDID)
+        _, _ = tx.Exec("UPDATE device_macs SET pdid = ? WHERE pdid = ?", m.NewPDID, m.OldPDID)
+        _, _ = tx.Exec("UPDATE device_ips SET pdid = ? WHERE pdid = ?", m.NewPDID, m.OldPDID)
+        _, _ = tx.Exec("DELETE FROM devices WHERE pdid = ?", m.OldPDID)
+        _ = tx.Commit()
+    }
+
+    _, _ = s.db.Exec("DELETE FROM hostname_owners")
+    ownerRows, _ := s.db.Query("SELECT canonical_hostname, pdid FROM devices WHERE canonical_hostname != ''")
+    defer ownerRows.Close()
+    for ownerRows.Next() {
+        var host, pdid string
+        if ownerRows.Scan(&host, &pdid) == nil {
+            _, _ = s.db.Exec("INSERT OR REPLACE INTO hostname_owners (canonical_hostname, pdid, acquired_at) VALUES (?, ?, ?)", host, pdid, time.Now())
         }
     }
 
-    // Automatic DB Seeding: Ensure built-in tags are persisted to SQLite
-    for _, builtInTag := range tagMgr.List() {
-        if builtInTag.Builtin {
-            builtinInt := 1
-            _, _ = s.db.Exec(`
-                INSERT INTO tags (id, name, color, precedence, builtin)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name=excluded.name,
-                    color=excluded.color,
-                    precedence=excluded.precedence
-            `, builtInTag.ID, builtInTag.Name, builtInTag.Color, builtInTag.Precedence, builtinInt)
-        }
-    }
-
-    // 2. Hydrate Device Tags
-    dtRows, err := s.db.Query("SELECT pdid, tag_id, mac FROM device_tags")
-    if err == nil {
-        defer dtRows.Close()
-        for dtRows.Next() {
-            var pdid, tagID, mac string
-            if err := dtRows.Scan(&pdid, &tagID, &mac); err == nil {
-                if pdid != "" {
-                    deviceTags[pdid] = tagID
-                    tagMgr.EnsureTagExists(tagID)
-                }
-                if mac != "" {
-                    macTags[mac] = tagID
-                }
-            }
-        }
-    }
-
-    // 3. Hydrate Policies & Migrate legacy ScheduleID -> ScheduleIDs
-    pRows, err := s.db.Query("SELECT data FROM policies")
-    if err == nil {
-        defer pRows.Close()
-        for pRows.Next() {
-            var dataStr string
-            if err := pRows.Scan(&dataStr); err == nil {
-                var p models.Policy
-                if err := json.Unmarshal([]byte(dataStr), &p); err == nil {
-                    // Self-healing migration for legacy single schedule policies
-                    if len(p.ScheduleIDs) == 0 && p.ScheduleID != nil && *p.ScheduleID != "" {
-                        p.ScheduleIDs = []string{*p.ScheduleID}
-                    }
-                    polEng.UpsertPolicy(p)
-                }
-            }
-        }
-    }
-
-    // 4. Hydrate Schedules & Backfill Mode
-    sRows, err := s.db.Query("SELECT id, name, mode, timezone, rules FROM schedules")
-    if err == nil {
-        defer sRows.Close()
-        for sRows.Next() {
-            var sch models.Schedule
-            var rulesJson string
-            if err := sRows.Scan(&sch.ID, &sch.Name, &sch.Mode, &sch.Timezone, &rulesJson); err == nil {
-                if err := json.Unmarshal([]byte(rulesJson), &sch.Rules); err == nil {
-                    if sch.Mode == "" {
-                        hasAllow := false
-                        for _, r := range sch.Rules {
-                            if r.Action == models.ActionAllow {
-                                hasAllow = true
-                                break
-                            }
-                        }
-                        if hasAllow {
-                            sch.Mode = models.ScheduleModeWhitelist
-                        } else {
-                            sch.Mode = models.ScheduleModeDowntime
-                        }
-                    }
-                    schedEng.UpsertSchedule(sch)
-                }
-            }
-        }
-    }
-
-    slog.Info("Successfully hydrated LIAS state from persistent storage", "device_tags", len(deviceTags), "mac_tags", len(macTags))
-    return deviceTags, macTags, nil
+    slog.Info("v1→v2 PDID migration complete", "migrated", len(migrations))
+    return nil
 }
 
-func (s *Storage) SaveDeviceTag(pdid, tagID, mac string) error {
+func (s *Storage) LoadHydrate() ([]models.Device, error) {
     s.mu.Lock()
     defer s.mu.Unlock()
 
-    _, err := s.db.Exec(`
-        INSERT INTO device_tags (pdid, tag_id, mac)
-        VALUES (?, ?, ?)
-        ON CONFLICT(pdid) DO UPDATE SET tag_id=excluded.tag_id, mac=CASE WHEN excluded.mac != '' THEN excluded.mac ELSE device_tags.mac END
-    `, pdid, tagID, mac)
+    rows, err := s.db.Query(`
+        SELECT pdid, identity_tier, identity_anchor, canonical_hostname, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online
+        FROM devices
+    `)
+    if err != nil {
+        return nil, fmt.Errorf("failed to query devices from DB: %w", err)
+    }
+    defer rows.Close()
 
-    return err
+    deviceMap := make(map[string]*models.Device)
+
+    for rows.Next() {
+        var d models.Device
+        var onlineInt int
+        var firstSeen, lastSeen time.Time
+
+        err := rows.Scan(
+            &d.PDID, &d.IdentityTier, &d.IdentityAnchor, &d.CanonicalHostname,
+            &d.CurrentMAC, &d.CurrentIP, &d.Hostname, &d.FriendlyName, &d.Manufacturer,
+            &d.Vendor, &d.Model, &d.DeviceType, &d.Confidence, &firstSeen, &lastSeen, &onlineInt,
+        )
+        if err != nil {
+            continue
+        }
+
+        d.FirstSeen = firstSeen
+        d.LastSeen = lastSeen
+        d.Online = onlineInt == 1
+        d.MACs = []string{}
+        d.IPs = []string{}
+        d.SourceInfo = make(map[string]models.SourceMeta)
+
+        devCopy := d
+        deviceMap[d.PDID] = &devCopy
+    }
+
+    macRows, err := s.db.Query("SELECT pdid, mac FROM device_macs")
+    if err == nil {
+        defer macRows.Close()
+        for macRows.Next() {
+            var pdid, mac string
+            if macRows.Scan(&pdid, &mac) == nil {
+                if dev, ok := deviceMap[pdid]; ok {
+                    dev.MACs = append(dev.MACs, mac)
+                }
+            }
+        }
+    }
+
+    ipRows, err := s.db.Query("SELECT pdid, ip FROM device_ips")
+    if err == nil {
+        defer ipRows.Close()
+        for ipRows.Next() {
+            var pdid, ip string
+            if ipRows.Scan(&pdid, &ip) == nil {
+                if dev, ok := deviceMap[pdid]; ok {
+                    dev.IPs = append(dev.IPs, ip)
+                }
+            }
+        }
+    }
+
+    devices := make([]models.Device, 0, len(deviceMap))
+    for _, dev := range deviceMap {
+        devices = append(devices, *dev)
+    }
+
+    slog.Info("Successfully hydrated DIS device inventory from SQLite", "count", len(devices))
+    return devices, nil
 }
 
-// MigrateDeviceTag updates the PDID associated with a device tag (GAP-L02)
-func (s *Storage) MigrateDeviceTag(oldPDID, newPDID string) error {
+func (s *Storage) LoadHostnameOwners() (map[string]string, error) {
     s.mu.Lock()
     defer s.mu.Unlock()
 
-    _, err := s.db.Exec(`
-        UPDATE device_tags
-        SET pdid = ?
-        WHERE pdid = ?
-    `, newPDID, oldPDID)
+    rows, err := s.db.Query("SELECT canonical_hostname, pdid FROM hostname_owners")
+    if err != nil {
+        return nil, fmt.Errorf("failed to query hostname owners from DB: %w", err)
+    }
+    defer rows.Close()
 
-    return err
+    owners := make(map[string]string)
+    for rows.Next() {
+        var host, pdid string
+        if err := rows.Scan(&host, &pdid) == nil && host != "" {
+            owners[host] = pdid
+        }
+    }
+    return owners, nil
 }
 
-func (s *Storage) UpdateDeviceTagMAC(pdid, mac string) error {
-    if pdid == "" || mac == "" {
+func (s *Storage) SaveHostnameOwner(canonicalHost, pdid string) error {
+    if canonicalHost == "" || pdid == "" {
         return nil
     }
 
@@ -255,109 +314,230 @@ func (s *Storage) UpdateDeviceTagMAC(pdid, mac string) error {
     defer s.mu.Unlock()
 
     _, err := s.db.Exec(`
-        UPDATE device_tags
-        SET mac = ?
-        WHERE pdid = ? AND (mac = '' OR mac IS NULL)
-    `, mac, pdid)
+        INSERT INTO hostname_owners (canonical_hostname, pdid, acquired_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(canonical_hostname) DO UPDATE SET
+            pdid=excluded.pdid,
+            acquired_at=excluded.acquired_at
+    `, canonicalHost, pdid, time.Now())
 
     return err
 }
 
-func (s *Storage) SaveTag(t tags.Tag) error {
+func (s *Storage) DeleteHostnameOwner(canonicalHost string) error {
+    if canonicalHost == "" {
+        return nil
+    }
+
     s.mu.Lock()
     defer s.mu.Unlock()
 
-    builtinInt := 0
-    if t.Builtin {
-        builtinInt = 1
+    _, err := s.db.Exec("DELETE FROM hostname_owners WHERE canonical_hostname = ?", canonicalHost)
+    return err
+}
+
+// SaveDevice saves a single device using diff-based updates.
+func (s *Storage) SaveDevice(d *models.Device) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    tx, err := s.db.Begin()
+    if err != nil {
+        return err
+    }
+    defer func() { _ = tx.Rollback() }()
+
+    if err := s.saveDeviceTx(tx, d); err != nil {
+        return err
     }
 
+    return tx.Commit()
+}
+
+// SaveDevicesBatch saves multiple devices in a single transaction to reduce disk I/O.
+func (s *Storage) SaveDevicesBatch(devs []*models.Device) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    tx, err := s.db.Begin()
+    if err != nil {
+        return err
+    }
+    defer func() { _ = tx.Rollback() }()
+
+    for _, d := range devs {
+        if err := s.saveDeviceTx(tx, d); err != nil {
+            slog.Error("Failed to save device in batch, continuing", "pdid", d.PDID, "error", err)
+        }
+    }
+
+    return tx.Commit()
+}
+
+// saveDeviceTx performs diff-based MAC/IP updates within a transaction.
+func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
+    if d == nil || d.PDID == "" {
+        return nil
+    }
+
+    onlineInt := 0
+    if d.Online {
+        onlineInt = 1
+    }
+
+    _, err := tx.Exec(`
+        INSERT INTO devices (pdid, identity_tier, identity_anchor, canonical_hostname, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(pdid) DO UPDATE SET
+            identity_tier=excluded.identity_tier,
+            identity_anchor=excluded.identity_anchor,
+            canonical_hostname=excluded.canonical_hostname,
+            current_mac=excluded.current_mac,
+            current_ip=excluded.current_ip,
+            hostname=excluded.hostname,
+            friendly_name=excluded.friendly_name,
+            manufacturer=excluded.manufacturer,
+            vendor=excluded.vendor,
+            model=excluded.model,
+            device_type=excluded.device_type,
+            confidence=excluded.confidence,
+            last_seen=excluded.last_seen,
+            online=excluded.online
+    `, d.PDID, string(d.IdentityTier), d.IdentityAnchor, d.CanonicalHostname, d.CurrentMAC, d.CurrentIP, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt)
+
+    if err != nil {
+        return fmt.Errorf("failed to upsert device %s: %w", d.PDID, err)
+    }
+
+    // DIS-IO-02 Fix: Diff-based MAC updates
+    existingMACs := make(map[string]bool)
+    macRows, err := tx.Query("SELECT mac FROM device_macs WHERE pdid = ?", d.PDID)
+    if err == nil {
+        for macRows.Next() {
+            var mac string
+            macRows.Scan(&mac)
+            existingMACs[mac] = true
+        }
+        macRows.Close()
+    }
+
+    desiredMACs := make(map[string]bool)
+    for _, mac := range d.MACs {
+        if mac != "" {
+            desiredMACs[mac] = true
+        }
+    }
+
+    for mac := range desiredMACs {
+        if !existingMACs[mac] {
+            _, _ = tx.Exec("INSERT OR IGNORE INTO device_macs (pdid, mac) VALUES (?, ?)", d.PDID, mac)
+        }
+    }
+    for mac := range existingMACs {
+        if !desiredMACs[mac] {
+            _, _ = tx.Exec("DELETE FROM device_macs WHERE pdid = ? AND mac = ?", d.PDID, mac)
+        }
+    }
+
+    // DIS-IO-02 Fix: Diff-based IP updates
+    existingIPs := make(map[string]bool)
+    ipRows, err := tx.Query("SELECT ip FROM device_ips WHERE pdid = ?", d.PDID)
+    if err == nil {
+        for ipRows.Next() {
+            var ip string
+            ipRows.Scan(&ip)
+            existingIPs[ip] = true
+        }
+        ipRows.Close()
+    }
+
+    desiredIPs := make(map[string]bool)
+    for _, ip := range d.IPs {
+        if ip != "" {
+            desiredIPs[ip] = true
+        }
+    }
+
+    for ip := range desiredIPs {
+        if !existingIPs[ip] {
+            _, _ = tx.Exec("INSERT OR IGNORE INTO device_ips (pdid, ip) VALUES (?, ?)", d.PDID, ip)
+        }
+    }
+    for ip := range existingIPs {
+        if !desiredIPs[ip] {
+            _, _ = tx.Exec("DELETE FROM device_ips WHERE pdid = ? AND ip = ?", d.PDID, ip)
+        }
+    }
+
+    return nil
+}
+
+func (s *Storage) DeleteDevice(pdid string) error {
+    if pdid == "" {
+        return nil
+    }
+
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    tx, err := s.db.Begin()
+    if err != nil {
+        return err
+    }
+    defer func() { _ = tx.Rollback() }()
+
+    _, _ = tx.Exec("DELETE FROM device_macs WHERE pdid = ?", pdid)
+    _, _ = tx.Exec("DELETE FROM device_ips WHERE pdid = ?", pdid)
+    _, _ = tx.Exec("DELETE FROM hostname_owners WHERE pdid = ?", pdid)
+    _, _ = tx.Exec("DELETE FROM devices WHERE pdid = ?", pdid)
+
+    return tx.Commit()
+}
+
+func (s *Storage) SavePendingEvent(pdid, eventType string, payload []byte, firstSeen, lastSeen time.Time, confirmations int, sources string) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    payloadStr := string(payload)
     _, err := s.db.Exec(`
-        INSERT INTO tags (id, name, color, precedence, builtin)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            name=excluded.name,
-            color=excluded.color,
-            precedence=excluded.precedence
-    `, t.ID, t.Name, t.Color, t.Precedence, builtinInt)
+        INSERT INTO pending_events (pdid, event_type, payload, first_seen, last_seen, confirmations, sources)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(pdid, event_type) DO UPDATE SET
+            payload=excluded.payload,
+            last_seen=excluded.last_seen,
+            confirmations=excluded.confirmations,
+            sources=excluded.sources
+    `, pdid, eventType, payloadStr, firstSeen, lastSeen, confirmations, sources)
 
     return err
 }
 
-func (s *Storage) DeleteTag(id string) error {
+func (s *Storage) DeletePendingEvent(pdid, eventType string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
-    _, err := s.db.Exec("DELETE FROM tags WHERE id = ?", id)
+
+    _, err := s.db.Exec("DELETE FROM pending_events WHERE pdid = ? AND event_type = ?", pdid, eventType)
     return err
 }
 
-func (s *Storage) SavePolicy(p models.Policy) error {
+func (s *Storage) LoadPendingEvents() ([]PendingEventRecord, error) {
     s.mu.Lock()
     defer s.mu.Unlock()
 
-    dataBytes, err := json.Marshal(p)
+    rows, err := s.db.Query("SELECT pdid, event_type, payload, first_seen, last_seen, confirmations, sources FROM pending_events")
     if err != nil {
-        return err
+        return nil, err
     }
+    defer rows.Close()
 
-    schedID := ""
-    if p.ScheduleID != nil {
-        schedID = *p.ScheduleID
+    var records []PendingEventRecord
+    for rows.Next() {
+        var r PendingEventRecord
+        if err := rows.Scan(&r.PDID, &r.EventType, &r.Payload, &r.FirstSeen, &r.LastSeen, &r.Confirmations, &r.Sources); err == nil {
+            records = append(records, r)
+        }
     }
-
-    schedIDsBytes, _ := json.Marshal(p.GetScheduleIDs())
-
-    _, err = s.db.Exec(`
-        INSERT INTO policies (id, name, type, target_id, action, schedule_id, schedule_ids, priority, data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            name=excluded.name,
-            type=excluded.type,
-            target_id=excluded.target_id,
-            action=excluded.action,
-            schedule_id=excluded.schedule_id,
-            schedule_ids=excluded.schedule_ids,
-            priority=excluded.priority,
-            data=excluded.data
-    `, p.ID, p.Name, p.Type, p.TargetID, p.Action, schedID, string(schedIDsBytes), p.Priority, string(dataBytes))
-
-    return err
-}
-
-func (s *Storage) DeletePolicy(id string) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    _, err := s.db.Exec("DELETE FROM policies WHERE id = ?", id)
-    return err
-}
-
-func (s *Storage) SaveSchedule(sch models.Schedule) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-
-    rulesBytes, err := json.Marshal(sch.Rules)
-    if err != nil {
-        return err
-    }
-
-    _, err = s.db.Exec(`
-        INSERT INTO schedules (id, name, mode, timezone, rules)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            name=excluded.name,
-            mode=excluded.mode,
-            timezone=excluded.timezone,
-            rules=excluded.rules
-    `, sch.ID, sch.Name, sch.Mode, sch.Timezone, string(rulesBytes))
-
-    return err
-}
-
-func (s *Storage) DeleteSchedule(id string) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    _, err := s.db.Exec("DELETE FROM schedules WHERE id = ?", id)
-    return err
+    return records, nil
 }
 
 func (s *Storage) Close() error {
@@ -367,4 +547,34 @@ func (s *Storage) Close() error {
         return s.db.Close()
     }
     return nil
+}
+
+func canonicalizeHostnameLocal(raw string) string {
+    h := strings.ToLower(strings.TrimSpace(raw))
+    h = strings.TrimSuffix(h, ".")
+    if h == "" {
+        return ""
+    }
+
+    var canonicalSuffixes = []string{
+        ".home.arpa", ".localdomain", ".internal", ".local", ".lan", ".home", ".corp", ".priv", ".intranet",
+    }
+
+    changed := true
+    for changed {
+        changed = false
+        for _, suf := range canonicalSuffixes {
+            if strings.HasSuffix(h, suf) {
+                h = strings.TrimSuffix(h, suf)
+                changed = true
+                break
+            }
+        }
+    }
+
+    for strings.Contains(h, "..") {
+        h = strings.ReplaceAll(h, "..", ".")
+    }
+
+    return strings.Trim(h, ".")
 }
