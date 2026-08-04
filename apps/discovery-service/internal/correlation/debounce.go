@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/debounce.go
-// Version: 2.4
+// Version: 2.5
 package correlation
 
 import (
@@ -19,7 +19,7 @@ import (
 
 type PendingEventStore interface {
     SavePendingEvent(pdid, eventType string, payload []byte, firstSeen, lastSeen time.Time, confirmations int, sources string) error
-    DeletePendingEvent(pdid, eventType string) error
+    DeletePendingEventsBatch(records []PendingEventRecord) error // IO-08 Fix: Batch delete
 }
 
 type PendingChange struct {
@@ -71,7 +71,6 @@ func (d *Debouncer) LoadPending(records []PendingEventRecord) {
 
         reqConf := 1
         evtType := models.EventType(r.EventType)
-        // Gap 3 Fix: MAC Changed only requires 1 confirmation
         if evtType == models.EventHostnameChanged || evtType == models.EventDeviceOnline {
             reqConf = 2
         }
@@ -160,7 +159,6 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
     p, exists := d.pending[key]
     if !exists {
         reqConf := 1
-        // Gap 3 Fix: MAC Changed only requires 1 confirmation
         if eventType == models.EventHostnameChanged || eventType == models.EventDeviceOnline {
             reqConf = 2
         }
@@ -196,11 +194,8 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
         p.Confirmations = len(p.Sources)
     }
 
-    if d.store != nil {
-        payloadBytes, _ := json.Marshal(p.Payload)
-        sourcesStr := strings.Join(p.ConfirmedBy, ",")
-        _ = d.store.SavePendingEvent(p.PDID, string(p.EventType), payloadBytes, p.FirstSeen, p.LastSeen, p.Confirmations, sourcesStr)
-    }
+    // IO-01 Fix: Removed per-Submit DB write.
+    // Pending events are written to DB in the Flush loop for crash recovery.
 }
 
 func (d *Debouncer) Flush() {
@@ -208,17 +203,32 @@ func (d *Debouncer) Flush() {
     defer d.mu.Unlock()
 
     now := time.Now()
+    var confirmedRecords []PendingEventRecord
+
     for key, p := range d.pending {
+        // IO-01 Fix: Write pending state to DB here for crash recovery
+        if d.store != nil {
+            payloadBytes, _ := json.Marshal(p.Payload)
+            sourcesStr := strings.Join(p.ConfirmedBy, ",")
+            _ = d.store.SavePendingEvent(p.PDID, string(p.EventType), payloadBytes, p.FirstSeen, p.LastSeen, p.Confirmations, sourcesStr)
+        }
+
         if p.Confirmations >= p.RequiredConfirmations || now.Sub(p.FirstSeen) > 10*time.Second {
             p.Payload.ConfirmedBy = p.ConfirmedBy
             evt := models.NewEvent(p.EventType, p.PDID, p.Payload)
             d.broker.Broadcast(evt)
+            
+            confirmedRecords = append(confirmedRecordes, PendingEventRecord{
+                PDID:      p.PDID,
+                EventType: string(p.EventType),
+            })
             delete(d.pending, key)
-
-            if d.store != nil {
-                _ = d.store.DeletePendingEvent(p.PDID, string(p.EventType))
-            }
         }
+    }
+
+    // IO-08 Fix: Batch delete confirmed events from DB
+    if d.store != nil && len(confirmedRecords) > 0 {
+        _ = d.store.DeletePendingEventsBatch(confirmedRecords)
     }
 
     for k, t := range d.recentValTime {
