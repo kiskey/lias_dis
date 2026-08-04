@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 1.9
+// Version: 2.0
 package storage
 
 import (
@@ -12,6 +12,7 @@ import (
     "os"
     "path/filepath"
     "sync"
+    "time"
 
     "github.com/user/lias-dis/apps/lias/internal/policy"
     "github.com/user/lias-dis/apps/lias/internal/schedule"
@@ -21,7 +22,7 @@ import (
 )
 
 type Storage struct {
-    mu     sync.RWMutex // LIAS-STOR-09 Fix: RWMutex allows concurrent reads
+    mu     sync.RWMutex
     dbPath string
     db     *sql.DB
 }
@@ -77,13 +78,11 @@ func (s *Storage) initSchema() error {
         mac TEXT NOT NULL DEFAULT ''
     );
 
-    -- UI-FN-12 Fix: Manual device overrides
     CREATE TABLE IF NOT EXISTS device_overrides (
         pdid TEXT PRIMARY KEY,
         friendly_name TEXT NOT NULL DEFAULT ''
     );
 
-    -- SYS-FEAT-03 Fix: Per-User identity mapping
     CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL
@@ -103,7 +102,7 @@ func (s *Storage) initSchema() error {
         schedule_id TEXT,
         schedule_ids TEXT NOT NULL DEFAULT '',
         priority INTEGER NOT NULL,
-        enabled INTEGER NOT NULL DEFAULT 1, -- LIAS-POL-01 Fix
+        enabled INTEGER NOT NULL DEFAULT 1,
         data TEXT NOT NULL
     );
 
@@ -115,6 +114,17 @@ func (s *Storage) initSchema() error {
         rules TEXT NOT NULL
     );
 
+    -- UI-FN-08/SYS-FEAT-04 Fix: Flow logs for reporting
+    CREATE TABLE IF NOT EXISTS flow_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME NOT NULL,
+        pdid TEXT NOT NULL,
+        action TEXT NOT NULL,
+        bytes INTEGER NOT NULL DEFAULT 0
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_flow_logs_pdid ON flow_logs(pdid);
+    CREATE INDEX IF NOT EXISTS idx_flow_logs_ts ON flow_logs(timestamp);
     CREATE INDEX IF NOT EXISTS idx_device_tags_mac ON device_tags(mac);
     `
 
@@ -123,10 +133,9 @@ func (s *Storage) initSchema() error {
         return fmt.Errorf("failed to execute schema initialization: %w", err)
     }
 
-    // Additive migrations for existing databases
     _, _ = s.db.Exec("ALTER TABLE policies ADD COLUMN schedule_ids TEXT NOT NULL DEFAULT ''")
     _, _ = s.db.Exec("ALTER TABLE schedules ADD COLUMN mode TEXT NOT NULL DEFAULT ''")
-    _, _ = s.db.Exec("ALTER TABLE policies ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1") // LIAS-POL-01
+    _, _ = s.db.Exec("ALTER TABLE policies ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
 
     return nil
 }
@@ -138,7 +147,6 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
     deviceTags := make(map[string]string)
     macTags := make(map[string]string)
 
-    // 1. Hydrate Tags
     rows, err := s.db.Query("SELECT id, name, color, precedence, builtin FROM tags")
     if err == nil {
         defer rows.Close()
@@ -166,7 +174,6 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
         }
     }
 
-    // 2. Hydrate Device Tags
     dtRows, err := s.db.Query("SELECT pdid, tag_id, mac FROM device_tags")
     if err == nil {
         defer dtRows.Close()
@@ -184,7 +191,6 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
         }
     }
 
-    // 3. Hydrate Policies
     pRows, err := s.db.Query("SELECT data, enabled FROM policies")
     if err == nil {
         defer pRows.Close()
@@ -197,14 +203,13 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
                     if len(p.ScheduleIDs) == 0 && p.ScheduleID != nil && *p.ScheduleID != "" {
                         p.ScheduleIDs = []string{*p.ScheduleID}
                     }
-                    p.Enabled = enabledInt == 1 // LIAS-POL-01
+                    p.Enabled = enabledInt == 1
                     polEng.UpsertPolicy(p)
                 }
             }
         }
     }
 
-    // 4. Hydrate Schedules
     sRows, err := s.db.Query("SELECT id, name, mode, timezone, rules FROM schedules")
     if err == nil {
         defer sRows.Close()
@@ -240,91 +245,50 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
 func (s *Storage) SaveDeviceTag(pdid, tagID, mac string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
-
-    _, err := s.db.Exec(`
-        INSERT INTO device_tags (pdid, tag_id, mac)
-        VALUES (?, ?, ?)
-        ON CONFLICT(pdid) DO UPDATE SET tag_id=excluded.tag_id, mac=CASE WHEN excluded.mac != '' THEN excluded.mac ELSE device_tags.mac END
-    `, pdid, tagID, mac)
-
+    _, err := s.db.Exec(`INSERT INTO device_tags (pdid, tag_id, mac) VALUES (?, ?, ?) ON CONFLICT(pdid) DO UPDATE SET tag_id=excluded.tag_id, mac=CASE WHEN excluded.mac != '' THEN excluded.mac ELSE device_tags.mac END`, pdid, tagID, mac)
     return err
 }
 
 func (s *Storage) MigrateDeviceTag(oldPDID, newPDID string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
-
-    _, err := s.db.Exec(`
-        UPDATE device_tags
-        SET pdid = ?
-        WHERE pdid = ?
-    `, newPDID, oldPDID)
-
+    _, err := s.db.Exec(`UPDATE device_tags SET pdid = ? WHERE pdid = ?`, newPDID, oldPDID)
     return err
 }
 
 func (s *Storage) UpdateDeviceTagMAC(pdid, mac string) error {
-    if pdid == "" || mac == "" {
-        return nil
-    }
-
+    if pdid == "" || mac == "" { return nil }
     s.mu.Lock()
     defer s.mu.Unlock()
-
-    _, err := s.db.Exec(`
-        UPDATE device_tags
-        SET mac = ?
-        WHERE pdid = ? AND (mac = '' OR mac IS NULL)
-    `, mac, pdid)
-
+    _, err := s.db.Exec(`UPDATE device_tags SET mac = ? WHERE pdid = ? AND (mac = '' OR mac IS NULL)`, mac, pdid)
     return err
 }
 
-// UI-FN-12 Fix: Save manual device rename
 func (s *Storage) SaveDeviceOverride(pdid, friendlyName string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
-
-    _, err := s.db.Exec(`
-        INSERT INTO device_overrides (pdid, friendly_name)
-        VALUES (?, ?)
-        ON CONFLICT(pdid) DO UPDATE SET friendly_name=excluded.friendly_name
-    `, pdid, friendlyName)
-
+    _, err := s.db.Exec(`INSERT INTO device_overrides (pdid, friendly_name) VALUES (?, ?) ON CONFLICT(pdid) DO UPDATE SET friendly_name=excluded.friendly_name`, pdid, friendlyName)
     return err
 }
 
 func (s *Storage) LoadDeviceOverrides() (map[string]string, error) {
     s.mu.RLock()
     defer s.mu.RUnlock()
-
     rows, err := s.db.Query("SELECT pdid, friendly_name FROM device_overrides")
-    if err != nil {
-        return nil, err
-    }
+    if err != nil { return nil, err }
     defer rows.Close()
-
     overrides := make(map[string]string)
     for rows.Next() {
         var pdid, name string
-        if rows.Scan(&pdid, &name) == nil {
-            overrides[pdid] = name
-        }
+        if rows.Scan(&pdid, &name) == nil { overrides[pdid] = name }
     }
     return overrides, nil
 }
 
-// SYS-FEAT-03 Fix: Per-User identity mapping
 func (s *Storage) SaveUser(u models.User) error {
     s.mu.Lock()
     defer s.mu.Unlock()
-
-    _, err := s.db.Exec(`
-        INSERT INTO users (id, name)
-        VALUES (?, ?)
-        ON CONFLICT(id) DO UPDATE SET name=excluded.name
-    `, u.ID, u.Name)
-
+    _, err := s.db.Exec(`INSERT INTO users (id, name) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name`, u.ID, u.Name)
     return err
 }
 
@@ -338,32 +302,20 @@ func (s *Storage) DeleteUser(id string) error {
 func (s *Storage) AssignDeviceToUser(pdid, userID string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
-
-    _, err := s.db.Exec(`
-        INSERT INTO device_users (pdid, user_id)
-        VALUES (?, ?)
-        ON CONFLICT(pdid) DO UPDATE SET user_id=excluded.user_id
-    `, pdid, userID)
-
+    _, err := s.db.Exec(`INSERT INTO device_users (pdid, user_id) VALUES (?, ?) ON CONFLICT(pdid) DO UPDATE SET user_id=excluded.user_id`, pdid, userID)
     return err
 }
 
 func (s *Storage) LoadUserAssignments() (map[string]string, error) {
     s.mu.RLock()
     defer s.mu.RUnlock()
-
     rows, err := s.db.Query("SELECT pdid, user_id FROM device_users")
-    if err != nil {
-        return nil, err
-    }
+    if err != nil { return nil, err }
     defer rows.Close()
-
     mappings := make(map[string]string)
     for rows.Next() {
         var pdid, uid string
-        if rows.Scan(&pdid, &uid) == nil {
-            mappings[pdid] = uid
-        }
+        if rows.Scan(&pdid, &uid) == nil { mappings[pdid] = uid }
     }
     return mappings, nil
 }
@@ -371,21 +323,9 @@ func (s *Storage) LoadUserAssignments() (map[string]string, error) {
 func (s *Storage) SaveTag(t tags.Tag) error {
     s.mu.Lock()
     defer s.mu.Unlock()
-
     builtinInt := 0
-    if t.Builtin {
-        builtinInt = 1
-    }
-
-    _, err := s.db.Exec(`
-        INSERT INTO tags (id, name, color, precedence, builtin)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            name=excluded.name,
-            color=excluded.color,
-            precedence=excluded.precedence
-    `, t.ID, t.Name, t.Color, t.Precedence, builtinInt)
-
+    if t.Builtin { builtinInt = 1 }
+    _, err := s.db.Exec(`INSERT INTO tags (id, name, color, precedence, builtin) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, color=excluded.color, precedence=excluded.precedence`, t.ID, t.Name, t.Color, t.Precedence, builtinInt)
     return err
 }
 
@@ -399,39 +339,15 @@ func (s *Storage) DeleteTag(id string) error {
 func (s *Storage) SavePolicy(p models.Policy) error {
     s.mu.Lock()
     defer s.mu.Unlock()
-
     dataBytes, err := json.Marshal(p)
-    if err != nil {
-        return err
-    }
-
+    if err != nil { return err }
     schedID := ""
-    if p.ScheduleID != nil {
-        schedID = *p.ScheduleID
-    }
-
+    if p.ScheduleID != nil { schedID = *p.ScheduleID }
     schedIDsBytes, _ := json.Marshal(p.GetScheduleIDs())
-    
     enabledInt := 0
-    if p.Enabled { // LIAS-POL-01
-        enabledInt = 1
-    }
+    if p.Enabled { enabledInt = 1 }
 
-    _, err = s.db.Exec(`
-        INSERT INTO policies (id, name, type, target_id, action, schedule_id, schedule_ids, priority, enabled, data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            name=excluded.name,
-            type=excluded.type,
-            target_id=excluded.target_id,
-            action=excluded.action,
-            schedule_id=excluded.schedule_id,
-            schedule_ids=excluded.schedule_ids,
-            priority=excluded.priority,
-            enabled=excluded.enabled,
-            data=excluded.data
-    `, p.ID, p.Name, p.Type, p.TargetID, p.Action, schedID, string(schedIDsBytes), p.Priority, enabledInt, string(dataBytes))
-
+    _, err = s.db.Exec(`INSERT INTO policies (id, name, type, target_id, action, schedule_id, schedule_ids, priority, enabled, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, target_id=excluded.target_id, action=excluded.action, schedule_id=excluded.schedule_id, schedule_ids=excluded.schedule_ids, priority=excluded.priority, enabled=excluded.enabled, data=excluded.data`, p.ID, p.Name, p.Type, p.TargetID, p.Action, schedID, string(schedIDsBytes), p.Priority, enabledInt, string(dataBytes))
     return err
 }
 
@@ -442,25 +358,61 @@ func (s *Storage) DeletePolicy(id string) error {
     return err
 }
 
-func (s *Storage) SaveSchedule(sch models.Schedule) error {
+// LIAS-POL-08 Fix: ExportPolicies retrieves all policies as raw JSON array
+func (s *Storage) ExportPolicies() ([]byte, error) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    rows, err := s.db.Query("SELECT data FROM policies")
+    if err != nil { return nil, err }
+    defer rows.Close()
+    
+    var policies []json.RawMessage
+    for rows.Next() {
+        var dataStr string
+        if err := rows.Scan(&dataStr); err == nil {
+            policies = append(policies, json.RawMessage(dataStr))
+        }
+    }
+    return json.Marshal(policies)
+}
+
+// LIAS-POL-08 Fix: ImportPolicies takes a JSON array and upserts them
+func (s *Storage) ImportPolicies(jsonData []byte) error {
+    var policies []models.Policy
+    if err := json.Unmarshal(jsonData, &policies); err != nil {
+        return fmt.Errorf("invalid policy JSON array: %w", err)
+    }
+
     s.mu.Lock()
     defer s.mu.Unlock()
 
-    rulesBytes, err := json.Marshal(sch.Rules)
-    if err != nil {
-        return err
+    tx, err := s.db.Begin()
+    if err != nil { return err }
+    defer func() { _ = tx.Rollback() }()
+
+    for _, p := range policies {
+        if p.ID == "" { continue }
+        dataBytes, _ := json.Marshal(p)
+        schedID := ""
+        if p.ScheduleID != nil { schedID = *p.ScheduleID }
+        schedIDsBytes, _ := json.Marshal(p.GetScheduleIDs())
+        enabledInt := 0
+        if p.Enabled { enabledInt = 1 }
+
+        _, err = tx.Exec(`INSERT INTO policies (id, name, type, target_id, action, schedule_id, schedule_ids, priority, enabled, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, target_id=excluded.target_id, action=excluded.action, schedule_id=excluded.schedule_id, schedule_ids=excluded.schedule_ids, priority=excluded.priority, enabled=excluded.enabled, data=excluded.data`, p.ID, p.Name, p.Type, p.TargetID, p.Action, schedID, string(schedIDsBytes), p.Priority, enabledInt, string(dataBytes))
+        if err != nil {
+            slog.Warn("Failed to import policy, skipping", "id", p.ID, "error", err)
+        }
     }
+    return tx.Commit()
+}
 
-    _, err = s.db.Exec(`
-        INSERT INTO schedules (id, name, mode, timezone, rules)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            name=excluded.name,
-            mode=excluded.mode,
-            timezone=excluded.timezone,
-            rules=excluded.rules
-    `, sch.ID, sch.Name, sch.Mode, sch.Timezone, string(rulesBytes))
-
+func (s *Storage) SaveSchedule(sch models.Schedule) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    rulesBytes, err := json.Marshal(sch.Rules)
+    if err != nil { return err }
+    _, err = s.db.Exec(`INSERT INTO schedules (id, name, mode, timezone, rules) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, mode=excluded.mode, timezone=excluded.timezone, rules=excluded.rules`, sch.ID, sch.Name, sch.Mode, sch.Timezone, string(rulesBytes))
     return err
 }
 
@@ -471,11 +423,60 @@ func (s *Storage) DeleteSchedule(id string) error {
     return err
 }
 
+// UI-FN-08 Fix: Save flow log entry
+func (s *Storage) SaveFlowLog(pdid string, action models.Action, bytes int64) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    _, err := s.db.Exec("INSERT INTO flow_logs (timestamp, pdid, action, bytes) VALUES (?, ?, ?, ?)", time.Now(), pdid, string(action), bytes)
+    return err
+}
+
+// UI-FN-08 Fix: Get flow logs for a specific device
+func (s *Storage) GetDeviceFlowLogs(pdid string, limit int) ([]models.FlowLog, error) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    
+    if limit <= 0 || limit > 1000 { limit = 100 }
+    
+    rows, err := s.db.Query("SELECT timestamp, action, bytes FROM flow_logs WHERE pdid = ? ORDER BY timestamp DESC LIMIT ?", pdid, limit)
+    if err != nil { return nil, err }
+    defer rows.Close()
+
+    var logs []models.FlowLog
+    for rows.Next() {
+        var l models.FlowLog
+        l.PDID = pdid
+        if err := rows.Scan(&l.Timestamp, &l.Action, &l.Bytes); err == nil {
+            logs = append(logs, l)
+        }
+    }
+    return logs, nil
+}
+
+// UI-FN-08 Fix: Get aggregate network stats for dashboard
+func (s *Storage) GetNetworkStats() (models.NetworkStats, error) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+
+    var stats models.NetworkStats
+    
+    // Total blocked events in last 24h
+    err := s.db.QueryRow("SELECT COUNT(*) FROM flow_logs WHERE action = 'block' AND timestamp > datetime('now', '-1 day')").Scan(&stats.BlockedEvents24h)
+    if err != nil { return stats, err }
+    
+    // Top blocked device
+    var topPDID string
+    err = s.db.QueryRow("SELECT pdid FROM flow_logs WHERE action = 'block' AND timestamp > datetime('now', '-1 day') GROUP BY pdid ORDER BY COUNT(*) DESC LIMIT 1").Scan(&topPDID)
+    if err == nil {
+        stats.TopBlockedDevicePDID = topPDID
+    }
+
+    return stats, nil
+}
+
 func (s *Storage) Close() error {
     s.mu.Lock()
     defer s.mu.Unlock()
-    if s.db != nil {
-        return s.db.Close()
-    }
+    if s.db != nil { return s.db.Close() }
     return nil
 }
