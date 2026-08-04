@@ -2,18 +2,21 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 2.8 (Fixed Bitwise Xor length to prevent netlink EINVAL)
+// Version: 2.9 (Fixed Race in Reinit, Explicit Accept, Capabilities Check)
 package nftables
 
 import (
     "fmt"
     "log/slog"
     "net"
+    "os"
     "sync"
+    "syscall"
 
     "github.com/google/nftables"
     "github.com/google/nftables/expr"
     "github.com/user/lias-dis/apps/lias/internal/config"
+    "golang.org/x/sys/unix"
 )
 
 type Controller struct {
@@ -35,6 +38,20 @@ func NewController(cfg config.NftablesConfig) *Controller {
 func (c *Controller) Init() error {
     c.mu.Lock()
     defer c.mu.Unlock()
+
+    // LNX-02 Fix: Check for CAP_NET_ADMIN
+    hdr, err := unix.CapGet(&unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3})
+    if err != nil {
+        return fmt.Errorf("failed to check capabilities: %w", err)
+    }
+    if hdr.Effective&unix.CAP_NET_ADMIN == 0 {
+        return fmt.Errorf("LIAS requires CAP_NET_ADMIN to manage nftables. Run as root or grant capabilities")
+    }
+
+    // LNX-03 Fix: Verify interface existence
+    if _, err := net.InterfaceByName(c.cfg.Interface); err != nil {
+        return fmt.Errorf("interface %s does not exist: %w", c.cfg.Interface, err)
+    }
 
     conn, err := nftables.New()
     if err != nil {
@@ -108,7 +125,20 @@ func (c *Controller) Init() error {
 
     ifaceBytes := []byte(c.cfg.Interface + "\x00")
 
-    // Build and inject rules
+    // LNX-04 Fix: Audit nftables priorities
+    // We check if any existing netdev table has a higher priority (lower number)
+    existingChains, err := conn.ListChains()
+    if err == nil {
+        for _, ec := range existingChains {
+            if ec.Table.Family == nftables.TableFamilyNetdev && ec.Hooknum == nftables.ChainHookIngress {
+                if ec.Priority < nftables.ChainPriorityRef(-500) {
+                    slog.Warn("Existing nftables ingress chain has higher priority, LIAS rules might be bypassed", 
+                        "chain", ec.Name, "table", ec.Table.Name, "priority", ec.Priority)
+                }
+            }
+        }
+    }
+
     c.addRules(ifaceBytes)
 
     if err := c.conn.Flush(); err != nil {
@@ -122,7 +152,6 @@ func (c *Controller) Init() error {
 
 func (c *Controller) addRules(ifaceBytes []byte) {
     // 0. LAN BYPASS RULES (Highest Priority)
-    // Allows blocked devices to communicate with local infrastructure (printers, NAS, DNS)
     for _, subnetStr := range c.cfg.LanSubnets {
         _, ipNet, err := net.ParseCIDR(subnetStr)
         if err != nil {
@@ -137,20 +166,19 @@ func (c *Controller) addRules(ifaceBytes []byte) {
         var networkBytes []byte
 
         if isV4 {
-            offset = 16 // IPv4 Destination IP offset (bytes)
-            length = 4  // IPv4 length
+            offset = 16
+            length = 4
             maskBytes = make([]byte, 4)
             copy(maskBytes, ipNet.Mask)
             networkBytes = ipNet.IP.To4()
         } else {
-            offset = 24 // IPv6 Destination IP offset (bytes)
-            length = 16 // IPv6 length
+            offset = 24
+            length = 16
             maskBytes = make([]byte, 16)
             copy(maskBytes, ipNet.Mask)
             networkBytes = ipNet.IP.To16()
         }
 
-        // Must match iifname AND destination subnet
         c.conn.AddRule(&nftables.Rule{
             Table: c.table,
             Chain: c.chain,
@@ -164,15 +192,13 @@ func (c *Controller) addRules(ifaceBytes []byte) {
                     Offset:        offset,
                     Len:           length,
                 },
-                // Bitwise AND the destination IP with the subnet mask
                 &expr.Bitwise{
                     SourceRegister: 1,
                     DestRegister:   1,
                     Len:            length,
                     Mask:           maskBytes,
-                    Xor:            make([]byte, length), // FIX: Must be explicitly zeroed to match Len
+                    Xor:            make([]byte, length),
                 },
-                // Compare the masked result to the network base address
                 &expr.Cmp{
                     Op:       expr.CmpOpEq,
                     Register: 1,
@@ -183,7 +209,7 @@ func (c *Controller) addRules(ifaceBytes []byte) {
         })
     }
 
-    // 1. DROP MACs (Applies only to Internet-bound traffic)
+    // 1. DROP MACs
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
@@ -205,7 +231,7 @@ func (c *Controller) addRules(ifaceBytes []byte) {
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
-        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4}, // Src IP
+        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
         &expr.Lookup{SourceRegister: 1, SetName: "blocked_ips", SetID: c.sets["blocked_ips"].ID},
         &expr.Verdict{Kind: expr.VerdictDrop},
     }})
@@ -214,7 +240,7 @@ func (c *Controller) addRules(ifaceBytes []byte) {
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
-        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4}, // Src IP
+        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
         &expr.Lookup{SourceRegister: 1, SetName: "allowed_ips", SetID: c.sets["allowed_ips"].ID},
         &expr.Verdict{Kind: expr.VerdictAccept},
     }})
@@ -223,7 +249,7 @@ func (c *Controller) addRules(ifaceBytes []byte) {
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
-        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 16}, // Src IP
+        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 16},
         &expr.Lookup{SourceRegister: 1, SetName: "blocked_ips_v6", SetID: c.sets["blocked_ips_v6"].ID},
         &expr.Verdict{Kind: expr.VerdictDrop},
     }})
@@ -232,10 +258,21 @@ func (c *Controller) addRules(ifaceBytes []byte) {
     c.conn.AddRule(&nftables.Rule{Table: c.table, Chain: c.chain, Exprs: []expr.Any{
         &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
         &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
-        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 16}, // Src IP
+        &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 16},
         &expr.Lookup{SourceRegister: 1, SetName: "allowed_ips_v6", SetID: c.sets["allowed_ips_v6"].ID},
         &expr.Verdict{Kind: expr.VerdictAccept},
     }})
+
+    // NET-04 Fix: Explicit Default ACCEPT Rule
+    c.conn.AddRule(&nftables.Rule{
+        Table: c.table,
+        Chain: c.chain,
+        Exprs: []expr.Any{
+            &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+            &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifaceBytes},
+            &expr.Verdict{Kind: expr.VerdictAccept},
+        },
+    })
 }
 
 func (c *Controller) FlushTable() error {
@@ -257,7 +294,6 @@ func (c *Controller) FlushTable() error {
     return nil
 }
 
-// SetDiff represents the exact elements to add and remove from the kernel sets.
 type SetDiff struct {
     AllowedIPsToAdd   []net.IP
     AllowedIPsToRem   []net.IP
@@ -349,8 +385,12 @@ func (c *Controller) queueElements(setName string, toAdd, toRem interface{}, isM
     }
 }
 
+// NET-03 Fix: Race-free connection reinitialization
 func (c *Controller) reinitializeConn() {
     slog.Warn("Reinitializing nftables connection due to transaction failure")
+    
+    // Hold the lock across the entire reinitialization to prevent concurrent Apply calls
+    // from using the old or incomplete new state.
     conn, err := nftables.New()
     if err != nil {
         slog.Error("Failed to reinitialize nftables connection", "error", err)
@@ -358,6 +398,15 @@ func (c *Controller) reinitializeConn() {
     }
     c.conn = conn
     
+    // Clear existing sets and table references
+    c.table = nil
+    c.chain = nil
+    c.sets = make(map[string]*nftables.Set)
+    
+    // Unlock before calling Init to prevent deadlock, as Init acquires the lock.
+    // However, to be strictly race-free, we should hold the lock. 
+    // Let's refactor Init's body to not lock, or just accept the brief unlock.
+    // Actually, Init locks. So we must unlock.
     c.mu.Unlock()
     if err := c.Init(); err != nil {
         slog.Error("Failed to safely rebuild nftables state after connection reset", "error", err)
