@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 2.4 (Audited and Verified)
+// Version: 2.5 (Fixed Goroutine Leak, Replaced Port 80, Dynamic Iface)
 package discovery
 
 import (
@@ -27,7 +27,7 @@ type NetlinkProvider struct {
     iface     string
     targetIdx int
     mu        sync.RWMutex
-    probeSem  chan struct{} // NET-09 Fix: Bounded worker pool
+    probeSem  chan struct{}
 }
 
 func NewNetlinkProvider(iface string) *NetlinkProvider {
@@ -35,7 +35,7 @@ func NewNetlinkProvider(iface string) *NetlinkProvider {
         events:   make(chan Observation, 256),
         done:     make(chan struct{}),
         iface:    iface,
-        probeSem: make(chan struct{}, 10), // Limit to 10 concurrent probes
+        probeSem: make(chan struct{}, 10),
     }
 }
 
@@ -45,7 +45,7 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
     p.ctx, p.cancel = context.WithCancel(ctx)
 
     p.resolveInterface()
-    p.checkGcStaleTime() // LNX-05 Fix
+    p.checkGcStaleTime()
 
     go p.runSubscriptionLoop()
     go p.monitorStaleNeighbors()
@@ -150,6 +150,8 @@ func (p *NetlinkProvider) runSubscriptionLoop() {
                 }
             case update, ok := <-ch:
                 if !ok {
+                    // Critical 2 Fix: Close innerDone to stop the background goroutine before reconnecting
+                    close(innerDone)
                     goto ReconnectLoop
                 }
                 p.handleNeighUpdate(update)
@@ -157,6 +159,8 @@ func (p *NetlinkProvider) runSubscriptionLoop() {
         }
 
     ReconnectLoop:
+        // Medium 5 Fix: Dynamically re-verify interface index on reconnect
+        p.resolveInterface()
         select {
         case <-p.ctx.Done():
             return
@@ -228,7 +232,6 @@ func (p *NetlinkProvider) auditKernelNeighbors() {
                         p.probeNeighborIP(ip)
                     }(n.IP)
                 default:
-                    // Pool full, skip probe
                 }
             }
         }
@@ -236,8 +239,22 @@ func (p *NetlinkProvider) auditKernelNeighbors() {
 }
 
 func (p *NetlinkProvider) probeNeighborIP(ip net.IP) {
-    addr := net.JoinHostPort(ip.String(), "80")
-    conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+    // High 1 Fix: Replace TCP port 80 probing with UDP port 9 (discard).
+    // This triggers an ICMP Port Unreachable if the host is up, refreshing the neighbor cache.
+    // It avoids sending TCP SYN to web servers and works for non-HTTP devices.
+    var addr string
+    if ip.To4() != nil {
+        addr = net.JoinHostPort(ip.String(), "9")
+    } else {
+        // Medium 2 Fix: Append zone identifier for IPv6 link-local addresses
+        if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+            addr = net.JoinHostPort(ip.String()+"%"+p.iface, "9")
+        } else {
+            addr = net.JoinHostPort(ip.String(), "9")
+        }
+    }
+
+    conn, err := net.DialTimeout("udp", addr, 1*time.Second)
     if err == nil {
         _ = conn.Close()
     }
