@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 1.8
+// Version: 1.9
 package storage
 
 import (
@@ -21,7 +21,7 @@ import (
 )
 
 type Storage struct {
-    mu     sync.Mutex
+    mu     sync.RWMutex // LIAS-STOR-09 Fix: RWMutex allows concurrent reads
     dbPath string
     db     *sql.DB
 }
@@ -40,8 +40,7 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, fmt.Errorf("failed to open sqlite database: %w", err)
     }
 
-    // Enable WAL mode and busy timeout to eliminate write lock contention
-    if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
+    if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;"); err != nil {
         slog.Warn("Failed to set PRAGMAs on LIAS database", "error", err)
     }
 
@@ -78,6 +77,23 @@ func (s *Storage) initSchema() error {
         mac TEXT NOT NULL DEFAULT ''
     );
 
+    -- UI-FN-12 Fix: Manual device overrides
+    CREATE TABLE IF NOT EXISTS device_overrides (
+        pdid TEXT PRIMARY KEY,
+        friendly_name TEXT NOT NULL DEFAULT ''
+    );
+
+    -- SYS-FEAT-03 Fix: Per-User identity mapping
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS device_users (
+        pdid TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS policies (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -87,6 +103,7 @@ func (s *Storage) initSchema() error {
         schedule_id TEXT,
         schedule_ids TEXT NOT NULL DEFAULT '',
         priority INTEGER NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1, -- LIAS-POL-01 Fix
         data TEXT NOT NULL
     );
 
@@ -109,13 +126,14 @@ func (s *Storage) initSchema() error {
     // Additive migrations for existing databases
     _, _ = s.db.Exec("ALTER TABLE policies ADD COLUMN schedule_ids TEXT NOT NULL DEFAULT ''")
     _, _ = s.db.Exec("ALTER TABLE schedules ADD COLUMN mode TEXT NOT NULL DEFAULT ''")
+    _, _ = s.db.Exec("ALTER TABLE policies ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1") // LIAS-POL-01
 
     return nil
 }
 
 func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, schedEng *schedule.Engine) (map[string]string, map[string]string, error) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+    s.mu.RLock()
+    defer s.mu.RUnlock()
 
     deviceTags := make(map[string]string)
     macTags := make(map[string]string)
@@ -134,7 +152,6 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
         }
     }
 
-    // Automatic DB Seeding: Ensure built-in tags are persisted to SQLite
     for _, builtInTag := range tagMgr.List() {
         if builtInTag.Builtin {
             builtinInt := 1
@@ -167,26 +184,27 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
         }
     }
 
-    // 3. Hydrate Policies & Migrate legacy ScheduleID -> ScheduleIDs
-    pRows, err := s.db.Query("SELECT data FROM policies")
+    // 3. Hydrate Policies
+    pRows, err := s.db.Query("SELECT data, enabled FROM policies")
     if err == nil {
         defer pRows.Close()
         for pRows.Next() {
             var dataStr string
-            if err := pRows.Scan(&dataStr); err == nil {
+            var enabledInt int
+            if err := pRows.Scan(&dataStr, &enabledInt); err == nil {
                 var p models.Policy
                 if err := json.Unmarshal([]byte(dataStr), &p); err == nil {
-                    // Self-healing migration for legacy single schedule policies
                     if len(p.ScheduleIDs) == 0 && p.ScheduleID != nil && *p.ScheduleID != "" {
                         p.ScheduleIDs = []string{*p.ScheduleID}
                     }
+                    p.Enabled = enabledInt == 1 // LIAS-POL-01
                     polEng.UpsertPolicy(p)
                 }
             }
         }
     }
 
-    // 4. Hydrate Schedules & Backfill Mode
+    // 4. Hydrate Schedules
     sRows, err := s.db.Query("SELECT id, name, mode, timezone, rules FROM schedules")
     if err == nil {
         defer sRows.Close()
@@ -232,7 +250,6 @@ func (s *Storage) SaveDeviceTag(pdid, tagID, mac string) error {
     return err
 }
 
-// MigrateDeviceTag updates the PDID associated with a device tag (GAP-L02)
 func (s *Storage) MigrateDeviceTag(oldPDID, newPDID string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -261,6 +278,94 @@ func (s *Storage) UpdateDeviceTagMAC(pdid, mac string) error {
     `, mac, pdid)
 
     return err
+}
+
+// UI-FN-12 Fix: Save manual device rename
+func (s *Storage) SaveDeviceOverride(pdid, friendlyName string) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    _, err := s.db.Exec(`
+        INSERT INTO device_overrides (pdid, friendly_name)
+        VALUES (?, ?)
+        ON CONFLICT(pdid) DO UPDATE SET friendly_name=excluded.friendly_name
+    `, pdid, friendlyName)
+
+    return err
+}
+
+func (s *Storage) LoadDeviceOverrides() (map[string]string, error) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+
+    rows, err := s.db.Query("SELECT pdid, friendly_name FROM device_overrides")
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    overrides := make(map[string]string)
+    for rows.Next() {
+        var pdid, name string
+        if rows.Scan(&pdid, &name) == nil {
+            overrides[pdid] = name
+        }
+    }
+    return overrides, nil
+}
+
+// SYS-FEAT-03 Fix: Per-User identity mapping
+func (s *Storage) SaveUser(u models.User) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    _, err := s.db.Exec(`
+        INSERT INTO users (id, name)
+        VALUES (?, ?)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name
+    `, u.ID, u.Name)
+
+    return err
+}
+
+func (s *Storage) DeleteUser(id string) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    _, err := s.db.Exec("DELETE FROM users WHERE id = ?", id)
+    return err
+}
+
+func (s *Storage) AssignDeviceToUser(pdid, userID string) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    _, err := s.db.Exec(`
+        INSERT INTO device_users (pdid, user_id)
+        VALUES (?, ?)
+        ON CONFLICT(pdid) DO UPDATE SET user_id=excluded.user_id
+    `, pdid, userID)
+
+    return err
+}
+
+func (s *Storage) LoadUserAssignments() (map[string]string, error) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+
+    rows, err := s.db.Query("SELECT pdid, user_id FROM device_users")
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    mappings := make(map[string]string)
+    for rows.Next() {
+        var pdid, uid string
+        if rows.Scan(&pdid, &uid) == nil {
+            mappings[pdid] = uid
+        }
+    }
+    return mappings, nil
 }
 
 func (s *Storage) SaveTag(t tags.Tag) error {
@@ -306,10 +411,15 @@ func (s *Storage) SavePolicy(p models.Policy) error {
     }
 
     schedIDsBytes, _ := json.Marshal(p.GetScheduleIDs())
+    
+    enabledInt := 0
+    if p.Enabled { // LIAS-POL-01
+        enabledInt = 1
+    }
 
     _, err = s.db.Exec(`
-        INSERT INTO policies (id, name, type, target_id, action, schedule_id, schedule_ids, priority, data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO policies (id, name, type, target_id, action, schedule_id, schedule_ids, priority, enabled, data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name=excluded.name,
             type=excluded.type,
@@ -318,8 +428,9 @@ func (s *Storage) SavePolicy(p models.Policy) error {
             schedule_id=excluded.schedule_id,
             schedule_ids=excluded.schedule_ids,
             priority=excluded.priority,
+            enabled=excluded.enabled,
             data=excluded.data
-    `, p.ID, p.Name, p.Type, p.TargetID, p.Action, schedID, string(schedIDsBytes), p.Priority, string(dataBytes))
+    `, p.ID, p.Name, p.Type, p.TargetID, p.Action, schedID, string(schedIDsBytes), p.Priority, enabledInt, string(dataBytes))
 
     return err
 }
