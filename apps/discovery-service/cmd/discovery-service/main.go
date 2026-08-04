@@ -1,7 +1,7 @@
 // Binary discovery-service implements the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 2.3
+// Version: 2.4
 package main
 
 import (
@@ -108,15 +108,17 @@ func main() {
     }
 
     var primaries []discovery.Enricher
+    var ssdpEnricher *discovery.SSDPEnricher // Keep a reference for wiring
+    
     if cfg.Discovery.Enrichment.AvahiEnabled {
         e := discovery.NewAvahiEnricher()
         _ = e.Start(ctx)
         primaries = append(primaries, e)
     }
     if cfg.Discovery.Enrichment.SSDPEnabled {
-        e := discovery.NewSSDPEnricher()
-        _ = e.Start(ctx)
-        primaries = append(primaries, e)
+        ssdpEnricher = discovery.NewSSDPEnricher()
+        _ = ssdpEnricher.Start(ctx)
+        primaries = append(primaries, ssdpEnricher)
     }
     if cfg.Discovery.Enrichment.NetbiosEnabled {
         e := discovery.NewNetBIOSEnricher()
@@ -136,11 +138,17 @@ func main() {
     
     orch.SetDeviceManager(eng)
 
+    // DIS-ENR-03 Fix: Wire the SSDP enricher with cache and orchestrator references
+    // so its passive listener can trigger enrichment safely.
+    if ssdpEnricher != nil {
+        ssdpEnricher.SetCache(cache)
+        ssdpEnricher.SetEnrichmentTriggerer(orch)
+    }
+
     eng.Run(ctx, providers)
 
     mux := http.NewServeMux()
     handlers := disAPI.NewHandlers(cache, broker, orch)
-    // FIX: Pass the auth token to RegisterRoutes for middleware wrapping
     handlers.RegisterRoutes(mux, cfg.HTTP.AuthToken)
 
     mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
