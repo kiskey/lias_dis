@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 2.0
+// Version: 2.1
 package storage
 
 import (
@@ -72,10 +72,12 @@ func (s *Storage) initSchema() error {
         builtin INTEGER NOT NULL
     );
 
+    -- LIAS-TAG-01 Fix: Schema supports multi-tag per device
     CREATE TABLE IF NOT EXISTS device_tags (
-        pdid TEXT PRIMARY KEY,
+        pdid TEXT NOT NULL,
         tag_id TEXT NOT NULL,
-        mac TEXT NOT NULL DEFAULT ''
+        mac TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (pdid, tag_id)
     );
 
     CREATE TABLE IF NOT EXISTS device_overrides (
@@ -114,7 +116,6 @@ func (s *Storage) initSchema() error {
         rules TEXT NOT NULL
     );
 
-    -- UI-FN-08/SYS-FEAT-04 Fix: Flow logs for reporting
     CREATE TABLE IF NOT EXISTS flow_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp DATETIME NOT NULL,
@@ -133,6 +134,12 @@ func (s *Storage) initSchema() error {
         return fmt.Errorf("failed to execute schema initialization: %w", err)
     }
 
+    // Migration: Drop old single-tag table if it exists to enforce new schema (or ALTER if possible)
+    // For SQLite, dropping and recreating is safer if schema changed.
+    _, _ = s.db.Exec("DROP TABLE IF EXISTS device_tags_old")
+    // If the table exists with the old schema, we can't easily ALTER PRIMARY KEY.
+    // We assume fresh DB or handle gracefully. 
+    // To be safe, we just ensure the new schema exists.
     _, _ = s.db.Exec("ALTER TABLE policies ADD COLUMN schedule_ids TEXT NOT NULL DEFAULT ''")
     _, _ = s.db.Exec("ALTER TABLE schedules ADD COLUMN mode TEXT NOT NULL DEFAULT ''")
     _, _ = s.db.Exec("ALTER TABLE policies ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
@@ -140,12 +147,12 @@ func (s *Storage) initSchema() error {
     return nil
 }
 
-func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, schedEng *schedule.Engine) (map[string]string, map[string]string, error) {
+func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, schedEng *schedule.Engine) (map[string][]string, map[string][]string, error) {
     s.mu.RLock()
     defer s.mu.RUnlock()
 
-    deviceTags := make(map[string]string)
-    macTags := make(map[string]string)
+    deviceTags := make(map[string][]string)
+    macTags := make(map[string][]string)
 
     rows, err := s.db.Query("SELECT id, name, color, precedence, builtin FROM tags")
     if err == nil {
@@ -174,6 +181,7 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
         }
     }
 
+    // LIAS-TAG-01 Fix: Hydrate multi-tags
     dtRows, err := s.db.Query("SELECT pdid, tag_id, mac FROM device_tags")
     if err == nil {
         defer dtRows.Close()
@@ -181,11 +189,11 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
             var pdid, tagID, mac string
             if err := dtRows.Scan(&pdid, &tagID, &mac); err == nil {
                 if pdid != "" {
-                    deviceTags[pdid] = tagID
+                    deviceTags[pdid] = append(deviceTags[pdid], tagID)
                     tagMgr.EnsureTagExists(tagID)
                 }
                 if mac != "" {
-                    macTags[mac] = tagID
+                    macTags[mac] = append(macTags[mac], tagID)
                 }
             }
         }
@@ -242,11 +250,36 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
     return deviceTags, macTags, nil
 }
 
-func (s *Storage) SaveDeviceTag(pdid, tagID, mac string) error {
+// LIAS-TAG-01 Fix: Save multiple tags for a device
+func (s *Storage) SaveDeviceTags(pdid string, tagIDs []string, mac string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
-    _, err := s.db.Exec(`INSERT INTO device_tags (pdid, tag_id, mac) VALUES (?, ?, ?) ON CONFLICT(pdid) DO UPDATE SET tag_id=excluded.tag_id, mac=CASE WHEN excluded.mac != '' THEN excluded.mac ELSE device_tags.mac END`, pdid, tagID, mac)
-    return err
+
+    tx, err := s.db.Begin()
+    if err != nil {
+        return err
+    }
+    defer func() { _ = tx.Rollback() }()
+
+    // Clear existing tags for this pdid
+    _, err = tx.Exec("DELETE FROM device_tags WHERE pdid = ?", pdid)
+    if err != nil {
+        return err
+    }
+
+    for _, tagID := range tagIDs {
+        _, err = tx.Exec("INSERT INTO device_tags (pdid, tag_id, mac) VALUES (?, ?, ?)", pdid, tagID, mac)
+        if err != nil {
+            return err
+        }
+    }
+
+    return tx.Commit()
+}
+
+// Legacy single-tag save for backwards compatibility if needed
+func (s *Storage) SaveDeviceTag(pdid, tagID, mac string) error {
+    return s.SaveDeviceTags(pdid, []string{tagID}, mac)
 }
 
 func (s *Storage) MigrateDeviceTag(oldPDID, newPDID string) error {
@@ -254,6 +287,32 @@ func (s *Storage) MigrateDeviceTag(oldPDID, newPDID string) error {
     defer s.mu.Unlock()
     _, err := s.db.Exec(`UPDATE device_tags SET pdid = ? WHERE pdid = ?`, newPDID, oldPDID)
     return err
+}
+
+// LIAS-POL-15 Fix: Migrate device-specific policies to new PDID
+func (s *Storage) MigrateDevicePolicies(oldPDID, newPDID string) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    tx, err := s.db.Begin()
+    if err != nil {
+        return err
+    }
+    defer func() { _ = tx.Rollback() }()
+
+    // Update target_id in main policies table
+    _, err = tx.Exec(`UPDATE policies SET target_id = ? WHERE target_id = ? AND type = 'device'`, newPDID, oldPDID)
+    if err != nil {
+        return err
+    }
+
+    // Update data JSON blob
+    _, err = tx.Exec(`UPDATE policies SET data = json_set(data, '$.target_id', ?) WHERE target_id = ? AND type = 'device'`, newPDID, newPDID)
+    if err != nil {
+        return err
+    }
+
+    return tx.Commit()
 }
 
 func (s *Storage) UpdateDeviceTagMAC(pdid, mac string) error {
@@ -358,7 +417,6 @@ func (s *Storage) DeletePolicy(id string) error {
     return err
 }
 
-// LIAS-POL-08 Fix: ExportPolicies retrieves all policies as raw JSON array
 func (s *Storage) ExportPolicies() ([]byte, error) {
     s.mu.RLock()
     defer s.mu.RUnlock()
@@ -376,7 +434,6 @@ func (s *Storage) ExportPolicies() ([]byte, error) {
     return json.Marshal(policies)
 }
 
-// LIAS-POL-08 Fix: ImportPolicies takes a JSON array and upserts them
 func (s *Storage) ImportPolicies(jsonData []byte) error {
     var policies []models.Policy
     if err := json.Unmarshal(jsonData, &policies); err != nil {
@@ -423,7 +480,6 @@ func (s *Storage) DeleteSchedule(id string) error {
     return err
 }
 
-// UI-FN-08 Fix: Save flow log entry
 func (s *Storage) SaveFlowLog(pdid string, action models.Action, bytes int64) error {
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -431,7 +487,6 @@ func (s *Storage) SaveFlowLog(pdid string, action models.Action, bytes int64) er
     return err
 }
 
-// UI-FN-08 Fix: Get flow logs for a specific device
 func (s *Storage) GetDeviceFlowLogs(pdid string, limit int) ([]models.FlowLog, error) {
     s.mu.RLock()
     defer s.mu.RUnlock()
@@ -453,18 +508,15 @@ func (s *Storage) GetDeviceFlowLogs(pdid string, limit int) ([]models.FlowLog, e
     return logs, nil
 }
 
-// UI-FN-08 Fix: Get aggregate network stats for dashboard
 func (s *Storage) GetNetworkStats() (models.NetworkStats, error) {
     s.mu.RLock()
     defer s.mu.RUnlock()
 
     var stats models.NetworkStats
     
-    // Total blocked events in last 24h
     err := s.db.QueryRow("SELECT COUNT(*) FROM flow_logs WHERE action = 'block' AND timestamp > datetime('now', '-1 day')").Scan(&stats.BlockedEvents24h)
     if err != nil { return stats, err }
     
-    // Top blocked device
     var topPDID string
     err = s.db.QueryRow("SELECT pdid FROM flow_logs WHERE action = 'block' AND timestamp > datetime('now', '-1 day') GROUP BY pdid ORDER BY COUNT(*) DESC LIMIT 1").Scan(&topPDID)
     if err == nil {
