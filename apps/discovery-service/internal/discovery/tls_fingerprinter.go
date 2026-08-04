@@ -2,11 +2,10 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/tls_fingerprinter.go
-// Version: 1.0
+// Version: 1.1
 package discovery
 
 import (
-    "context"
     "crypto/sha256"
     "crypto/tls"
     "fmt"
@@ -55,10 +54,6 @@ func (e *TLSFingerprinter) Enrich(ctx context.Context, d *models.Device) (*model
         InsecureSkipVerify: true, // We don't care about validity, just the fingerprint
         ServerName:         "",
     }
-
-    // Wrap in timeout context
-    searchCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-    defer cancel()
 
     conn, err := tls.DialWithDialer(dialer, "tcp", addr, config)
     if err != nil {
