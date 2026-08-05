@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/ssdp_enricher.go
-// Version: 1.6 (Fixed Multicast Binding and SO_REUSEPORT)
+// Version: 1.7 (Fixed IP Extraction for Standard HTTP Ports)
 package discovery
 
 import (
@@ -12,6 +12,7 @@ import (
     "log/slog"
     "net"
     "net/http"
+    "net/url"
     "strings"
     "sync"
     "syscall"
@@ -29,7 +30,7 @@ type EnrichmentTriggerer interface {
 type SSDPEnricher struct {
     ctx       context.Context
     cancel    context.CancelFunc
-    ifaceName string // NET-05 Fix: Store interface name
+    ifaceName string
     cache     *inventory.Cache
     trigger   EnrichmentTriggerer
     bgQueue   chan string
@@ -146,7 +147,6 @@ func (e *SSDPEnricher) runPassiveListener() {
         }
     }
 
-    // ListenMulticastUDP natively sets SO_REUSEADDR, which is correct for multicast on Linux.
     conn, err := net.ListenMulticastUDP("udp4", iface, addr)
     if err != nil {
         slog.Error("Failed to listen on SSDP multicast", "error", err)
@@ -154,7 +154,6 @@ func (e *SSDPEnricher) runPassiveListener() {
     }
     defer conn.Close()
 
-    // LNX-01 Fix: Explicitly set SO_REUSEPORT to allow multiple DIS instances if needed
     sc, err := conn.SyscallConn()
     if err == nil {
         _ = sc.Control(func(fd uintptr) {
@@ -223,14 +222,13 @@ func (e *SSDPEnricher) runBackgroundFetcher() {
     }
 }
 
+// Medium 1 Fix: Use net/url.Parse to safely extract Hostname
 func extractIPFromURL(rawURL string) string {
-    u := strings.TrimPrefix(rawURL, "http://")
-    u = strings.TrimPrefix(u, "https://")
-    parts := strings.Split(u, ":")
-    if len(parts) > 0 {
-        return parts[0]
+    u, err := url.Parse(rawURL)
+    if err != nil {
+        return ""
     }
-    return ""
+    return u.Hostname()
 }
 
 func parseLocation(headers string) string {
