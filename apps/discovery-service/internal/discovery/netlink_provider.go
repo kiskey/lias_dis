@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 2.5 (Fixed Goroutine Leak, Replaced Port 80, Dynamic Iface)
+// Version: 2.6 (Enhanced UDP Probe to Force L2 Resolution)
 package discovery
 
 import (
@@ -150,7 +150,6 @@ func (p *NetlinkProvider) runSubscriptionLoop() {
                 }
             case update, ok := <-ch:
                 if !ok {
-                    // Critical 2 Fix: Close innerDone to stop the background goroutine before reconnecting
                     close(innerDone)
                     goto ReconnectLoop
                 }
@@ -159,7 +158,6 @@ func (p *NetlinkProvider) runSubscriptionLoop() {
         }
 
     ReconnectLoop:
-        // Medium 5 Fix: Dynamically re-verify interface index on reconnect
         p.resolveInterface()
         select {
         case <-p.ctx.Done():
@@ -239,14 +237,10 @@ func (p *NetlinkProvider) auditKernelNeighbors() {
 }
 
 func (p *NetlinkProvider) probeNeighborIP(ip net.IP) {
-    // High 1 Fix: Replace TCP port 80 probing with UDP port 9 (discard).
-    // This triggers an ICMP Port Unreachable if the host is up, refreshing the neighbor cache.
-    // It avoids sending TCP SYN to web servers and works for non-HTTP devices.
     var addr string
     if ip.To4() != nil {
         addr = net.JoinHostPort(ip.String(), "9")
     } else {
-        // Medium 2 Fix: Append zone identifier for IPv6 link-local addresses
         if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
             addr = net.JoinHostPort(ip.String()+"%"+p.iface, "9")
         } else {
@@ -256,6 +250,9 @@ func (p *NetlinkProvider) probeNeighborIP(ip net.IP) {
 
     conn, err := net.DialTimeout("udp", addr, 1*time.Second)
     if err == nil {
+        // High 1 Fix Enhancement: Actually send a packet to force kernel L2 resolution
+        // and trigger an ICMP Port Unreachable if the host is up.
+        _, _ = conn.Write([]byte{0})
         _ = conn.Close()
     }
 }
