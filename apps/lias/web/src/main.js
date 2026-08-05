@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 3.7 (Fixed Schedule Rule Mode Reconstruction Heuristic)
+// Version: 3.8 (Moved Policy Toggle to Card, Removed from Wizard)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -720,6 +720,7 @@ class App {
           const isGlobal = p.id === 'global_default';
           const isPaused = p.id.startsWith('pol_pause_');
           const canCopy = !isGlobal && !isPaused && !isInfra;
+          const canToggle = !isGlobal && !isPaused && !isInfra;
           
           const schedSummary = this.getScheduleSummary(p);
           const scheds = this.resolvePolicySchedules(p);
@@ -733,17 +734,27 @@ class App {
 
           return `
             <div class="card" style="margin-bottom:0;">
-              <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                <div>
-                  <div style="font-size:16px; font-weight:700;">${p.name} ${isInfra ? '🔒' : ''} ${!p.enabled ? '<span style="color:var(--text-secondary); font-size:12px;">(Disabled)</span>' : ''}</div>
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; gap: 16px;">
+                <div style="flex: 1;">
+                  <div style="font-size:16px; font-weight:700;">${p.name} ${isInfra ? '🔒' : ''} ${!p.enabled && canToggle ? '<span style="color:var(--text-secondary); font-size:12px;">(Disabled)</span>' : ''}</div>
                   <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
                     Scope: <strong style="text-transform:capitalize;">${p.type}</strong> | Target: <strong>${p.target_id || 'Global'}</strong> | Priority: <strong>${p.priority}</strong>
                   </div>
                 </div>
-                <div style="display:flex; gap:8px; flex-wrap: wrap;">
-                  <button class="btn btn-secondary btn-edit-policy" data-id="${p.id}" ${isInfra ? 'disabled' : ''}>Edit</button>
-                  ${canCopy ? `<button class="btn btn-secondary btn-copy-policy" data-id="${p.id}">Copy</button>` : ''}
-                  <button class="btn btn-danger btn-delete-policy" data-id="${p.id}">Delete</button>
+                <div style="display:flex; align-items:center; gap:16px; flex-shrink: 0;">
+                  ${canToggle ? `
+                    <div class="hig-toggle-row compact">
+                      <label class="hig-toggle-switch">
+                        <input type="checkbox" class="policy-enabled-toggle" data-id="${p.id}" ${p.enabled ? 'checked' : ''}>
+                        <span class="hig-slider"></span>
+                      </label>
+                    </div>
+                  ` : ''}
+                  <div style="display:flex; gap:8px; flex-wrap: wrap;">
+                    <button class="btn btn-secondary btn-edit-policy" data-id="${p.id}" ${isInfra ? 'disabled' : ''}>Edit</button>
+                    ${canCopy ? `<button class="btn btn-secondary btn-copy-policy" data-id="${p.id}">Copy</button>` : ''}
+                    <button class="btn btn-danger btn-delete-policy" data-id="${p.id}">Delete</button>
+                  </div>
                 </div>
               </div>
               ${isInfra ? `
@@ -801,6 +812,26 @@ class App {
             this.showToast(`Failed to delete policy: ${err.message}`, 'danger');
           }
         });
+      });
+    });
+
+    // Bind Enable/Disable Toggles
+    document.querySelectorAll('.policy-enabled-toggle').forEach(toggle => {
+      toggle.addEventListener('change', async (e) => {
+        const id = e.currentTarget.dataset.id;
+        const enabled = e.currentTarget.checked;
+        const p = this.policies.find(item => item.id === id);
+        if (!p) return;
+
+        p.enabled = enabled;
+        try {
+          await API.savePolicy(p);
+          this.showToast(`Policy ${enabled ? 'enabled' : 'disabled'}`);
+          this.loadData(); // Reload to reflect the "(Disabled)" tag instantly
+        } catch (err) {
+          this.showToast(`Failed to update policy: ${err.message}`, 'danger');
+          e.currentTarget.checked = !enabled; // Revert UI on failure
+        }
       });
     });
 
@@ -1093,7 +1124,8 @@ class App {
         target_id: '',
         action: 'schedule',
         schedule_ids: [],
-        priority: 50
+        priority: 50,
+        enabled: true
       }
     };
 
@@ -1666,7 +1698,6 @@ class App {
   }
 
   renderSettingsView(container) {
-    // Fix 3: Rewrote Vacation Mode Toggle HTML/CSS to be strictly HIG compliant and clickable
     container.innerHTML = `
       <div class="card">
         <h3>System Maintenance</h3>
@@ -1686,69 +1717,6 @@ class App {
           </div>
         </div>
       </div>
-      <style>
-        .hig-toggle-row {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          padding: 16px;
-          background: var(--bg-tertiary);
-          border-radius: 12px;
-        }
-        .hig-toggle-text strong {
-          font-size: 15px;
-          font-weight: 600;
-          color: var(--text-primary);
-          display: block;
-        }
-        .hig-toggle-text p {
-          font-size: 13px;
-          color: var(--text-secondary);
-          margin-top: 4px;
-        }
-        .hig-toggle-switch {
-          position: relative;
-          display: inline-block;
-          width: 51px;
-          height: 31px;
-          flex-shrink: 0;
-          cursor: pointer;
-        }
-        .hig-toggle-switch input {
-          opacity: 0;
-          width: 0;
-          height: 0;
-        }
-        .hig-slider {
-          position: absolute;
-          cursor: pointer;
-          top: 0;
-          left: 0;
-          right: 0;
-          bottom: 0;
-          background-color: #e9e9ea; /* Default Apple Gray for OFF */
-          transition: .4s;
-          border-radius: 31px;
-        }
-        .hig-slider:before {
-          position: absolute;
-          content: "";
-          height: 27px;
-          width: 27px;
-          left: 2px;
-          bottom: 2px;
-          background-color: white;
-          transition: .4s;
-          border-radius: 50%;
-          box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-        }
-        input:checked + .hig-slider {
-          background-color: #34c759; /* Apple Green for ON */
-        }
-        input:checked + .hig-slider:before {
-          transform: translateX(20px);
-        }
-      </style>
     `;
 
     document.getElementById('btn-flush-nft').addEventListener('click', () => {
@@ -1761,7 +1729,6 @@ class App {
     const vacChk = document.getElementById('chk-vacation');
     const globalPol = this.policies.find(p => p.id === 'global_default');
     
-    // Fix 3: Explicitly set initial state
     if (globalPol && globalPol.action === 'block') {
       vacChk.checked = true;
     } else {
@@ -1773,14 +1740,12 @@ class App {
         await API.toggleVacationMode(e.target.checked); 
         this.showToast(`Vacation Mode ${e.target.checked ? 'Enabled' : 'Disabled'}`); 
         
-        // Fix 3: Update local state immediately to prevent UI flicker, then delay reload
         if (globalPol) {
           globalPol.action = e.target.checked ? 'block' : 'schedule';
         } else {
           this.policies.push({ id: 'global_default', action: e.target.checked ? 'block' : 'schedule' });
         }
         
-        // Delay loadData to allow the toggle animation to complete smoothly
         setTimeout(() => this.loadData(), 300);
       } 
       catch (err) { 
