@@ -2,7 +2,7 @@
 // for the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/internal/config/config.go
-// Version: 1.4
+// Version: 1.5 (Added OpenWrt AP & Bridge Polling Config)
 package config
 
 import (
@@ -56,6 +56,10 @@ type DHCPConfig struct {
     LeaseURL  string `yaml:"lease_url"`  // Remote HTTP URL
     SSHHost   string `yaml:"ssh_host"`   // Remote SSH host
     SSHUser   string `yaml:"ssh_user"`   // SSH user
+
+    // V1.5 ADD: OpenWrt AP & Bridge Polling for definitive Layer-2 ground truth
+    OpenWrtAPEnabled    bool `yaml:"openwrt_ap_enabled"`
+    BridgeFDBEnabled    bool `yaml:"bridge_fdb_enabled"`
 }
 
 // EnrichmentConfig enables or disables on-demand enrichers.
@@ -64,7 +68,7 @@ type EnrichmentConfig struct {
     AvahiEnabled       bool          `yaml:"avahi_enabled"`
     SSDPEnabled        bool          `yaml:"ssdp_enabled"`
     NetbiosEnabled     bool          `yaml:"netbios_enabled"`
-    TLSEnabled         bool          `yaml:"tls_enabled"`         // NET-01 Fix: Added TLS Enricher config
+    TLSEnabled         bool          `yaml:"tls_enabled"`
     UnknownDeviceScan  bool          `yaml:"unknown_device_scan"`
     ValidationInterval time.Duration `yaml:"validation_interval"`
 }
