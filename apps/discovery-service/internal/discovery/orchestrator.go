@@ -218,18 +218,21 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
     }
 }
 
+
 // P1-FIX: Proper Nmap gating with cooldown, retry limit, and completeness check
 func (o *Orchestrator) shouldRunNmap(d *models.Device, force bool) bool {
-    if force {
-        return true
-    }
-
-    // Rule 1: Already fully identified - never scan
+    // Rule 1: Already fully identified - NEVER scan, even with force=true.
+    // Nmap is strictly for discovering missing attributes. If we have them, don't scan.
     if d.IsFullyIdentified {
         return false
     }
     if d.Vendor != "" && d.DeviceType != "" && (d.FriendlyName != "" || d.Hostname != "") {
         return false
+    }
+
+    // If force=true (manual UI refresh), bypass time-based and retry limits
+    if force {
+        return true
     }
 
     // Rule 2: Max retries reached without new attributes
