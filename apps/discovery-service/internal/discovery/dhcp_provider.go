@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/dhcp_provider.go
-// Version: 1.8 (Added OpenWrt AP & Bridge Layer-2 Ground Truth Polling)
+// Version: 1.9 (Replaced Bridge FDB with ARP Table for L3 accuracy)
 package discovery
 
 import (
@@ -35,7 +35,7 @@ type DHCPProvider struct {
 func NewDHCPProvider(cfg config.DHCPConfig) *DHCPProvider {
     return &DHCPProvider{
         cfg:    cfg,
-        events: make(chan Observation, 256), // Increased buffer for AP data
+        events: make(chan Observation, 256),
         done:   make(chan struct{}),
         client: &http.Client{Timeout: 10 * time.Second},
     }
@@ -96,16 +96,17 @@ func (p *DHCPProvider) poll() {
             leaseFile = "/tmp/dhcp.leases"
         }
         
-        // V1.8 ADD: Build compound command to fetch Leases, Wi-Fi APs, and Bridge FDB
+        // V1.9 ADD: Build compound command to fetch Leases, Wi-Fi APs, and ARP Table
         cmdStr := "cat " + leaseFile
         if p.cfg.OpenWrtAPEnabled {
-            // iw dev parses all wireless interfaces (wlan0, wlan1, etc.) and lists associated stations
             cmdStr += "; echo '===AP_ASSOC==='; iw dev | grep -E 'Interface|Station' | awk '/Interface/{iface=$2} /Station/{print iface, $2}'"
         }
-        if p.cfg.BridgeFDBEnabled {
-            // brctl showmacs lists all MACs learned by the bridge (wired and wireless)
-            // We print MAC (field 2) and isLocal (field 4) to filter out the router's own interfaces
-            cmdStr += "; echo '===BRIDGE_FDB==='; brctl showmacs br-lan | awk 'NR>1 {print $2, $4}'"
+        if p.cfg.ArpTableEnabled {
+            // ip neigh show pulls the kernel ARP cache.
+            // We grep for lladdr to ensure we only get resolved MACs.
+            // awk prints IP (field 1) and MAC (field 5).
+            // Format: 192.168.1.50 aa:bb:cc:dd:ee:ff
+            cmdStr += "; echo '===ARP_TABLE==='; ip neigh show | grep lladdr | awk '{print $1, $5}'"
         }
 
         cmd := exec.CommandContext(p.ctx, "ssh", 
@@ -118,7 +119,7 @@ func (p *DHCPProvider) poll() {
         cmd.Stdout = &stdout
         err = cmd.Run()
         if err != nil {
-            slog.Debug("Failed to fetch DHCP/AP data via SSH", "host", p.cfg.SSHHost, "error", err)
+            slog.Debug("Failed to fetch DHCP/ARP data via SSH", "host", p.cfg.SSHHost, "error", err)
             return
         }
         reader = &stdout
@@ -162,8 +163,8 @@ func (p *DHCPProvider) poll() {
             currentSection = "ap"
             continue
         }
-        if line == "===BRIDGE_FDB===" {
-            currentSection = "bridge"
+        if line == "===ARP_TABLE===" {
+            currentSection = "arp"
             continue
         }
 
@@ -171,8 +172,8 @@ func (p *DHCPProvider) poll() {
             p.parseDHCPLine(line)
         } else if currentSection == "ap" {
             p.parseAPLine(line)
-        } else if currentSection == "bridge" {
-            p.parseBridgeLine(line)
+        } else if currentSection == "arp" {
+            p.parseARPLine(line)
         }
     }
 }
@@ -230,7 +231,6 @@ func (p *DHCPProvider) parseDHCPLine(line string) {
 }
 
 // V1.8 ADD: Parse Wi-Fi AP Associations (iw dev)
-// Line format: wlan0 aa:bb:cc:dd:ee:ff
 func (p *DHCPProvider) parseAPLine(line string) {
     parts := strings.Fields(line)
     if len(parts) != 2 {
@@ -251,7 +251,7 @@ func (p *DHCPProvider) parseAPLine(line string) {
         MAC:        mac,
         IP:         nil,
         Online:     true,
-        Confidence: 0.99, // Highest possible confidence
+        Confidence: 0.99,
         Timestamp:  time.Now(),
         Raw: map[string]interface{}{
             "wifi_interface": iface,
@@ -265,17 +265,19 @@ func (p *DHCPProvider) parseAPLine(line string) {
     }
 }
 
-// V1.8 ADD: Parse Bridge FDB entries (brctl showmacs br-lan)
-// Line format: aa:bb:cc:dd:ee:ff no (we only want the MACs that are "no" i.e., not local)
-func (p *DHCPProvider) parseBridgeLine(line string) {
+// V1.9 ADD: Parse ARP Table entries (ip neigh show)
+// Line format: 192.168.1.50 aa:bb:cc:dd:ee:ff
+func (p *DHCPProvider) parseARPLine(line string) {
     parts := strings.Fields(line)
     if len(parts) != 2 {
         return
     }
     
-    macStr := parts[0]
-    isLocal := parts[1] == "yes"
-    if isLocal {
+    ipStr := parts[0]
+    macStr := parts[1]
+    
+    ip := net.ParseIP(ipStr)
+    if ip == nil {
         return
     }
     
@@ -285,12 +287,12 @@ func (p *DHCPProvider) parseBridgeLine(line string) {
     }
 
     obs := Observation{
-        Source:     "openwrt_bridge",
-        Group:      GroupA, // Layer-2 Ground Truth
+        Source:     "openwrt_arp",
+        Group:      GroupA, // Layer-2 + Layer-3 Ground Truth
         MAC:        mac,
-        IP:         nil,
+        IP:         ip,     // We now have the IP binding!
         Online:     true,
-        Confidence: 0.95,
+        Confidence: 0.99,
         Timestamp:  time.Now(),
         Raw:        make(map[string]interface{}),
     }
@@ -298,7 +300,7 @@ func (p *DHCPProvider) parseBridgeLine(line string) {
     select {
     case p.events <- obs:
     default:
-        slog.Warn("Bridge observation channel full, dropping event")
+        slog.Warn("ARP observation channel full, dropping event")
     }
 }
 
