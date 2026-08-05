@@ -2,7 +2,7 @@
 // for the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/internal/config/config.go
-// Version: 1.5 (Added OpenWrt AP & Bridge Polling Config)
+// Version: 1.6 (Renamed Bridge FDB to ARP Table Standard)
 package config
 
 import (
@@ -57,9 +57,9 @@ type DHCPConfig struct {
     SSHHost   string `yaml:"ssh_host"`   // Remote SSH host
     SSHUser   string `yaml:"ssh_user"`   // SSH user
 
-    // V1.5 ADD: OpenWrt AP & Bridge Polling for definitive Layer-2 ground truth
+    // V1.6 ADD: OpenWrt AP & ARP Table Polling for definitive Layer-2/Layer-3 ground truth
     OpenWrtAPEnabled bool `yaml:"openwrt_ap_enabled"`
-    BridgeFDBEnabled bool `yaml:"bridge_fdb_enabled"`
+    ArpTableEnabled  bool `yaml:"arp_table_enabled"`
 }
 
 // EnrichmentConfig enables or disables on-demand enrichers.
