@@ -99,9 +99,12 @@ func (p *DHCPProvider) poll() {
         // V1.8 ADD: Build compound command to fetch Leases, Wi-Fi APs, and Bridge FDB
         cmdStr := "cat " + leaseFile
         if p.cfg.OpenWrtAPEnabled {
+            // iw dev parses all wireless interfaces (wlan0, wlan1, etc.) and lists associated stations
             cmdStr += "; echo '===AP_ASSOC==='; iw dev | grep -E 'Interface|Station' | awk '/Interface/{iface=$2} /Station/{print iface, $2}'"
         }
         if p.cfg.BridgeFDBEnabled {
+            // brctl showmacs lists all MACs learned by the bridge (wired and wireless)
+            // We print MAC (field 2) and isLocal (field 4) to filter out the router's own interfaces
             cmdStr += "; echo '===BRIDGE_FDB==='; brctl showmacs br-lan | awk 'NR>1 {print $2, $4}'"
         }
 
