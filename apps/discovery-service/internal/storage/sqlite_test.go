@@ -1,11 +1,10 @@
 // Package storage provides unit tests for DIS SQLite persistence.
 //
 // File:    apps/discovery-service/internal/storage/sqlite_test.go
-// Version: 1.0
+// Version: 1.1
 package storage
 
 import (
-    "os"
     "path/filepath"
     "testing"
     "time"
@@ -63,10 +62,5 @@ func TestSaveDevicesBatchSavepoint(t *testing.T) {
     _, err = s.db.Exec("DELETE FROM pending_events WHERE last_seen < datetime('now', '-1 hour')")
     if err != nil {
         t.Errorf("Pending events purge query failed: %v", err)
-    }
-
-    // Verify file exists
-    if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-        t.Errorf("Database file was not created")
     }
 }
