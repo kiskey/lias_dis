@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 4.8 (Added Immediate Offline Detection)
+// Version: 5.0 (Relaxed Online Confirmation for DNS/L7 Traffic)
 package correlation
 
 import (
@@ -234,15 +234,6 @@ func canUpdateCurrentIP(source string) bool {
     }
 }
 
-func canTriggerOnline(source string) bool {
-    switch source {
-    case "netlink", "dhcp":
-        return true
-    default:
-        return false
-    }
-}
-
 func hasL2AndL3Confirmation(sources []string) bool {
     hasL2 := false
     hasL3 := false
@@ -434,9 +425,23 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         return
     }
 
-    if !d.Online && obs.Online && canTriggerOnline(obs.Source) {
-        d.PendingOnlineObs = append(d.PendingOnlineObs, obs.Source)
-        if len(d.PendingOnlineObs) >= 2 || hasL2AndL3Confirmation(d.PendingOnlineObs) {
+    if !d.Online && obs.Online {
+        // V5.0 FIX: Allow ALL sources to append to PendingOnlineObs.
+        // This ensures DNS (Pi-hole) and mDNS (Avahi) observations count toward the 2-source confirmation,
+        // preventing mobile devices from flapping offline due to radio sleep.
+        exists := false
+        for _, s := range d.PendingOnlineObs {
+            if s == obs.Source {
+                exists = true
+                break
+            }
+        }
+        if !exists {
+            d.PendingOnlineObs = append(d.PendingOnlineObs, obs.Source)
+        }
+
+        isInfra := d.HasTag("infrastructure") || ApplySmartClassifications(d)
+        if isInfra || len(d.PendingOnlineObs) >= 2 || hasL2AndL3Confirmation(d.PendingOnlineObs) {
             d.Online = true
             d.PendingOnlineObs = nil
             e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
