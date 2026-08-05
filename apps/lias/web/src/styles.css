@@ -1,7 +1,7 @@
 /* 
  * LIAS Dashboard Styles
  * File:    apps/lias/web/src/styles.css
- * Version: 2.5 (Removed !important overrides from day-chip elements)
+ * Version: 2.6 (Ensured flex-wrap for action buttons to prevent overflow)
  */
 
 :root {
