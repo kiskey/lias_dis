@@ -58,8 +58,8 @@ type DHCPConfig struct {
     SSHUser   string `yaml:"ssh_user"`   // SSH user
 
     // V1.5 ADD: OpenWrt AP & Bridge Polling for definitive Layer-2 ground truth
-    OpenWrtAPEnabled    bool `yaml:"openwrt_ap_enabled"`
-    BridgeFDBEnabled    bool `yaml:"bridge_fdb_enabled"`
+    OpenWrtAPEnabled bool `yaml:"openwrt_ap_enabled"`
+    BridgeFDBEnabled bool `yaml:"bridge_fdb_enabled"`
 }
 
 // EnrichmentConfig enables or disables on-demand enrichers.
