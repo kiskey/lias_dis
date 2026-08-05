@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for DIS device state.
 //
 // File:    apps/discovery-service/internal/storage/sqlite.go
-// Version: 3.0 (Added Pending Events TTL Purge)
+// Version: 3.1 (Removed Duplicate Canonicalization Helper)
 package storage
 
 import (
@@ -10,7 +10,6 @@ import (
     "log/slog"
     "os"
     "path/filepath"
-    "strings"
     "sync"
     "time"
 
@@ -68,7 +67,6 @@ func NewStorage(dbPath string) (*Storage, error) {
         slog.Warn("v1 to v2 PDID migration encountered an error", "error", err)
     }
 
-    // Technical Debt Fix: Start pending events retention loop
     go s.pendingEventsRetentionLoop()
 
     slog.Info("DIS SQLite storage engine initialized", "path", dbPath)
@@ -196,7 +194,8 @@ func (s *Storage) migrateV1PDIDs() error {
             continue
         }
 
-        canonicalHost := canonicalizeHostnameLocal(hostname)
+        // Tech Debt 1 Fix: Use unified inventory.CanonicalizeHostname
+        canonicalHost := inventory.CanonicalizeHostname(hostname)
         tier, anchor := inventory.DeriveTierAndAnchor(mac, canonicalHost, vendor)
         newPDID := inventory.GeneratePDID(tier, anchor)
 
@@ -622,32 +621,4 @@ func (s *Storage) Close() error {
     return nil
 }
 
-func canonicalizeHostnameLocal(raw string) string {
-    h := strings.ToLower(strings.TrimSpace(raw))
-    h = strings.TrimSuffix(h, ".")
-    if h == "" {
-        return ""
-    }
-
-    var canonicalSuffixes = []string{
-        ".home.arpa", ".localdomain", ".internal", ".local", ".lan", ".home", ".corp", ".priv", ".intranet",
-    }
-
-    changed := true
-    for changed {
-        changed = false
-        for _, suf := range canonicalSuffixes {
-            if strings.HasSuffix(h, suf) {
-                h = strings.TrimSuffix(h, suf)
-                changed = true
-                break
-            }
-        }
-    }
-
-    for strings.Contains(h, "..") {
-        h = strings.ReplaceAll(h, "..", ".")
-    }
-
-    return strings.Trim(h, ".")
-}
+// Tech Debt 1 Fix: Removed canonicalizeHostnameLocal and replaced all calls with inventory.CanonicalizeHostname
