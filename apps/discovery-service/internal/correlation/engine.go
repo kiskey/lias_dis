@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 4.6 (Standardized Logging Keys)
+// Version: 4.7 (Fixed Hydration Type Conversion)
 package correlation
 
 import (
@@ -71,21 +71,10 @@ func (e *Engine) SetStorage(store *storage.Storage) {
         })
 
         if pending, err := store.LoadPendingEvents(); err == nil {
-            correlationPending := make([]PendingEventRecord, len(pending))
-            for i, p := range pending {
-                correlationPending[i] = PendingEventRecord{
-                    PDID:          p.PDID,
-                    EventType:     p.EventType,
-                    Payload:       p.Payload,
-                    FirstSeen:     p.FirstSeen,
-                    LastSeen:      p.LastSeen,
-                    Confirmations: p.Confirmations,
-                    Sources:       p.Sources,
-                }
-            }
-            e.debouncer.LoadPending(correlationPending)
-            if len(correlationPending) > 0 {
-                slog.Info("Loaded pending events from storage for recovery", "count", len(correlationPending))
+            // Pass []storage.PendingEventRecord directly to LoadPending
+            e.debouncer.LoadPending(pending)
+            if len(pending) > 0 {
+                slog.Info("Loaded pending events from storage for recovery", "count", len(pending))
             }
         }
     }
@@ -200,7 +189,6 @@ func (e *Engine) runStalenessSweep(ctx context.Context) {
                     IP:        d.CurrentIP,
                     Timestamp: time.Now(),
                 }))
-                // Consistency Fix: Standardized logging keys to "pdid"
                 slog.Info("Device transitioned offline via staleness sweep", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", d.CurrentIP)
             }
         }
@@ -347,7 +335,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                 slog.Warn("Potential MAC spoofing detected", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", ipStr, "conflict_mac", macStr)
                 
                 e.cache.RemoveIPIndex(ipStr)
-                e.markDirty(d.PDID) // High 5 Fix: Mark dirty so DB knows about IP eviction
+                e.markDirty(d.PDID)
                 d = nil
             }
         } else if ipStr != "" {
@@ -377,7 +365,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                     slog.Warn("Potential cross-device MAC spoofing detected", "pdid", existingOnIP.PDID, "ip", ipStr, "conflict_mac", macStr)
                     
                     e.cache.RemoveIPIndex(ipStr)
-                    e.markDirty(existingOnIP.PDID) // High 5 Fix: Mark dirty so DB knows about IP eviction
+                    e.markDirty(existingOnIP.PDID)
                     d = nil
                 }
             }
@@ -525,7 +513,6 @@ func (e *Engine) promoteDevice(d *models.Device, newTier models.IdentityTier, ne
         }
     }
 
-    // Critical 3 Fix: Migrate pending events in the debouncer to the new PDID
     e.debouncer.MigratePDID(oldPDID, newPDID)
 
     e.cache.Delete(oldPDID)
