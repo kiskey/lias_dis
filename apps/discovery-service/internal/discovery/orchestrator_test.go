@@ -1,7 +1,7 @@
 // Package discovery provides unit tests for the DIS orchestrator and nmap enrichment gating.
 //
 // File:    apps/discovery-service/internal/discovery/orchestrator_test.go
-// Version: 1.0
+// Version: 1.1 (Fixed Broker.Stop compile error)
 package discovery
 
 import (
@@ -16,9 +16,9 @@ import (
 
 // mockEnricher is a test double for the Enricher interface used to count nmap invocations.
 type mockEnricher struct {
-    name       string
+    name        string
     invocations int
-    enrichFunc func(ctx context.Context, d *models.Device) (*models.Enrichment, error)
+    enrichFunc  func(ctx context.Context, d *models.Device) (*models.Enrichment, error)
 }
 
 func (m *mockEnricher) Name() string { return m.name }
@@ -35,7 +35,6 @@ func TestNmapMaxRetries(t *testing.T) {
     cache := inventory.NewCache()
     defer cache.Stop()
     broker := disAPI.NewBroker(cache)
-    defer broker.Stop()
 
     fallback := &mockEnricher{
         name: "nmap_mock",
@@ -71,7 +70,6 @@ func TestNmapSkippedForFullyIdentified(t *testing.T) {
     cache := inventory.NewCache()
     defer cache.Stop()
     broker := disAPI.NewBroker(cache)
-    defer broker.Stop()
 
     fallback := &mockEnricher{
         name: "nmap_mock",
@@ -106,7 +104,6 @@ func TestForceBypassesCooldowns(t *testing.T) {
     cache := inventory.NewCache()
     defer cache.Stop()
     broker := disAPI.NewBroker(cache)
-    defer broker.Stop()
 
     fallback := &mockEnricher{
         name: "nmap_mock",
