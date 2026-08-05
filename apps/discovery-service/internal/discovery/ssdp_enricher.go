@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/ssdp_enricher.go
-// Version: 1.7 (Fixed IP Extraction for Standard HTTP Ports)
+// Version: 1.8 (Added Material Change Guard to Background Fetcher)
 package discovery
 
 import (
@@ -201,6 +201,9 @@ func (e *SSDPEnricher) runBackgroundFetcher() {
     e.wg.Add(1)
     defer e.wg.Done()
 
+    // P1-FIX: Per-device last-triggered timestamp for rate limiting
+    var lastTrigger sync.Map
+
     for loc := range e.bgQueue {
         if e.cache == nil || e.trigger == nil {
             continue
@@ -211,9 +214,21 @@ func (e *SSDPEnricher) runBackgroundFetcher() {
             continue
         }
 
+        // P1-FIX: Rate limit per-device triggers to once per 5 minutes
+        if last, ok := lastTrigger.Load(ip); ok {
+            if time.Since(last.(time.Time)) < 5*time.Minute {
+                continue
+            }
+        }
+        lastTrigger.Store(ip, time.Now())
+
         dev := e.cache.GetByIP(ip)
         if dev == nil {
-            slog.Debug("Passive SSDP: Device not in cache, skipping trigger", "ip", ip)
+            continue
+        }
+
+        // P1-FIX: Skip if device is already fully identified
+        if dev.IsFullyIdentified || (dev.Vendor != "" && dev.DeviceType != "" && (dev.FriendlyName != "" || dev.Hostname != "")) {
             continue
         }
 
