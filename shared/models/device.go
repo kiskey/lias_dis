@@ -1,7 +1,7 @@
 // Package models defines canonical data structures shared between DIS and LIAS.
 //
 // File:    shared/models/device.go
-// Version: 2.2
+// Version: 2.3 (Added Enrichment State Tracking)
 package models
 
 import (
@@ -47,6 +47,12 @@ type Device struct {
     Tags              []string              `json:"tags"`
     UserID            string                `json:"user_id,omitempty"`
     SourceInfo        map[string]SourceMeta `json:"source_info,omitempty"`
+
+    // P1-FIX: Enrichment Tracking & Negative Cache State
+    LastEnrichedAt    time.Time `json:"last_enriched_at,omitempty"`
+    LastNmapScanAt    time.Time `json:"last_nmap_scan_at,omitempty"`
+    NmapAttemptCount  int       `json:"nmap_attempt_count,omitempty"`
+    IsFullyIdentified bool      `json:"is_fully_identified,omitempty"`
 }
 
 // SourceMeta records per-source provenance for an observed field on a Device.
