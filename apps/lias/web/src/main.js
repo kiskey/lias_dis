@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 3.3 (Added Explicit Online/Offline Text)
+// Version: 3.4 (Fixed Schedule Modal Event Delegation & Duplicate Saves)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -1460,107 +1460,148 @@ class App {
   }
 
   bindScheduleModalEvents(s) {
+    // ── Cancel button: single binding ──
     document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
 
-    // LIAS-SCH-09 Fix: Handle mode switching (Range/Specific/Calendar)
-    document.querySelectorAll('.day-mode-select').forEach(sel => {
-      sel.addEventListener('change', (e) => {
-        const row = e.target.closest('.rule-row');
-        const mode = e.target.value;
-        row.querySelector('.day-range-picker').style.display = mode === 'range' ? 'flex' : 'none';
-        row.querySelector('.specific-days-picker').style.display = mode === 'specific' ? 'flex' : 'none';
-        row.querySelector('.calendar-picker').style.display = mode === 'calendar' ? 'flex' : 'none';
-      });
-      // Trigger initial state if dates exist
-      const row = sel.closest('.rule-row');
-      if (row.querySelector('.rule-start-date').value) {
-        sel.value = 'calendar';
-        sel.dispatchEvent(new Event('change'));
-      }
-    });
-
-    document.querySelectorAll('.day-chip').forEach(chip => chip.addEventListener('click', (e) => e.currentTarget.classList.toggle('selected')));
-    
-    document.querySelectorAll('.rule-start, .rule-end').forEach(input => {
-      input.addEventListener('change', () => {
-        const row = input.closest('.rule-row');
-        const start = row.querySelector('.rule-start').value;
-        const end = row.querySelector('.rule-end').value;
-        const container = row.querySelector('.overnight-container');
-        const allDayChk = row.querySelector('.rule-all-day');
-        if (allDayChk && allDayChk.checked) return;
-        if (start && end && end <= start) {
-          container.innerHTML = `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${this.formatTimeTo12hr(end)} the FOLLOWING day</div>`;
-        } else {
-          container.innerHTML = '';
-        }
-      });
-    });
-
-    document.querySelectorAll('.rule-all-day').forEach(chk => {
-      chk.addEventListener('change', (e) => {
-        const row = e.target.closest('.rule-row');
-        const startInput = row.querySelector('.rule-start');
-        const endInput = row.querySelector('.rule-end');
-        const overnightContainer = row.querySelector('.overnight-container');
-        if (e.target.checked) {
-          startInput.value = '00:00'; endInput.value = '23:59';
-          startInput.disabled = true; endInput.disabled = true; overnightContainer.innerHTML = '';
-        } else { startInput.disabled = false; endInput.disabled = false; }
-      });
-    });
-
-    const addRuleBtn = document.getElementById('btn-add-rule');
-    if (addRuleBtn) {
-      addRuleBtn.addEventListener('click', () => {
-        const container = document.getElementById('sched-rules-container');
-        const newIdx = container.children.length;
-        const newRuleHtml = this.renderScheduleRuleRow({
-          days: ['mon', 'tue', 'wed', 'thu', 'fri'],
-          start_time: '22:00',
-          end_time: '06:00',
-          action: 'block'
-        }, newIdx);
-        container.insertAdjacentHTML('beforeend', newRuleHtml);
-        this.bindScheduleModalEvents(s);
-      });
-    }
-
-    document.querySelectorAll('.btn-remove-rule').forEach(btn => btn.addEventListener('click', (e) => e.currentTarget.closest('.rule-row').remove()));
-    
+    // ── Save button: single binding, reads LIVE DOM state ──
     document.getElementById('modal-save-sched').addEventListener('click', async () => {
       const name = document.getElementById('sched-name').value.trim();
       if (!name) { this.showToast('Schedule name is required', 'danger'); return; }
       const mode = document.getElementById('sched-mode').value;
       const timezone = document.getElementById('sched-tz').value;
       const rules = [];
-      document.querySelectorAll('.rule-row').forEach(row => {
+
+      // Read ONLY currently-existing rule rows from the DOM
+      document.querySelectorAll('#sched-rules-container .rule-row').forEach(row => {
         const start = row.querySelector('.rule-start').value;
         const end = row.querySelector('.rule-end').value;
         const action = row.querySelector('.rule-action').value;
         const modeSelect = row.querySelector('.day-mode-select').value;
-        
+
         let days = [];
         let startDate = '';
         let endDate = '';
 
         if (modeSelect === 'calendar') {
-            startDate = row.querySelector('.rule-start-date').value;
-            endDate = row.querySelector('.rule-end-date').value;
-            days = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']; // Dummy days to pass validation
+          startDate = row.querySelector('.rule-start-date').value;
+          endDate = row.querySelector('.rule-end-date').value;
+          days = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
         } else if (modeSelect === 'range') {
-            days = expandDayRange(row.querySelector('.range-from').value, row.querySelector('.range-to').value);
+          days = expandDayRange(row.querySelector('.range-from').value, row.querySelector('.range-to').value);
         } else {
-            days = Array.from(row.querySelectorAll('.day-chip.selected')).map(c => c.dataset.day);
+          days = Array.from(row.querySelectorAll('.day-chip.selected')).map(c => c.dataset.day);
         }
 
+        // Only persist rules with valid, confirmed data
         if (start && end && (days.length > 0 || (startDate && endDate))) {
-            rules.push({ days, start_time: start, end_time: end, action, start_date: startDate, end_date: endDate });
+          rules.push({ days, start_time: start, end_time: end, action, start_date: startDate, end_date: endDate });
         }
       });
-      s.name = name; s.mode = mode; s.timezone = timezone; s.rules = rules;
-      try { await API.saveSchedule(s); this.showToast('Schedule saved successfully'); this.closeModal(); this.loadData(); }
-      catch (err) { this.showToast(`Failed to save schedule: ${err.message}`, 'danger'); }
+
+      // Preserve schedule ID for updates (prevents duplicate creation)
+      const scheduleData = { id: s.id, name, mode, timezone, rules };
+
+      try {
+        await API.saveSchedule(scheduleData);
+        this.showToast('Schedule saved successfully');
+        this.closeModal();
+        this.loadData();
+      } catch (err) {
+        this.showToast(`Failed to save schedule: ${err.message}`, 'danger');
+      }
+    });
+
+    // ── Add Rule button: single binding, NO re-bind call ──
+    document.getElementById('btn-add-rule').addEventListener('click', () => {
+      const container = document.getElementById('sched-rules-container');
+      const newIdx = container.children.length;
+      const newRuleHtml = this.renderScheduleRuleRow({
+        days: ['mon', 'tue', 'wed', 'thu', 'fri'],
+        start_time: '22:00',
+        end_time: '06:00',
+        action: 'block'
+      }, newIdx);
+      container.insertAdjacentHTML('beforeend', newRuleHtml);
+      // NOTE: No call to bindScheduleModalEvents — delegation handles new elements
+    });
+
+    // ── Event Delegation on rules container (handles ALL rules, existing + future) ──
+    const rulesContainer = document.getElementById('sched-rules-container');
+
+    // Delegated 'change' listener: day-mode, time inputs, all-day checkbox
+    rulesContainer.addEventListener('change', (e) => {
+      // Day mode selector
+      if (e.target.classList.contains('day-mode-select')) {
+        const row = e.target.closest('.rule-row');
+        const mode = e.target.value;
+        row.querySelector('.day-range-picker').style.display = mode === 'range' ? 'flex' : 'none';
+        row.querySelector('.specific-days-picker').style.display = mode === 'specific' ? 'flex' : 'none';
+        row.querySelector('.calendar-picker').style.display = mode === 'calendar' ? 'flex' : 'none';
+      }
+
+      // Time input changes → overnight indicator
+      if (e.target.classList.contains('rule-start') || e.target.classList.contains('rule-end')) {
+        const row = e.target.closest('.rule-row');
+        const start = row.querySelector('.rule-start').value;
+        const end = row.querySelector('.rule-end').value;
+        const overnightContainer = row.querySelector('.overnight-container');
+        const allDayChk = row.querySelector('.rule-all-day');
+        if (allDayChk && allDayChk.checked) return;
+        if (start && end && end <= start) {
+          overnightContainer.innerHTML = `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${this.formatTimeTo12hr(end)} the FOLLOWING day</div>`;
+        } else {
+          overnightContainer.innerHTML = '';
+        }
+      }
+
+      // All-day checkbox
+      if (e.target.classList.contains('rule-all-day')) {
+        const row = e.target.closest('.rule-row');
+        const startInput = row.querySelector('.rule-start');
+        const endInput = row.querySelector('.rule-end');
+        const overnightContainer = row.querySelector('.overnight-container');
+        if (e.target.checked) {
+          startInput.value = '00:00'; endInput.value = '23:59';
+          startInput.disabled = true; endInput.disabled = true;
+          if (overnightContainer) overnightContainer.innerHTML = '';
+        } else {
+          startInput.disabled = false; endInput.disabled = false;
+        }
+      }
+    });
+
+    // Delegated 'click' listener: day chips, remove buttons
+    rulesContainer.addEventListener('click', (e) => {
+      // Day chip toggle
+      if (e.target.classList.contains('day-chip')) {
+        e.target.classList.toggle('selected');
+      }
+      // Remove rule button
+      if (e.target.classList.contains('btn-remove-rule')) {
+        e.target.closest('.rule-row').remove();
+        this.updateRuleIndices();
+      }
+    });
+
+    // ── Initialize mode states for all pre-existing rules ──
+    document.querySelectorAll('.day-mode-select').forEach(sel => {
+      const row = sel.closest('.rule-row');
+      if (row.querySelector('.rule-start-date')?.value) {
+        sel.value = 'calendar';
+      }
+      const mode = sel.value;
+      row.querySelector('.day-range-picker').style.display = mode === 'range' ? 'flex' : 'none';
+      row.querySelector('.specific-days-picker').style.display = mode === 'specific' ? 'flex' : 'none';
+      row.querySelector('.calendar-picker').style.display = mode === 'calendar' ? 'flex' : 'none';
+    });
+  }
+
+  // ── New method: renumber rule labels after add/remove ──
+  updateRuleIndices() {
+    document.querySelectorAll('#sched-rules-container .rule-row').forEach((row, idx) => {
+      const label = row.querySelector('strong');
+      if (label) label.textContent = `Rule #${idx + 1}`;
+      row.dataset.idx = idx;
     });
   }
 
