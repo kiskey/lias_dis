@@ -2,19 +2,21 @@
 // It manages ONLY the isolated 'netdev lancontrol' table on the LAN interface.
 //
 // File:    apps/lias/internal/nftables/controller.go
-// Version: 3.0 (Corrected CapGet signature)
+// Version: 3.1 (Fixed CapGet Build Error and Pointer Comparison)
 package nftables
 
 import (
     "fmt"
     "log/slog"
     "net"
+    "os"
+    "strconv"
+    "strings"
     "sync"
 
     "github.com/google/nftables"
     "github.com/google/nftables/expr"
     "github.com/user/lias-dis/apps/lias/internal/config"
-    "golang.org/x/sys/unix"
 )
 
 type Controller struct {
@@ -37,14 +39,9 @@ func (c *Controller) Init() error {
     c.mu.Lock()
     defer c.mu.Unlock()
 
-    // LNX-02 Fix: Check for CAP_NET_ADMIN
-    hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
-    var data unix.CapUserData
-    if err := unix.CapGet(&hdr, &data); err != nil {
-        return fmt.Errorf("failed to check capabilities: %w", err)
-    }
-    if data.Effective&unix.CAP_NET_ADMIN == 0 {
-        return fmt.Errorf("LIAS requires CAP_NET_ADMIN to manage nftables. Run as root or grant capabilities")
+    // LNX-02 Fix: Check for CAP_NET_ADMIN using /proc/self/status
+    if err := checkNetAdmin(); err != nil {
+        return err
     }
 
     // LNX-03 Fix: Verify interface existence
@@ -129,9 +126,10 @@ func (c *Controller) Init() error {
     if err == nil {
         for _, ec := range existingChains {
             if ec.Table.Family == nftables.TableFamilyNetdev && ec.Hooknum == nftables.ChainHookIngress {
-                if ec.Priority < nftables.ChainPriorityRef(-500) {
+                // Fix: ec.Priority is a *int. We need to dereference it safely.
+                if ec.Priority != nil && *ec.Priority < -500 {
                     slog.Warn("Existing nftables ingress chain has higher priority, LIAS rules might be bypassed", 
-                        "chain", ec.Name, "table", ec.Table.Name, "priority", ec.Priority)
+                        "chain", ec.Name, "table", ec.Table.Name, "priority", *ec.Priority)
                 }
             }
         }
@@ -146,6 +144,30 @@ func (c *Controller) Init() error {
     slog.Info("nftables netdev table initialized successfully with priority -500, drop-first rules, and LAN bypass",
         "table", c.cfg.TableName, "iface", c.cfg.Interface, "bypass_subnets", len(c.cfg.LanSubnets))
     return nil
+}
+
+// checkNetAdmin checks if the process has CAP_NET_ADMIN
+func checkNetAdmin() error {
+    data, err := os.ReadFile("/proc/self/status")
+    if err != nil {
+        return fmt.Errorf("failed to read /proc/self/status: %w", err)
+    }
+
+    for _, line := range strings.Split(string(data), "\n") {
+        if strings.HasPrefix(line, "CapEff:\t") {
+            hexStr := strings.TrimSpace(strings.TrimPrefix(line, "CapEff:\t"))
+            capEff, err := strconv.ParseUint(hexStr, 16, 64)
+            if err != nil {
+                return fmt.Errorf("failed to parse CapEff: %w", err)
+            }
+            // CAP_NET_ADMIN is bit 12 (value 0x1000)
+            if capEff&0x1000 == 0 {
+                return fmt.Errorf("LIAS requires CAP_NET_ADMIN to manage nftables. Run as root or grant capabilities")
+            }
+            return nil
+        }
+    }
+    return fmt.Errorf("could not find CapEff in /proc/self/status")
 }
 
 func (c *Controller) addRules(ifaceBytes []byte) {
@@ -383,7 +405,6 @@ func (c *Controller) queueElements(setName string, toAdd, toRem interface{}, isM
     }
 }
 
-// NET-03 Fix: Race-free connection reinitialization
 func (c *Controller) reinitializeConn() {
     slog.Warn("Reinitializing nftables connection due to transaction failure")
     
