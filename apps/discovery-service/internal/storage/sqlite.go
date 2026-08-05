@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for DIS device state.
 //
 // File:    apps/discovery-service/internal/storage/sqlite.go
-// Version: 3.1 (Removed Duplicate Canonicalization Helper)
+// Version: 3.2 (Added Enrichment State Persistence)
 package storage
 
 import (
@@ -111,7 +111,11 @@ func (s *Storage) initSchema() error {
         confidence REAL NOT NULL DEFAULT 0.0,
         first_seen DATETIME NOT NULL,
         last_seen DATETIME NOT NULL,
-        online INTEGER NOT NULL DEFAULT 1
+        online INTEGER NOT NULL DEFAULT 1,
+        last_enriched_at DATETIME,
+        last_nmap_scan_at DATETIME,
+        nmap_attempt_count INTEGER NOT NULL DEFAULT 0,
+        is_fully_identified INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS device_macs (
@@ -159,6 +163,12 @@ func (s *Storage) initSchema() error {
     _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN canonical_hostname TEXT NOT NULL DEFAULT ''")
     _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN current_mac TEXT NOT NULL DEFAULT ''")
     _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN current_ip TEXT NOT NULL DEFAULT ''")
+    
+    // P1-FIX: Add enrichment tracking columns
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN last_enriched_at DATETIME")
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN last_nmap_scan_at DATETIME")
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN nmap_attempt_count INTEGER NOT NULL DEFAULT 0")
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN is_fully_identified INTEGER NOT NULL DEFAULT 0")
 
     return nil
 }
@@ -194,7 +204,6 @@ func (s *Storage) migrateV1PDIDs() error {
             continue
         }
 
-        // Tech Debt 1 Fix: Use unified inventory.CanonicalizeHostname
         canonicalHost := inventory.CanonicalizeHostname(hostname)
         tier, anchor := inventory.DeriveTierAndAnchor(mac, canonicalHost, vendor)
         newPDID := inventory.GeneratePDID(tier, anchor)
@@ -235,7 +244,10 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
     defer s.mu.Unlock()
 
     rows, err := s.db.Query(`
-        SELECT pdid, identity_tier, identity_anchor, canonical_hostname, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online
+        SELECT pdid, identity_tier, identity_anchor, canonical_hostname, 
+               current_mac, current_ip, hostname, friendly_name, manufacturer, 
+               vendor, model, device_type, confidence, first_seen, last_seen, online,
+               last_enriched_at, last_nmap_scan_at, nmap_attempt_count, is_fully_identified
         FROM devices
     `)
     if err != nil {
@@ -249,11 +261,14 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
         var d models.Device
         var onlineInt int
         var firstSeen, lastSeen time.Time
+        var lastEnrichedAt, lastNmapScanAt sql.NullTime
+        var nmapAttemptCount, isFullyIdentified int
 
         err := rows.Scan(
             &d.PDID, &d.IdentityTier, &d.IdentityAnchor, &d.CanonicalHostname,
             &d.CurrentMAC, &d.CurrentIP, &d.Hostname, &d.FriendlyName, &d.Manufacturer,
             &d.Vendor, &d.Model, &d.DeviceType, &d.Confidence, &firstSeen, &lastSeen, &onlineInt,
+            &lastEnrichedAt, &lastNmapScanAt, &nmapAttemptCount, &isFullyIdentified,
         )
         if err != nil {
             continue
@@ -262,6 +277,15 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
         d.FirstSeen = firstSeen
         d.LastSeen = lastSeen
         d.Online = onlineInt == 1
+        if lastEnrichedAt.Valid {
+            d.LastEnrichedAt = lastEnrichedAt.Time
+        }
+        if lastNmapScanAt.Valid {
+            d.LastNmapScanAt = lastNmapScanAt.Time
+        }
+        d.NmapAttemptCount = nmapAttemptCount
+        d.IsFullyIdentified = isFullyIdentified == 1
+        
         d.MACs = []string{}
         d.IPs = []string{}
         d.SourceInfo = make(map[string]models.SourceMeta)
@@ -384,7 +408,6 @@ func (s *Storage) SaveDevicesBatch(devs []*models.Device) error {
     defer func() { _ = tx.Rollback() }()
 
     for i, d := range devs {
-        // Critical 1 Fix: Use SAVEPOINT to allow individual failures without aborting the batch
         spName := fmt.Sprintf("sp_%d", i)
         if _, err := tx.Exec("SAVEPOINT " + spName); err != nil {
             slog.Error("Failed to create savepoint, aborting batch", "error", err)
@@ -413,9 +436,17 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
         onlineInt = 1
     }
 
+    isFullyIdentifiedInt := 0
+    if d.IsFullyIdentified {
+        isFullyIdentifiedInt = 1
+    }
+
     _, err := tx.Exec(`
-        INSERT INTO devices (pdid, identity_tier, identity_anchor, canonical_hostname, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO devices (pdid, identity_tier, identity_anchor, canonical_hostname, 
+            current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, 
+            model, device_type, confidence, first_seen, last_seen, online,
+            last_enriched_at, last_nmap_scan_at, nmap_attempt_count, is_fully_identified)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(pdid) DO UPDATE SET
             identity_tier=excluded.identity_tier,
             identity_anchor=excluded.identity_anchor,
@@ -430,8 +461,12 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
             device_type=excluded.device_type,
             confidence=excluded.confidence,
             last_seen=excluded.last_seen,
-            online=excluded.online
-    `, d.PDID, string(d.IdentityTier), d.IdentityAnchor, d.CanonicalHostname, d.CurrentMAC, d.CurrentIP, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt)
+            online=excluded.online,
+            last_enriched_at=excluded.last_enriched_at,
+            last_nmap_scan_at=excluded.last_nmap_scan_at,
+            nmap_attempt_count=excluded.nmap_attempt_count,
+            is_fully_identified=excluded.is_fully_identified
+    `, d.PDID, string(d.IdentityTier), d.IdentityAnchor, d.CanonicalHostname, d.CurrentMAC, d.CurrentIP, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt, d.LastEnrichedAt, d.LastNmapScanAt, d.NmapAttemptCount, isFullyIdentifiedInt)
 
     if err != nil {
         return fmt.Errorf("failed to upsert device %s: %w", d.PDID, err)
@@ -620,5 +655,3 @@ func (s *Storage) Close() error {
     }
     return nil
 }
-
-// Tech Debt 1 Fix: Removed canonicalizeHostnameLocal and replaced all calls with inventory.CanonicalizeHostname
