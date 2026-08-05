@@ -1,7 +1,7 @@
 // Package nftables implements the isolated firewall controller for LIAS.
 //
 // File:    apps/lias/internal/nftables/builder.go
-// Version: 2.0 (Added log/slog import)
+// Version: 2.2 (Fixed Infrastructure Immunity Bypass on Offline Status)
 package nftables
 
 import (
@@ -42,7 +42,6 @@ func NewBuilder(cache *liasSync.Cache, controller *Controller) *Builder {
 }
 
 // NET-03 Fix: Reset internal state when the kernel connection is lost/reinitialized.
-// This forces the next Sync to compute a full diff (all adds, no removes), repopulating the kernel sets.
 func (b *Builder) ResetState() {
     b.mu.Lock()
     defer b.mu.Unlock()
@@ -74,9 +73,17 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
         d := &devs[i]
         action := policyEngine.EvaluateAction(d, schedEngine)
 
+        // V2.2 FIX: Infrastructure devices must ALWAYS be in the allowed sets, 
+        // even if offline, to prevent network lockouts.
+        isInfra := d.HasTag("infrastructure")
+        if isInfra {
+            action = models.ActionAllow
+        }
+
         switch action {
         case models.ActionAllow:
-            if !d.Online {
+            // Skip offline devices ONLY if they are not infrastructure
+            if !d.Online && !isInfra {
                 continue
             }
             for _, ipStr := range d.IPs {
@@ -153,8 +160,6 @@ func (b *Builder) Sync(policyEngine policy.PolicyEvaluator, schedEngine policy.S
         b.currentAllowedIP6s = desiredAllowedIP6s
         b.currentBlockedIP6s = desiredBlockedIP6s
     } else {
-        // If Apply failed and triggered a reinit, reset our state so the next sync repopulates everything.
-        // We must unlock briefly to call ResetState which acquires the lock, or just inline it.
         b.currentAllowedIPs = make(map[string]net.IP)
         b.currentBlockedIPs = make(map[string]net.IP)
         b.currentAllowedMACs = make(map[string]net.HardwareAddr)
