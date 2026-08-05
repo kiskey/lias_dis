@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/dhcp_provider.go
-// Version: 1.6 (Hardened Option 55 Parsing)
+// Version: 1.7 (Dynamic Lease File, OS Fingerprint Fix, SSH Hardening)
 package discovery
 
 import (
@@ -90,7 +90,19 @@ func (p *DHCPProvider) poll() {
         }
         
         target := fmt.Sprintf("%s@%s", user, p.cfg.SSHHost)
-        cmd := exec.CommandContext(p.ctx, "ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=5", target, "cat /tmp/dhcp.leases")
+        
+        // High 4 Fix: Use p.cfg.LeaseFile dynamically, default to /tmp/dhcp.leases
+        leaseFile := p.cfg.LeaseFile
+        if leaseFile == "" {
+            leaseFile = "/tmp/dhcp.leases"
+        }
+        
+        // Security 1 Fix: Hardcode UserKnownHostsFile to prevent MITM if default ~/.ssh/known_hosts is manipulated
+        cmd := exec.CommandContext(p.ctx, "ssh", 
+            "-o", "StrictHostKeyChecking=accept-new", 
+            "-o", "UserKnownHostsFile=/etc/dis/known_hosts",
+            "-o", "ConnectTimeout=5", 
+            target, "cat "+leaseFile)
         
         var stdout bytes.Buffer
         cmd.Stdout = &stdout
@@ -170,7 +182,8 @@ func (p *DHCPProvider) poll() {
             obs.Raw["dhcp_option_55"] = opt55
             osGuess := fingerprintOSFromDHCP(opt55)
             if osGuess != "" {
-                obs.Model = osGuess
+                // Medium 3 Fix: Map to OS field in Raw instead of overwriting Model
+                obs.Raw["dhcp_os"] = osGuess
                 obs.Confidence = 0.70
             }
         } else if len(parts) > 4 {
@@ -185,12 +198,10 @@ func (p *DHCPProvider) poll() {
     }
 }
 
-// ENR-07 Fix: Parse DHCP Option 55 robustly (handles both comma-separated decimal and raw hex)
 func fingerprintOSFromDHCP(opt55 string) string {
     set := make(map[byte]bool)
     
     if strings.Contains(opt55, ",") {
-        // Comma-separated decimal (e.g., "1,15,3,6,44,46,47,31,33,121,249")
         bytesStr := strings.Split(opt55, ",")
         for _, b := range bytesStr {
             n, err := strconv.Atoi(strings.TrimSpace(b))
@@ -199,7 +210,6 @@ func fingerprintOSFromDHCP(opt55 string) string {
             }
         }
     } else {
-        // Raw hex string (e.g., "0103060f1f21" or "01:03:06:0f:1f:21")
         cleanHex := strings.ReplaceAll(opt55, ":", "")
         cleanHex = strings.ReplaceAll(cleanHex, " ", "")
         if len(cleanHex)%2 == 0 {
@@ -212,19 +222,15 @@ func fingerprintOSFromDHCP(opt55 string) string {
         }
     }
 
-    // Typical Windows request: 1,15,3,6,44,46,47,31,33,121,249
     if set[31] && set[33] && set[44] {
         return "Windows"
     }
-    // Typical macOS / iOS request: 1,121,3,6,15,119,252,95,44
     if set[119] && set[252] && set[95] {
         return "Apple macOS/iOS"
     }
-    // Typical Android request: 1,33,3,6,15,28,51,58,59
     if set[28] && set[51] && !set[44] {
         return "Android"
     }
-    // Typical Linux (dhclient): 1,28,2,5,3,6,12,15,119
     if set[1] && set[28] && set[2] && set[5] && !set[119] {
         return "Linux"
     }
