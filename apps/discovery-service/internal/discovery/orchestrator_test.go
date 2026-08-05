@@ -1,7 +1,7 @@
 // Package discovery provides unit tests for the DIS orchestrator and nmap enrichment gating.
 //
 // File:    apps/discovery-service/internal/discovery/orchestrator_test.go
-// Version: 1.1 (Fixed Broker.Stop compile error)
+// Version: 1.2 (Fixed force=true logic boundaries)
 package discovery
 
 import (
@@ -53,10 +53,12 @@ func TestNmapMaxRetries(t *testing.T) {
     }
     cache.Upsert(dev)
 
-    // Trigger 5 times with force=true to bypass the 1-hour cooldown, 
-    // directly testing the max retry logic boundary.
+    // Trigger 5 times with force=false.
+    // We manually backdate the lastAttemptMap to bypass the 1-hour cooldown 
+    // so we can directly test the max retry logic boundary.
     for i := 0; i < 5; i++ {
-        orch.TriggerEnrichment(dev.PDID, true)
+        orch.lastAttemptMap.Store(dev.PDID, time.Now().Add(-2*time.Hour))
+        orch.TriggerEnrichment(dev.PDID, false)
     }
 
     if fallback.invocations != 3 {
@@ -90,7 +92,7 @@ func TestNmapSkippedForFullyIdentified(t *testing.T) {
     }
     cache.Upsert(dev)
 
-    // Force trigger to bypass cooldowns and test ONLY the fully identified logic
+    // Force trigger to bypass time-based cooldowns and test ONLY the fully identified logic
     orch.TriggerEnrichment(dev.PDID, true)
 
     if fallback.invocations != 0 {
@@ -98,7 +100,7 @@ func TestNmapSkippedForFullyIdentified(t *testing.T) {
     }
 }
 
-// TestForceBypassesCooldowns verifies that force=true bypasses all cooldowns and retry limits.
+// TestForceBypassesCooldowns verifies that force=true bypasses time-based and retry cooldowns.
 // This validates that manual UI refreshes always work regardless of negative cache state.
 func TestForceBypassesCooldowns(t *testing.T) {
     cache := inventory.NewCache()
@@ -123,6 +125,7 @@ func TestForceBypassesCooldowns(t *testing.T) {
     cache.Upsert(dev)
 
     // 1. Normal trigger should be blocked by 24h cooldown and max retries
+    orch.lastAttemptMap.Store(dev.PDID, time.Now().Add(-2*time.Hour)) // Bypass 1h cooldown
     orch.TriggerEnrichment(dev.PDID, false)
     if fallback.invocations != 0 {
         t.Fatalf("Expected 0 invocations without force, got %d", fallback.invocations)
