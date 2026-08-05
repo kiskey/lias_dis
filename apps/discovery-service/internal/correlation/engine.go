@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 5.1 (Integrated OpenWrt AP/Bridge into Multi-Source Consensus)
+// Version: 5.2 (Fixed ApplySmartClassifications Syntax Error)
 package correlation
 
 import (
@@ -451,7 +451,10 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             d.PendingOnlineObs = append(d.PendingOnlineObs, obs.Source)
         }
 
-        isInfra := d.HasTag("infrastructure") || ApplySmartClassifications(d)
+        // V5.2 FIX: Call ApplySmartClassifications as a statement, then check the property
+        ApplySmartClassifications(d)
+        isInfra := d.HasTag("infrastructure") || d.DeviceType == "infrastructure"
+        
         if isInfra || len(d.PendingOnlineObs) >= 2 || hasL2AndL3Confirmation(d.PendingOnlineObs) {
             d.Online = true
             d.PendingOnlineObs = nil
