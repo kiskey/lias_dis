@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 3.6 (Fixed Schedule Rule Mode Reconstruction)
+// Version: 3.7 (Fixed Schedule Rule Mode Reconstruction Heuristic)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -1436,16 +1436,15 @@ class App {
     const isAllDay = rule.start_time === '00:00' && rule.end_time === '23:59';
 
     // ── Infer the original selection mode ──
-    let inferredMode = 'range'; // Default for new rules or valid contiguous ranges
+    // To prevent ambiguity where a contiguous "Specific Days" selection (e.g., Mon, Tue, Wed)
+    // is incorrectly reconstructed as a "Continuous Day Range", we default to "Specific Days"
+    // for all loaded weekly rules. This accurately represents the underlying data and allows
+    // full editability without unexpected mode switching.
+    let inferredMode = 'range'; // Default for new rules
     if (rule.start_date && rule.end_date) {
       inferredMode = 'calendar';
     } else if (daysArr.length > 0) {
-      // Check if the days array represents a contiguous range
-      const range = expandDayRange(daysArr[0], daysArr[daysArr.length - 1]);
-      const isRange = range.length === daysArr.length && range.every((v, i) => v === daysArr[i]);
-      if (!isRange) {
-        inferredMode = 'specific';
-      }
+      inferredMode = 'specific';
     }
 
     return `
