@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 5.4 (Integrated openwrt_arp as Authoritative L2/L3 Ground Truth)
+// Version: 5.5 (Fixed Duplicate Case Syntax Error)
 package correlation
 
 import (
@@ -244,15 +244,19 @@ func canTriggerOnline(source string) bool {
     }
 }
 
-// V5.4 FIX: Recognize openwrt_arp as both Layer-2 AND Layer-3 source
+// V5.5 FIX: Corrected duplicate case syntax error.
+// openwrt_arp is now in its own case, setting both L2 and L3 flags.
 func hasL2AndL3Confirmation(sources []string) bool {
     hasL2 := false
     hasL3 := false
     for _, s := range sources {
         switch s {
-        case "netlink", "openwrt_ap", "openwrt_arp":
+        case "netlink", "openwrt_ap":
             hasL2 = true
-        case "dhcp", "pihole", "openwrt_arp":
+        case "dhcp", "pihole":
+            hasL3 = true
+        case "openwrt_arp":
+            hasL2 = true
             hasL3 = true
         }
     }
@@ -437,7 +441,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     }
 
     if !d.Online && obs.Online {
-        // V5.4 FIX: OpenWrt AP and ARP data is authoritative Layer-2/Layer-3 ground truth.
+        // V5.3 FIX: OpenWrt AP and ARP data is authoritative Layer-2/Layer-3 ground truth.
         // If the router reports the device as associated/resolved, it is definitively online.
         // We bypass the 30-second deferred timer to prevent bulk-poll "offline limbo".
         isAuthoritativeL2 := obs.Source == "openwrt_ap" || obs.Source == "openwrt_arp"
