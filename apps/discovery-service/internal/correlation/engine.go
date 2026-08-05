@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 4.5 (Wired Debouncer MigratePDID, Fixed Dangling CurrentIP)
+// Version: 4.6 (Standardized Logging Keys)
 package correlation
 
 import (
@@ -200,6 +200,7 @@ func (e *Engine) runStalenessSweep(ctx context.Context) {
                     IP:        d.CurrentIP,
                     Timestamp: time.Now(),
                 }))
+                // Consistency Fix: Standardized logging keys to "pdid"
                 slog.Info("Device transitioned offline via staleness sweep", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", d.CurrentIP)
             }
         }
@@ -343,7 +344,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                     Details:   fmt.Sprintf("MAC %s claimed IP %s currently held by %s (MAC %s)", macStr, ipStr, d.PDID, d.CurrentMAC),
                     Timestamp: time.Now(),
                 }))
-                slog.Warn("Potential MAC spoofing detected", "existing_pdid", d.PDID, "existing_mac", d.CurrentMAC, "spoof_mac", macStr, "ip", ipStr)
+                slog.Warn("Potential MAC spoofing detected", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", ipStr, "conflict_mac", macStr)
                 
                 e.cache.RemoveIPIndex(ipStr)
                 e.markDirty(d.PDID) // High 5 Fix: Mark dirty so DB knows about IP eviction
@@ -373,7 +374,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
                         Details:   fmt.Sprintf("MAC %s claimed IP %s held by %s", macStr, ipStr, existingOnIP.PDID),
                         Timestamp: time.Now(),
                     }))
-                    slog.Warn("Potential cross-device MAC spoofing detected", "target_pdid", existingOnIP.PDID, "spoof_mac", macStr, "ip", ipStr)
+                    slog.Warn("Potential cross-device MAC spoofing detected", "pdid", existingOnIP.PDID, "ip", ipStr, "conflict_mac", macStr)
                     
                     e.cache.RemoveIPIndex(ipStr)
                     e.markDirty(existingOnIP.PDID) // High 5 Fix: Mark dirty so DB knows about IP eviction
@@ -389,7 +390,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             if exists && ownerPDID != d.PDID {
                 acqRes := e.cache.AcquireHostname(canonicalHost, d.PDID)
                 if acqRes == inventory.AcquireReject {
-                    slog.Debug("Hostname ownership lock rejected claim", "host", canonicalHost, "claimant", obs.Source)
+                    slog.Debug("Hostname ownership lock rejected claim", "host", canonicalHost, "pdid", d.PDID, "claimant", obs.Source)
                     canonicalHost = ""
                     cleanHost = ""
                 }
@@ -435,7 +436,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
         e.markDirty(d.PDID)
 
-        slog.Info("New tiered device correlated", "pdid", pdid, "tier", tier, "mac", macStr, "ip", ipStr)
+        slog.Info("New tiered device correlated", "pdid", d.PDID, "tier", tier, "mac", macStr, "ip", ipStr)
         e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
         return
     }
@@ -517,7 +518,7 @@ func (e *Engine) promoteDevice(d *models.Device, newTier models.IdentityTier, ne
 
     if e.store != nil {
         if err := e.store.ReplaceDevicePDID(oldPDID, newPDID, d); err != nil {
-            slog.Error("Atomic PDID replacement failed", "old", oldPDID, "new", newPDID, "error", err)
+            slog.Error("Atomic PDID replacement failed", "old_pdid", oldPDID, "new_pdid", newPDID, "error", err)
             d.PDID = oldPDID
             d.IdentityTier = models.TierL7
             return
