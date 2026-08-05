@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 2.3 (Wired SSE Backoff Reset)
+// Version: 2.4 (Fixed SSE Payload Mismatch Cache Corruption)
 package sync
 
 import (
@@ -336,13 +336,17 @@ func (c *DISClient) handleEvent(e models.Event) {
             }
         }
 
-    case models.EventDeviceAdded, models.EventDeviceOnline, models.EventFingerprintUpdated:
+    // P1-FIX: Handle events that carry the FULL Device struct inline.
+    case models.EventDeviceAdded, models.EventFingerprintUpdated:
         go func(pdid string, evt models.Event) {
             prev := c.cache.Get(pdid)
             isNewDevice := prev == nil || evt.Type == models.EventDeviceAdded
 
             var inlineDev models.Device
-            if len(evt.Payload) > 0 && json.Unmarshal(evt.Payload, &inlineDev) == nil && inlineDev.PDID == pdid {
+            // FIX: Validate that the unmarshalled struct is actually a full Device 
+            // (must have a MAC) before upserting. This prevents partial payloads 
+            // from corrupting the LIAS cache.
+            if len(evt.Payload) > 0 && json.Unmarshal(evt.Payload, &inlineDev) == nil && inlineDev.PDID == pdid && inlineDev.CurrentMAC != "" {
                 c.cache.UpsertDevice(inlineDev)
                 c.tryTrigger()
             } else if c.fetchSingleDevice(pdid) {
@@ -357,8 +361,11 @@ func (c *DISClient) handleEvent(e models.Event) {
             }
         }(e.DeviceID, e)
 
-    case models.EventDeviceOffline, models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged:
+    // P1-FIX: Handle events that carry PARTIAL payloads (DeviceEventPayload).
+    // These MUST fetch the full device record to prevent wiping cache metadata.
+    case models.EventDeviceOnline, models.EventDeviceOffline, models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged:
         go func(pdid string, evt models.Event) {
+            // FIX: ALWAYS fetch the single device to ensure full state integrity.
             if c.fetchSingleDevice(pdid) {
                 c.tryTrigger()
             }
