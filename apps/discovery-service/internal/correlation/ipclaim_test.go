@@ -1,7 +1,7 @@
 // Package correlation implements unit tests for IP claim validation.
 //
 // File:    apps/discovery-service/internal/correlation/ipclaim_test.go
-// Version: 1.0
+// Version: 1.1
 package correlation
 
 import (
