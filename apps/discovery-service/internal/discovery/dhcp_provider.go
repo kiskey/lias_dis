@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/dhcp_provider.go
-// Version: 1.7 (Dynamic Lease File, OS Fingerprint Fix, SSH Hardening)
+// Version: 1.8 (Added OpenWrt AP & Bridge Layer-2 Ground Truth Polling)
 package discovery
 
 import (
@@ -35,7 +35,7 @@ type DHCPProvider struct {
 func NewDHCPProvider(cfg config.DHCPConfig) *DHCPProvider {
     return &DHCPProvider{
         cfg:    cfg,
-        events: make(chan Observation, 128),
+        events: make(chan Observation, 256), // Increased buffer for AP data
         done:   make(chan struct{}),
         client: &http.Client{Timeout: 10 * time.Second},
     }
@@ -91,24 +91,31 @@ func (p *DHCPProvider) poll() {
         
         target := fmt.Sprintf("%s@%s", user, p.cfg.SSHHost)
         
-        // High 4 Fix: Use p.cfg.LeaseFile dynamically, default to /tmp/dhcp.leases
         leaseFile := p.cfg.LeaseFile
         if leaseFile == "" {
             leaseFile = "/tmp/dhcp.leases"
         }
         
-        // Security 1 Fix: Hardcode UserKnownHostsFile to prevent MITM if default ~/.ssh/known_hosts is manipulated
+        // V1.8 ADD: Build compound command to fetch Leases, Wi-Fi APs, and Bridge FDB
+        cmdStr := "cat " + leaseFile
+        if p.cfg.OpenWrtAPEnabled {
+            cmdStr += "; echo '===AP_ASSOC==='; iw dev | grep -E 'Interface|Station' | awk '/Interface/{iface=$2} /Station/{print iface, $2}'"
+        }
+        if p.cfg.BridgeFDBEnabled {
+            cmdStr += "; echo '===BRIDGE_FDB==='; brctl showmacs br-lan | awk 'NR>1 {print $2, $4}'"
+        }
+
         cmd := exec.CommandContext(p.ctx, "ssh", 
             "-o", "StrictHostKeyChecking=accept-new", 
             "-o", "UserKnownHostsFile=/etc/dis/known_hosts",
             "-o", "ConnectTimeout=5", 
-            target, "cat "+leaseFile)
+            target, cmdStr)
         
         var stdout bytes.Buffer
         cmd.Stdout = &stdout
         err = cmd.Run()
         if err != nil {
-            slog.Debug("Failed to fetch DHCP leases via SSH", "host", p.cfg.SSHHost, "error", err)
+            slog.Debug("Failed to fetch DHCP/AP data via SSH", "host", p.cfg.SSHHost, "error", err)
             return
         }
         reader = &stdout
@@ -143,58 +150,152 @@ func (p *DHCPProvider) poll() {
     }
 
     scanner := bufio.NewScanner(reader)
+    currentSection := "dhcp"
+    
     for scanner.Scan() {
         line := scanner.Text()
-        parts := strings.Fields(line)
-        if len(parts) < 4 {
+        
+        if line == "===AP_ASSOC===" {
+            currentSection = "ap"
             continue
         }
-        
-        mac, err := net.ParseMAC(parts[1])
-        if err != nil {
+        if line == "===BRIDGE_FDB===" {
+            currentSection = "bridge"
             continue
-        }
-        
-        ip := net.ParseIP(parts[2])
-        if ip == nil {
-            continue
-        }
-        
-        hostname := parts[3]
-        if hostname == "*" {
-            hostname = ""
         }
 
-        obs := Observation{
-            Source:     p.Name(),
-            Group:      GroupB,
-            MAC:        mac,
-            IP:         ip,
-            Hostname:   hostname,
-            Online:     true,
-            Confidence: 0.50,
-            Timestamp:  time.Now(),
-            Raw:        make(map[string]interface{}),
+        if currentSection == "dhcp" {
+            p.parseDHCPLine(line)
+        } else if currentSection == "ap" {
+            p.parseAPLine(line)
+        } else if currentSection == "bridge" {
+            p.parseBridgeLine(line)
         }
+    }
+}
 
-        if len(parts) > 5 {
-            opt55 := parts[5]
-            obs.Raw["dhcp_option_55"] = opt55
-            osGuess := fingerprintOSFromDHCP(opt55)
-            if osGuess != "" {
-                // Medium 3 Fix: Map to OS field in Raw instead of overwriting Model
-                obs.Raw["dhcp_os"] = osGuess
-                obs.Confidence = 0.70
-            }
-        } else if len(parts) > 4 {
-            obs.Raw["client_id"] = parts[4]
+func (p *DHCPProvider) parseDHCPLine(line string) {
+    parts := strings.Fields(line)
+    if len(parts) < 4 {
+        return
+    }
+    
+    mac, err := net.ParseMAC(parts[1])
+    if err != nil {
+        return
+    }
+    
+    ip := net.ParseIP(parts[2])
+    if ip == nil {
+        return
+    }
+    
+    hostname := parts[3]
+    if hostname == "*" {
+        hostname = ""
+    }
+
+    obs := Observation{
+        Source:     p.Name(),
+        Group:      GroupB,
+        MAC:        mac,
+        IP:         ip,
+        Hostname:   hostname,
+        Online:     true,
+        Confidence: 0.50,
+        Timestamp:  time.Now(),
+        Raw:        make(map[string]interface{}),
+    }
+
+    if len(parts) > 5 {
+        opt55 := parts[5]
+        obs.Raw["dhcp_option_55"] = opt55
+        osGuess := fingerprintOSFromDHCP(opt55)
+        if osGuess != "" {
+            obs.Raw["dhcp_os"] = osGuess
+            obs.Confidence = 0.70
         }
-        
-        select {
-        case p.events <- obs:
-        default:
-            slog.Warn("DHCP observation channel full, dropping event")
-        }
+    } else if len(parts) > 4 {
+        obs.Raw["client_id"] = parts[4]
+    }
+    
+    select {
+    case p.events <- obs:
+    default:
+        slog.Warn("DHCP observation channel full, dropping event")
+    }
+}
+
+// V1.8 ADD: Parse Wi-Fi AP Associations (iw dev)
+// Line format: wlan0 aa:bb:cc:dd:ee:ff
+func (p *DHCPProvider) parseAPLine(line string) {
+    parts := strings.Fields(line)
+    if len(parts) != 2 {
+        return
+    }
+    
+    iface := parts[0]
+    macStr := parts[1]
+    
+    mac, err := net.ParseMAC(macStr)
+    if err != nil {
+        return
+    }
+
+    obs := Observation{
+        Source:     "openwrt_ap",
+        Group:      GroupA, // Layer-2 Ground Truth
+        MAC:        mac,
+        IP:         nil,
+        Online:     true,
+        Confidence: 0.99, // Highest possible confidence
+        Timestamp:  time.Now(),
+        Raw: map[string]interface{}{
+            "wifi_interface": iface,
+        },
+    }
+
+    select {
+    case p.events <- obs:
+    default:
+        slog.Warn("AP observation channel full, dropping event")
+    }
+}
+
+// V1.8 ADD: Parse Bridge FDB entries (brctl showmacs br-lan)
+// Line format: aa:bb:cc:dd:ee:ff no (we only want the MACs that are "no" i.e., not local)
+func (p *DHCPProvider) parseBridgeLine(line string) {
+    parts := strings.Fields(line)
+    if len(parts) != 2 {
+        return
+    }
+    
+    macStr := parts[0]
+    isLocal := parts[1] == "yes"
+    if isLocal {
+        return
+    }
+    
+    mac, err := net.ParseMAC(macStr)
+    if err != nil {
+        return
+    }
+
+    obs := Observation{
+        Source:     "openwrt_bridge",
+        Group:      GroupA, // Layer-2 Ground Truth
+        MAC:        mac,
+        IP:         nil,
+        Online:     true,
+        Confidence: 0.95,
+        Timestamp:  time.Now(),
+        Raw:        make(map[string]interface{}),
+    }
+
+    select {
+    case p.events <- obs:
+    default:
+        slog.Warn("Bridge observation channel full, dropping event")
     }
 }
 
