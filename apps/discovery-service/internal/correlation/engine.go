@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 5.3 (OpenWrt AP/Bridge Instant Online Trigger)
+// Version: 5.4 (Integrated openwrt_arp as Authoritative L2/L3 Ground Truth)
 package correlation
 
 import (
@@ -234,25 +234,25 @@ func canUpdateCurrentIP(source string) bool {
     }
 }
 
-// V5.1 FIX: Added openwrt_ap and openwrt_bridge as valid Layer-2 triggers
+// V5.4 FIX: Added openwrt_arp as a valid trigger
 func canTriggerOnline(source string) bool {
     switch source {
-    case "netlink", "dhcp", "openwrt_ap", "openwrt_bridge":
+    case "netlink", "dhcp", "openwrt_ap", "openwrt_arp":
         return true
     default:
         return false
     }
 }
 
-// V5.1 FIX: Recognize openwrt_ap and openwrt_bridge as Layer-2 sources
+// V5.4 FIX: Recognize openwrt_arp as both Layer-2 AND Layer-3 source
 func hasL2AndL3Confirmation(sources []string) bool {
     hasL2 := false
     hasL3 := false
     for _, s := range sources {
         switch s {
-        case "netlink", "openwrt_ap", "openwrt_bridge":
+        case "netlink", "openwrt_ap", "openwrt_arp":
             hasL2 = true
-        case "dhcp", "pihole":
+        case "dhcp", "pihole", "openwrt_arp":
             hasL3 = true
         }
     }
@@ -437,10 +437,10 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     }
 
     if !d.Online && obs.Online {
-        // V5.3 FIX: OpenWrt AP and Bridge data is authoritative Layer-2 ground truth.
-        // If the router reports the device as associated, it is definitively online.
+        // V5.4 FIX: OpenWrt AP and ARP data is authoritative Layer-2/Layer-3 ground truth.
+        // If the router reports the device as associated/resolved, it is definitively online.
         // We bypass the 30-second deferred timer to prevent bulk-poll "offline limbo".
-        isAuthoritativeL2 := obs.Source == "openwrt_ap" || obs.Source == "openwrt_bridge"
+        isAuthoritativeL2 := obs.Source == "openwrt_ap" || obs.Source == "openwrt_arp"
 
         exists := false
         for _, s := range d.PendingOnlineObs {
@@ -467,7 +467,6 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     }
 
     // V4.8 FIX: Immediate Offline Detection
-    // If the device is marked online, but we receive a definitive offline signal from L2/L3
     if d.Online && !obs.Online && (obs.Source == "netlink" || obs.Source == "dhcp") {
         d.Online = false
         d.PendingOnlineObs = nil
