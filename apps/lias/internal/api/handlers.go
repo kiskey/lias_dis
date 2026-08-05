@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 3.0 (Verified Dependencies)
+// Version: 3.1 (Fixed AssignDeviceTag Body Parsing)
 package api
 
 import (
@@ -195,18 +195,39 @@ func (h *Handlers) GetDeviceLogs(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(logs)
 }
 
+// AssignDeviceTag accepts an array of tags
 func (h *Handlers) AssignDeviceTag(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
-    var req struct {
-        TagIDs []string `json:"tag_ids"`
+    
+    // Fix: Unmarshal into a generic map first to avoid consuming the body twice.
+    // This safely handles both `tag_ids` (array) and `tag_id` (string) payloads.
+    var rawBody map[string]json.RawMessage
+    if err := json.NewDecoder(r.Body).Decode(&rawBody); err != nil {
+        http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+        return
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        var legacyReq struct { TagID string `json:"tag_id"` }
-        if err := json.NewDecoder(r.Body).Decode(&legacyReq); err != nil {
-            http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+
+    var req struct {
+        TagIDs []string
+    }
+
+    if v, ok := rawBody["tag_ids"]; ok {
+        if err := json.Unmarshal(v, &req.TagIDs); err != nil {
+            http.Error(w, `{"error":"invalid tag_ids format"}`, http.StatusBadRequest)
             return
         }
-        req.TagIDs = []string{legacyReq.TagID}
+    } else if v, ok := rawBody["tag_id"]; ok {
+        var legacyTagID string
+        if err := json.Unmarshal(v, &legacyTagID); err != nil {
+            http.Error(w, `{"error":"invalid tag_id format"}`, http.StatusBadRequest)
+            return
+        }
+        req.TagIDs = []string{legacyTagID}
+    }
+
+    // If no tags selected, default to generic
+    if len(req.TagIDs) == 0 {
+        req.TagIDs = []string{"generic"}
     }
 
     h.cache.SetTags(pdid, req.TagIDs)
