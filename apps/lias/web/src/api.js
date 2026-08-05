@@ -1,7 +1,7 @@
 /**
  * LIAS REST API Client & Real-time EventSource Subscriber
  * File:    apps/lias/web/src/api.js
- * Version: 2.3 (Added Unpause Device Internet)
+ * Version: 2.4 (Fixed Error Message Overwrite and Tag Payload)
  */
 
 export const API = {
@@ -40,7 +40,10 @@ export const API = {
             errorObj.status = response.status;
             if (errData) {
                 errorObj.error = errData.error;
-                errorObj.message = errData.message;
+                // Fix: Only overwrite message if errData.message is actually present
+                if (errData.message) {
+                    errorObj.message = errData.message;
+                }
                 errorObj.conflicts = errData.conflicts;
             }
             throw errorObj;
@@ -81,7 +84,6 @@ export const API = {
         });
     },
 
-    // Fix 1: Added Unpause Device Internet
     async unpauseDeviceInternet(pdid) {
         return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/pause`, {
             method: 'DELETE'
