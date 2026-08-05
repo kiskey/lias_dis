@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 3.4 (Fixed Schedule Modal Event Delegation & Duplicate Saves)
+// Version: 3.5 (Added Copy/Duplicate for Schedules & Policies)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -717,6 +717,10 @@ class App {
       <div style="display:flex; flex-direction:column; gap:16px;">
         ${this.policies.map(p => {
           const isInfra = p.target_id === 'infrastructure';
+          const isGlobal = p.id === 'global_default';
+          const isPaused = p.id.startsWith('pol_pause_');
+          const canCopy = !isGlobal && !isPaused && !isInfra;
+          
           const schedSummary = this.getScheduleSummary(p);
           const scheds = this.resolvePolicySchedules(p);
           
@@ -736,8 +740,9 @@ class App {
                     Scope: <strong style="text-transform:capitalize;">${p.type}</strong> | Target: <strong>${p.target_id || 'Global'}</strong> | Priority: <strong>${p.priority}</strong>
                   </div>
                 </div>
-                <div style="display:flex; gap:8px;">
+                <div style="display:flex; gap:8px; flex-wrap: wrap;">
                   <button class="btn btn-secondary btn-edit-policy" data-id="${p.id}" ${isInfra ? 'disabled' : ''}>Edit</button>
+                  ${canCopy ? `<button class="btn btn-secondary btn-copy-policy" data-id="${p.id}">Copy</button>` : ''}
                   <button class="btn btn-danger btn-delete-policy" data-id="${p.id}">Delete</button>
                 </div>
               </div>
@@ -769,6 +774,14 @@ class App {
         const id = e.currentTarget.dataset.id;
         const p = this.policies.find(item => item.id === id);
         if (p) this.openPolicyWizard(p);
+      });
+    });
+
+    document.querySelectorAll('.btn-copy-policy').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const id = e.currentTarget.dataset.id;
+        const p = this.policies.find(item => item.id === id);
+        if (p) this.openPolicyWizard(p, true);
       });
     });
 
@@ -874,7 +887,8 @@ class App {
                   Mode: <strong style="text-transform:uppercase;">${s.mode || 'downtime'}</strong> | Timezone: <strong>${s.timezone}</strong>
                 </div>
               </div>
-              <div style="display:flex; gap:8px;">
+              <div style="display:flex; gap:8px; flex-wrap: wrap;">
+                <button class="btn btn-secondary btn-copy-schedule" data-id="${s.id}">Copy</button>
                 <button class="btn btn-secondary btn-edit-schedule" data-id="${s.id}">Edit</button>
                 <button class="btn btn-danger btn-delete-schedule" data-id="${s.id}">Delete</button>
               </div>
@@ -895,6 +909,14 @@ class App {
         const id = e.currentTarget.dataset.id;
         const s = this.schedules.find(item => item.id === id);
         if (s) this.openScheduleModal(s);
+      });
+    });
+
+    document.querySelectorAll('.btn-copy-schedule').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const id = e.currentTarget.dataset.id;
+        const s = this.schedules.find(item => item.id === id);
+        if (s) this.openScheduleModal(s, true);
       });
     });
 
@@ -1062,7 +1084,7 @@ class App {
     return html;
   }
 
-  openPolicyWizard(existingPolicy = null) {
+  openPolicyWizard(existingPolicy = null, isCopy = false) {
     this.wizardState = {
       step: 1,
       policy: existingPolicy ? JSON.parse(JSON.stringify(existingPolicy)) : {
@@ -1074,6 +1096,11 @@ class App {
         priority: 50
       }
     };
+
+    if (isCopy) {
+      this.wizardState.policy.id = '';
+      this.wizardState.policy.name = `Copy of ${this.wizardState.policy.name}`;
+    }
 
     if (!this.wizardState.policy.schedule_ids && this.wizardState.policy.schedule_id) {
       this.wizardState.policy.schedule_ids = [this.wizardState.policy.schedule_id];
@@ -1349,13 +1376,18 @@ class App {
     }
   }
 
-  openScheduleModal(existingSchedule = null) {
+  openScheduleModal(existingSchedule = null, isCopy = false) {
     const s = existingSchedule ? JSON.parse(JSON.stringify(existingSchedule)) : {
       name: '',
       mode: 'downtime',
       timezone: 'UTC',
       rules: [{ days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_time: '22:00', end_time: '06:00', action: 'block' }]
     };
+
+    if (isCopy) {
+      s.id = '';
+      s.name = `Copy of ${s.name}`;
+    }
 
     const bodyHtml = `
       <div style="display:flex; flex-direction:column; gap:16px;">
