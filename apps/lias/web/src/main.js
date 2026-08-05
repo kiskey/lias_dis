@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 3.2 (Unpause UI, Vacation Mode CSS/JS Fix)
+// Version: 3.3 (Added Explicit Online/Offline Text)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -216,7 +216,7 @@ class App {
       const tz = schedule.timezone || 'UTC';
       const fmt = new Intl.DateTimeFormat('en-US', {
         timeZone: tz,
-        weekday: 'short',
+        weekday: 'Short',
         hour: '2-digit',
         minute: '2-digit',
         hour12: false
@@ -542,12 +542,16 @@ class App {
       }
     }
 
+    // V3.3 FIX: Added explicit text label next to the status dot
     return `
       <div class="device-item">
         <div>
           <div class="device-item-header">
             <div class="device-name">${dispName}</div>
-            <span class="status-indicator ${d.online ? 'online' : 'offline'}" title="${d.online ? 'Online' : 'Offline'}"></span>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <span class="status-indicator ${d.online ? 'online' : 'offline'}"></span>
+              <span style="font-size:11px; font-weight:700; color:${d.online ? 'var(--success)' : 'var(--text-secondary)'}; text-transform:uppercase;">${d.online ? 'Online' : 'Offline'}</span>
+            </div>
           </div>
           <div class="device-meta">
             <div>MAC: ${d.current_mac || 'N/A'}</div>
