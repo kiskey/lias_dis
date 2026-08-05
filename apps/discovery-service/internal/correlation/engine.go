@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 5.2 (Fixed ApplySmartClassifications Syntax Error)
+// Version: 5.3 (OpenWrt AP/Bridge Instant Online Trigger)
 package correlation
 
 import (
@@ -437,9 +437,11 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     }
 
     if !d.Online && obs.Online {
-        // V5.0 FIX: Allow ALL sources to append to PendingOnlineObs.
-        // This ensures DNS (Pi-hole) and mDNS (Avahi) observations count toward the 2-source confirmation,
-        // preventing mobile devices from flapping offline due to radio sleep.
+        // V5.3 FIX: OpenWrt AP and Bridge data is authoritative Layer-2 ground truth.
+        // If the router reports the device as associated, it is definitively online.
+        // We bypass the 30-second deferred timer to prevent bulk-poll "offline limbo".
+        isAuthoritativeL2 := obs.Source == "openwrt_ap" || obs.Source == "openwrt_bridge"
+
         exists := false
         for _, s := range d.PendingOnlineObs {
             if s == obs.Source {
@@ -451,11 +453,10 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             d.PendingOnlineObs = append(d.PendingOnlineObs, obs.Source)
         }
 
-        // V5.2 FIX: Call ApplySmartClassifications as a statement, then check the property
         ApplySmartClassifications(d)
         isInfra := d.HasTag("infrastructure") || d.DeviceType == "infrastructure"
         
-        if isInfra || len(d.PendingOnlineObs) >= 2 || hasL2AndL3Confirmation(d.PendingOnlineObs) {
+        if isAuthoritativeL2 || isInfra || len(d.PendingOnlineObs) >= 2 || hasL2AndL3Confirmation(d.PendingOnlineObs) {
             d.Online = true
             d.PendingOnlineObs = nil
             e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
