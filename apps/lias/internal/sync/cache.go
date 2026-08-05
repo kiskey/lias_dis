@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/cache.go
-// Version: 2.2 (Fixed Get/List side-effects)
+// Version: 2.3 (Added PatchDeviceOnline for instant SSE updates)
 package sync
 
 import (
@@ -196,5 +196,19 @@ func (c *Cache) SetNextStateChange(pdid string, t *time.Time) {
     defer c.mu.Unlock()
     if d, ok := c.devices[pdid]; ok {
         d.NextStateChange = t
+    }
+}
+
+// V2.3 FIX: PatchDeviceOnline updates the online status of a device in the cache
+// without overwriting the rest of the device struct. This is used for instant SSE updates.
+func (c *Cache) PatchDeviceOnline(pdid string, online bool) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    
+    if d, ok := c.devices[pdid]; ok {
+        if d.Online != online {
+            d.Online = online
+            d.Device.Online = online
+        }
     }
 }
