@@ -1,7 +1,7 @@
 // Package discovery provides unit tests for the DIS orchestrator and nmap enrichment gating.
 //
 // File:    apps/discovery-service/internal/discovery/orchestrator_test.go
-// Version: 1.2 (Fixed force=true logic boundaries)
+// Version: 1.3 (Fixed Nmap Cooldown Backdating in MaxRetries Test)
 package discovery
 
 import (
@@ -54,10 +54,19 @@ func TestNmapMaxRetries(t *testing.T) {
     cache.Upsert(dev)
 
     // Trigger 5 times with force=false.
-    // We manually backdate the lastAttemptMap to bypass the 1-hour cooldown 
-    // so we can directly test the max retry logic boundary.
+    // We must manually backdate BOTH the 1-hour enrichment cooldown AND the 24-hour 
+    // nmap cooldown to directly test the max retry logic boundary.
     for i := 0; i < 5; i++ {
+        // 1. Backdate 1-hour enrichment cooldown
         orch.lastAttemptMap.Store(dev.PDID, time.Now().Add(-2*time.Hour))
+        
+        // 2. Backdate 24-hour nmap cooldown on the cached device
+        cachedDev := cache.Get(dev.PDID)
+        if cachedDev != nil {
+            cachedDev.LastNmapScanAt = time.Now().Add(-25 * time.Hour)
+            cache.Upsert(cachedDev)
+        }
+
         orch.TriggerEnrichment(dev.PDID, false)
     }
 
