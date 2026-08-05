@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 4.7 (Fixed Hydration Type Conversion)
+// Version: 4.8 (Added Immediate Offline Detection)
 package correlation
 
 import (
@@ -71,7 +71,6 @@ func (e *Engine) SetStorage(store *storage.Storage) {
         })
 
         if pending, err := store.LoadPendingEvents(); err == nil {
-            // Pass []storage.PendingEventRecord directly to LoadPending
             e.debouncer.LoadPending(pending)
             if len(pending) > 0 {
                 slog.Info("Loaded pending events from storage for recovery", "count", len(pending))
@@ -447,6 +446,21 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         }
     }
 
+    // V4.8 FIX: Immediate Offline Detection
+    // If the device is marked online, but we receive a definitive offline signal from L2/L3
+    if d.Online && !obs.Online && (obs.Source == "netlink" || obs.Source == "dhcp") {
+        d.Online = false
+        d.PendingOnlineObs = nil
+        e.broker.Broadcast(models.NewEvent(models.EventDeviceOffline, d.PDID, models.DeviceEventPayload{
+            PDID:      d.PDID,
+            MAC:       d.CurrentMAC,
+            IP:        d.CurrentIP,
+            Timestamp: time.Now(),
+        }))
+        slog.Info("Device transitioned offline via immediate observation", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", d.CurrentIP)
+        dirty = true
+    }
+
     if cleanHost != "" && !HostnamesAreEquivalent(d.Hostname, cleanHost) {
         oldHost := d.Hostname
         if d.CanonicalHostname != "" {
@@ -557,7 +571,7 @@ func (e *Engine) scheduleDeferredOnline(pdid string, delay time.Duration) {
         d.Online = true
         d.PendingOnlineObs = nil
         e.cache.Upsert(d)
-        e.markDirty(pdid)
+        e.markDirty(d.PDID)
         e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
     }
 }
