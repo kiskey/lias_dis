@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 3.5 (Added Copy/Duplicate for Schedules & Policies)
+// Version: 3.6 (Fixed Schedule Rule Mode Reconstruction)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -1435,33 +1435,46 @@ class App {
     const daysArr = (rule.days || []).map(d => d.toLowerCase().substring(0, 3));
     const isAllDay = rule.start_time === '00:00' && rule.end_time === '23:59';
 
+    // ── Infer the original selection mode ──
+    let inferredMode = 'range'; // Default for new rules or valid contiguous ranges
+    if (rule.start_date && rule.end_date) {
+      inferredMode = 'calendar';
+    } else if (daysArr.length > 0) {
+      // Check if the days array represents a contiguous range
+      const range = expandDayRange(daysArr[0], daysArr[daysArr.length - 1]);
+      const isRange = range.length === daysArr.length && range.every((v, i) => v === daysArr[i]);
+      if (!isRange) {
+        inferredMode = 'specific';
+      }
+    }
+
     return `
       <div class="card rule-row" data-idx="${idx}" style="padding:12px; margin-bottom:0; background:var(--bg-tertiary);">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
           <strong style="font-size:12px;">Rule #${idx + 1}</strong>
           <div style="display:flex; gap:6px; align-items:center;">
             <select class="day-mode-select" style="font-size:11px; padding:4px 8px;">
-              <option value="range">Continuous Day Range</option>
-              <option value="specific">Specific Days</option>
-              <option value="calendar">Calendar Dates</option>
+              <option value="range" ${inferredMode === 'range' ? 'selected' : ''}>Continuous Day Range</option>
+              <option value="specific" ${inferredMode === 'specific' ? 'selected' : ''}>Specific Days</option>
+              <option value="calendar" ${inferredMode === 'calendar' ? 'selected' : ''}>Calendar Dates</option>
             </select>
             <button class="btn btn-danger btn-remove-rule" data-idx="${idx}" style="padding:4px 8px; font-size:11px;">Remove</button>
           </div>
         </div>
         
         <div class="rule-mode-container" style="display:flex; flex-direction:column; gap:8px;">
-          <div class="day-range-picker" style="display:flex; gap:8px; align-items:center;">
+          <div class="day-range-picker" style="display:${inferredMode === 'range' ? 'flex' : 'none'}; gap:8px; align-items:center;">
             <label style="font-size:11px; font-weight:700;">From:</label>
             <select class="range-from" style="flex:1; font-size:12px; padding:6px;">${['mon','tue','wed','thu','fri','sat','sun'].map(d => `<option value="${d}" ${daysArr[0] === d ? 'selected' : ''}>${d.toUpperCase()}</option>`).join('')}</select>
             <label style="font-size:11px; font-weight:700;">To:</label>
             <select class="range-to" style="flex:1; font-size:12px; padding:6px;">${['mon','tue','wed','thu','fri','sat','sun'].map(d => `<option value="${d}" ${daysArr[daysArr.length - 1] === d ? 'selected' : ''}>${d.toUpperCase()}</option>`).join('')}</select>
           </div>
 
-          <div class="day-chip-group specific-days-picker" style="display:none; flex-wrap:wrap; gap:4px;">
+          <div class="day-chip-group specific-days-picker" style="display:${inferredMode === 'specific' ? 'flex' : 'none'}; flex-wrap:wrap; gap:4px;">
             ${['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'].map(day => `<div class="day-chip ${daysArr.includes(day) ? 'selected' : ''}" data-day="${day}">${day.toUpperCase()}</div>`).join('')}
           </div>
 
-          <div class="calendar-picker" style="display:none; gap:8px; align-items:center;">
+          <div class="calendar-picker" style="display:${inferredMode === 'calendar' ? 'flex' : 'none'}; gap:8px; align-items:center;">
             <label style="font-size:11px; font-weight:700;">Start Date:</label>
             <input type="date" class="rule-start-date" value="${rule.start_date || ''}" style="flex:1; font-size:12px; padding:6px;">
             <label style="font-size:11px; font-weight:700;">End Date:</label>
@@ -1613,18 +1626,6 @@ class App {
         e.target.closest('.rule-row').remove();
         this.updateRuleIndices();
       }
-    });
-
-    // ── Initialize mode states for all pre-existing rules ──
-    document.querySelectorAll('.day-mode-select').forEach(sel => {
-      const row = sel.closest('.rule-row');
-      if (row.querySelector('.rule-start-date')?.value) {
-        sel.value = 'calendar';
-      }
-      const mode = sel.value;
-      row.querySelector('.day-range-picker').style.display = mode === 'range' ? 'flex' : 'none';
-      row.querySelector('.specific-days-picker').style.display = mode === 'specific' ? 'flex' : 'none';
-      row.querySelector('.calendar-picker').style.display = mode === 'calendar' ? 'flex' : 'none';
     });
   }
 
