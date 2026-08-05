@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 2.4 (Fixed SSE Payload Mismatch Cache Corruption)
+// Version: 2.5 (Fixed SSE Online Status Race Condition)
 package sync
 
 import (
@@ -361,15 +361,29 @@ func (c *DISClient) handleEvent(e models.Event) {
             }
         }(e.DeviceID, e)
 
-    // P1-FIX: Handle events that carry PARTIAL payloads (DeviceEventPayload).
-    // These MUST fetch the full device record to prevent wiping cache metadata.
-    case models.EventDeviceOnline, models.EventDeviceOffline, models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged:
+    // V2.5 FIX: Handle Online/Offline events IMMEDIATELY without waiting for REST fetch
+    case models.EventDeviceOnline, models.EventDeviceOffline:
         go func(pdid string, evt models.Event) {
-            // FIX: ALWAYS fetch the single device to ensure full state integrity.
+            // 1. Immediately patch local cache for instant UI feedback and firewall sync
+            onlineStatus := evt.Type == models.EventDeviceOnline
+            c.cache.PatchDeviceOnline(pdid, onlineStatus)
+            c.tryTrigger()
+            
+            // 2. Broadcast to frontend immediately
+            if c.broker != nil {
+                c.broker.Broadcast(evt)
+            }
+            
+            // 3. Background fetch to sync any remaining changed fields (IP, MAC, etc.)
+            c.fetchSingleDevice(pdid)
+        }(e.DeviceID, e)
+
+    // Handle partial payload events that require full struct fetch
+    case models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged:
+        go func(pdid string, evt models.Event) {
             if c.fetchSingleDevice(pdid) {
                 c.tryTrigger()
             }
-            
             if c.broker != nil {
                 c.broker.Broadcast(evt)
             }
