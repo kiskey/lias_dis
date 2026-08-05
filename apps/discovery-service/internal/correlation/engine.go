@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/engine.go
-// Version: 5.0 (Relaxed Online Confirmation for DNS/L7 Traffic)
+// Version: 5.1 (Integrated OpenWrt AP/Bridge into Multi-Source Consensus)
 package correlation
 
 import (
@@ -234,12 +234,23 @@ func canUpdateCurrentIP(source string) bool {
     }
 }
 
+// V5.1 FIX: Added openwrt_ap and openwrt_bridge as valid Layer-2 triggers
+func canTriggerOnline(source string) bool {
+    switch source {
+    case "netlink", "dhcp", "openwrt_ap", "openwrt_bridge":
+        return true
+    default:
+        return false
+    }
+}
+
+// V5.1 FIX: Recognize openwrt_ap and openwrt_bridge as Layer-2 sources
 func hasL2AndL3Confirmation(sources []string) bool {
     hasL2 := false
     hasL3 := false
     for _, s := range sources {
         switch s {
-        case "netlink":
+        case "netlink", "openwrt_ap", "openwrt_bridge":
             hasL2 = true
         case "dhcp", "pihole":
             hasL3 = true
