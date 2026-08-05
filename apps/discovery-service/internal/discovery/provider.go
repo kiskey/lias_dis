@@ -1,7 +1,7 @@
 // Package discovery implements observation, enrichment, and correlation for DIS.
 //
 // File:    apps/discovery-service/internal/discovery/provider.go
-// Version: 2.1
+// Version: 2.2 (Verified Interfaces)
 package discovery
 
 import (
@@ -14,7 +14,6 @@ import (
     "github.com/user/lias-dis/shared/models"
 )
 
-// ProviderGroup identifies the observation layer for provider-independence checks.
 type ProviderGroup string
 
 const (
@@ -25,26 +24,22 @@ const (
     GroupE ProviderGroup = "L7_active"
 )
 
-// Provider is the base interface for all discovery and enrichment modules.
 type Provider interface {
     Name() string
     Start(ctx context.Context) error
     Stop() error
 }
 
-// DiscoveryProvider extends Provider to emit real-time observations.
 type DiscoveryProvider interface {
     Provider
     Events() <-chan Observation
 }
 
-// Enricher extends Provider to provide on-demand detail gathering for a device.
 type Enricher interface {
     Provider
     Enrich(ctx context.Context, d *models.Device) (*models.Enrichment, error)
 }
 
-// Observation represents a single raw data point from a DiscoveryProvider.
 type Observation struct {
     Source     string
     Group      ProviderGroup
@@ -57,10 +52,9 @@ type Observation struct {
     Confidence float64
     Timestamp  time.Time
     Online     bool
-    Raw        map[string]interface{} // NEW: Raw metadata for advanced validation (e.g., mdns_host)
+    Raw        map[string]interface{}
 }
 
-// UnescapeHostname converts raw octal escape sequences (\058 -> :) and cleans mDNS hostnames.
 func UnescapeHostname(raw string) string {
     if raw == "" {
         return ""

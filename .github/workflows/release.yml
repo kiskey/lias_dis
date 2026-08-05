@@ -1,5 +1,5 @@
 # LIAS & DIS CI/CD Pipeline
-# Version: 1.3 - Rolling Latest Release Pipeline
+# Version: 1.4 - Added Testing Gate
 name: Release
 
 on:
@@ -12,8 +12,30 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Run Discovery Service Tests
+        run: cd apps/discovery-service && go test -v ./...
+
+      - name: Run LIAS Tests
+        run: cd apps/lias && go test -v ./...
+
+      - name: Run Shared Models Tests
+        run: cd shared && go test -v ./...
+
   build:
     name: Build Binaries
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:

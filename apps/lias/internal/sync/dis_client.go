@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/dis_client.go
-// Version: 2.0
+// Version: 2.5 (Fixed SSE Online Status Race Condition)
 package sync
 
 import (
@@ -23,29 +23,34 @@ import (
 
 type EventBroadcaster interface {
     Broadcast(event models.Event)
-}
-
-type DISClient struct {
-    cfg     config.DISConfig
-    cache   *Cache
-    store   StorageMigrator
-    client  *http.Client
-    trigger chan struct{}
-    broker  EventBroadcaster
+    // CPU-05 Fix: Added method to signal backoff reset
+    SignalSSEConnected() 
 }
 
 type StorageMigrator interface {
     MigrateDeviceTag(oldPDID, newPDID string) error
+    MigrateDevicePolicies(oldPDID, newPDID string) error
+}
+
+type DISClient struct {
+    cfg           config.DISConfig
+    cache         *Cache
+    store         StorageMigrator
+    client        *http.Client
+    trigger       chan struct{}
+    broker        EventBroadcaster
+    lastSeenInDIS map[string]time.Time
 }
 
 func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, broker EventBroadcaster, store StorageMigrator) *DISClient {
     return &DISClient{
-        cfg:     cfg,
-        cache:   cache,
-        store:   store,
-        client:  &http.Client{Timeout: 10 * time.Second},
-        trigger: trigger,
-        broker:  broker,
+        cfg:           cfg,
+        cache:         cache,
+        store:         store,
+        client:        &http.Client{Timeout: 10 * time.Second},
+        trigger:       trigger,
+        broker:        broker,
+        lastSeenInDIS: make(map[string]time.Time),
     }
 }
 
@@ -132,17 +137,24 @@ func (c *DISClient) pollDevices() {
         return
     }
 
-    // GAP-L-CR05 Fix: Reconcile cache by removing stale devices
     activePDIDs := make(map[string]bool)
     for _, d := range listResp.Devices {
         activePDIDs[d.PDID] = true
+        c.lastSeenInDIS[d.PDID] = time.Now()
     }
 
     cachedPDIDs := c.cache.ListPDIDs()
     for _, pdid := range cachedPDIDs {
         if !activePDIDs[pdid] {
+            if lastSeen, ok := c.lastSeenInDIS[pdid]; ok {
+                if time.Since(lastSeen) < 5*time.Minute {
+                    slog.Debug("Device in grace period, keeping in cache", "pdid", pdid)
+                    continue
+                }
+            }
             c.cache.RemoveDevice(pdid)
-            slog.Info("Removed stale device from LIAS cache (no longer reported by DIS)", "pdid", pdid)
+            delete(c.lastSeenInDIS, pdid)
+            slog.Info("Removed stale device from LIAS cache (grace period expired)", "pdid", pdid)
         }
     }
 
@@ -226,6 +238,11 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
 
     slog.Info("Successfully connected to DIS SSE event stream", "url", targetURL)
 
+    // CPU-05 Fix: Signal successful connection to reset backoff
+    if c.broker != nil {
+        c.broker.SignalSSEConnected()
+    }
+
     scanner := bufio.NewScanner(resp.Body)
     var event models.Event
     var dataBuf strings.Builder
@@ -282,6 +299,7 @@ func (c *DISClient) handleEvent(e models.Event) {
     switch e.Type {
     case models.EventDeviceRemoved:
         c.cache.RemoveDevice(e.DeviceID)
+        delete(c.lastSeenInDIS, e.DeviceID)
         slog.Info("Device removed from local cache via SSE", "pdid", e.DeviceID)
         c.tryTrigger()
         if c.broker != nil {
@@ -299,13 +317,16 @@ func (c *DISClient) handleEvent(e models.Event) {
 
             if c.store != nil {
                 _ = c.store.MigrateDeviceTag(payload.OldPDID, payload.NewPDID)
+                if err := c.store.MigrateDevicePolicies(payload.OldPDID, payload.NewPDID); err != nil {
+                    slog.Error("Failed to migrate device policies during reidentification", "old_pdid", payload.OldPDID, "new_pdid", payload.NewPDID, "error", err)
+                }
             }
 
             if c.fetchSingleDevice(payload.NewPDID) {
                 c.tryTrigger()
             }
 
-            slog.Info("Device reidentified, migrated identity",
+            slog.Info("Device reidentified, migrated identity and policies",
                 "old_pdid", payload.OldPDID,
                 "new_pdid", payload.NewPDID,
                 "reason", payload.Reason)
@@ -315,14 +336,17 @@ func (c *DISClient) handleEvent(e models.Event) {
             }
         }
 
-    case models.EventDeviceAdded, models.EventDeviceOnline, models.EventFingerprintUpdated:
-        // GAP-L-CR02 Fix: Only these events carry full models.Device payloads
+    // P1-FIX: Handle events that carry the FULL Device struct inline.
+    case models.EventDeviceAdded, models.EventFingerprintUpdated:
         go func(pdid string, evt models.Event) {
             prev := c.cache.Get(pdid)
             isNewDevice := prev == nil || evt.Type == models.EventDeviceAdded
 
             var inlineDev models.Device
-            if len(evt.Payload) > 0 && json.Unmarshal(evt.Payload, &inlineDev) == nil && inlineDev.PDID == pdid {
+            // FIX: Validate that the unmarshalled struct is actually a full Device 
+            // (must have a MAC) before upserting. This prevents partial payloads 
+            // from corrupting the LIAS cache.
+            if len(evt.Payload) > 0 && json.Unmarshal(evt.Payload, &inlineDev) == nil && inlineDev.PDID == pdid && inlineDev.CurrentMAC != "" {
                 c.cache.UpsertDevice(inlineDev)
                 c.tryTrigger()
             } else if c.fetchSingleDevice(pdid) {
@@ -337,13 +361,29 @@ func (c *DISClient) handleEvent(e models.Event) {
             }
         }(e.DeviceID, e)
 
-    case models.EventDeviceOffline, models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged:
-        // GAP-L-CR02 Fix: These events carry DeviceEventPayload, not models.Device. Always fetch.
+    // V2.5 FIX: Handle Online/Offline events IMMEDIATELY without waiting for REST fetch
+    case models.EventDeviceOnline, models.EventDeviceOffline:
+        go func(pdid string, evt models.Event) {
+            // 1. Immediately patch local cache for instant UI feedback and firewall sync
+            onlineStatus := evt.Type == models.EventDeviceOnline
+            c.cache.PatchDeviceOnline(pdid, onlineStatus)
+            c.tryTrigger()
+            
+            // 2. Broadcast to frontend immediately
+            if c.broker != nil {
+                c.broker.Broadcast(evt)
+            }
+            
+            // 3. Background fetch to sync any remaining changed fields (IP, MAC, etc.)
+            c.fetchSingleDevice(pdid)
+        }(e.DeviceID, e)
+
+    // Handle partial payload events that require full struct fetch
+    case models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged:
         go func(pdid string, evt models.Event) {
             if c.fetchSingleDevice(pdid) {
                 c.tryTrigger()
             }
-            
             if c.broker != nil {
                 c.broker.Broadcast(evt)
             }

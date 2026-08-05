@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for DIS device state.
 //
 // File:    apps/discovery-service/internal/storage/sqlite.go
-// Version: 2.5
+// Version: 3.2 (Added Enrichment State Persistence)
 package storage
 
 import (
@@ -10,7 +10,6 @@ import (
     "log/slog"
     "os"
     "path/filepath"
-    "strings"
     "sync"
     "time"
 
@@ -19,7 +18,6 @@ import (
     _ "modernc.org/sqlite"
 )
 
-// PendingEventRecord represents a pending event loaded from storage.
 type PendingEventRecord struct {
     PDID          string
     EventType     string
@@ -45,13 +43,10 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, fmt.Errorf("failed to create database directory: %w", err)
     }
 
-    db, err := sql.Open("sqlite", dbPath)
+    dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=journal_mode(WAL)", dbPath)
+    db, err := sql.Open("sqlite", dsn)
     if err != nil {
         return nil, fmt.Errorf("failed to open sqlite database: %w", err)
-    }
-
-    if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
-        slog.Warn("Failed to set PRAGMAs on DIS database", "error", err)
     }
 
     s := &Storage{
@@ -64,13 +59,35 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, err
     }
 
-    // GAP-D04: Run v1 -> v2 PDID migration
+    if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+        slog.Warn("Failed to truncate WAL on startup", "error", err)
+    }
+
     if err := s.migrateV1PDIDs(); err != nil {
         slog.Warn("v1 to v2 PDID migration encountered an error", "error", err)
     }
 
+    go s.pendingEventsRetentionLoop()
+
     slog.Info("DIS SQLite storage engine initialized", "path", dbPath)
     return s, nil
+}
+
+func (s *Storage) pendingEventsRetentionLoop() {
+    ticker := time.NewTicker(1 * time.Hour)
+    defer ticker.Stop()
+
+    for {
+        s.mu.Lock()
+        _, err := s.db.Exec("DELETE FROM pending_events WHERE last_seen < datetime('now', '-1 hour')")
+        s.mu.Unlock()
+
+        if err != nil {
+            slog.Warn("Failed to clean up old pending events", "error", err)
+        }
+
+        <-ticker.C
+    }
 }
 
 func (s *Storage) initSchema() error {
@@ -94,7 +111,11 @@ func (s *Storage) initSchema() error {
         confidence REAL NOT NULL DEFAULT 0.0,
         first_seen DATETIME NOT NULL,
         last_seen DATETIME NOT NULL,
-        online INTEGER NOT NULL DEFAULT 1
+        online INTEGER NOT NULL DEFAULT 1,
+        last_enriched_at DATETIME,
+        last_nmap_scan_at DATETIME,
+        nmap_attempt_count INTEGER NOT NULL DEFAULT 0,
+        is_fully_identified INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS device_macs (
@@ -129,6 +150,7 @@ func (s *Storage) initSchema() error {
 
     CREATE INDEX IF NOT EXISTS idx_mac_pdid ON device_macs(pdid);
     CREATE INDEX IF NOT EXISTS idx_ip_pdid ON device_ips(pdid);
+    CREATE INDEX IF NOT EXISTS idx_pending_pdid ON pending_events(pdid, event_type);
     `
 
     _, err := s.db.Exec(query)
@@ -136,17 +158,21 @@ func (s *Storage) initSchema() error {
         return fmt.Errorf("failed to execute DIS schema initialization: %w", err)
     }
 
-    // Migration column additions
     _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_tier TEXT NOT NULL DEFAULT 'tentative'")
     _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_anchor TEXT NOT NULL DEFAULT ''")
     _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN canonical_hostname TEXT NOT NULL DEFAULT ''")
     _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN current_mac TEXT NOT NULL DEFAULT ''")
     _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN current_ip TEXT NOT NULL DEFAULT ''")
+    
+    // P1-FIX: Add enrichment tracking columns
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN last_enriched_at DATETIME")
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN last_nmap_scan_at DATETIME")
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN nmap_attempt_count INTEGER NOT NULL DEFAULT 0")
+    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN is_fully_identified INTEGER NOT NULL DEFAULT 0")
 
     return nil
 }
 
-// GAP-D04: Migrates legacy v1 PDIDs to the new v2 tiered model.
 func (s *Storage) migrateV1PDIDs() error {
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -178,8 +204,7 @@ func (s *Storage) migrateV1PDIDs() error {
             continue
         }
 
-        // Use local canonicalizer to avoid circular dependency with correlation package
-        canonicalHost := canonicalizeHostnameLocal(hostname)
+        canonicalHost := inventory.CanonicalizeHostname(hostname)
         tier, anchor := inventory.DeriveTierAndAnchor(mac, canonicalHost, vendor)
         newPDID := inventory.GeneratePDID(tier, anchor)
 
@@ -191,26 +216,21 @@ func (s *Storage) migrateV1PDIDs() error {
 
     for _, m := range migrations {
         tx, _ := s.db.Begin()
-        // Copy device row with new PDID and identity fields
         _, _ = tx.Exec(`INSERT INTO devices (pdid, identity_tier, identity_anchor, canonical_hostname, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online)
                         SELECT ?, ?, ?, ?, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online FROM devices WHERE pdid = ?`,
             m.NewPDID, m.Tier, m.Anchor, m.CanonicalHost, m.OldPDID)
-        // Migrate MACs
         _, _ = tx.Exec("UPDATE device_macs SET pdid = ? WHERE pdid = ?", m.NewPDID, m.OldPDID)
-        // Migrate IPs
         _, _ = tx.Exec("UPDATE device_ips SET pdid = ? WHERE pdid = ?", m.NewPDID, m.OldPDID)
-        // Delete old row
         _, _ = tx.Exec("DELETE FROM devices WHERE pdid = ?", m.OldPDID)
         _ = tx.Commit()
     }
 
-    // Rebuild hostname_owners
     _, _ = s.db.Exec("DELETE FROM hostname_owners")
     ownerRows, _ := s.db.Query("SELECT canonical_hostname, pdid FROM devices WHERE canonical_hostname != ''")
     defer ownerRows.Close()
     for ownerRows.Next() {
         var host, pdid string
-        if ownerRows.Scan(&host, &pdid) == nil {
+        if err := ownerRows.Scan(&host, &pdid); err == nil && host != "" {
             _, _ = s.db.Exec("INSERT OR REPLACE INTO hostname_owners (canonical_hostname, pdid, acquired_at) VALUES (?, ?, ?)", host, pdid, time.Now())
         }
     }
@@ -219,13 +239,15 @@ func (s *Storage) migrateV1PDIDs() error {
     return nil
 }
 
-// GAP-D03: Load MACs and IPs from relational tables
 func (s *Storage) LoadHydrate() ([]models.Device, error) {
     s.mu.Lock()
     defer s.mu.Unlock()
 
     rows, err := s.db.Query(`
-        SELECT pdid, identity_tier, identity_anchor, canonical_hostname, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online
+        SELECT pdid, identity_tier, identity_anchor, canonical_hostname, 
+               current_mac, current_ip, hostname, friendly_name, manufacturer, 
+               vendor, model, device_type, confidence, first_seen, last_seen, online,
+               last_enriched_at, last_nmap_scan_at, nmap_attempt_count, is_fully_identified
         FROM devices
     `)
     if err != nil {
@@ -239,11 +261,14 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
         var d models.Device
         var onlineInt int
         var firstSeen, lastSeen time.Time
+        var lastEnrichedAt, lastNmapScanAt sql.NullTime
+        var nmapAttemptCount, isFullyIdentified int
 
         err := rows.Scan(
             &d.PDID, &d.IdentityTier, &d.IdentityAnchor, &d.CanonicalHostname,
             &d.CurrentMAC, &d.CurrentIP, &d.Hostname, &d.FriendlyName, &d.Manufacturer,
             &d.Vendor, &d.Model, &d.DeviceType, &d.Confidence, &firstSeen, &lastSeen, &onlineInt,
+            &lastEnrichedAt, &lastNmapScanAt, &nmapAttemptCount, &isFullyIdentified,
         )
         if err != nil {
             continue
@@ -252,6 +277,15 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
         d.FirstSeen = firstSeen
         d.LastSeen = lastSeen
         d.Online = onlineInt == 1
+        if lastEnrichedAt.Valid {
+            d.LastEnrichedAt = lastEnrichedAt.Time
+        }
+        if lastNmapScanAt.Valid {
+            d.LastNmapScanAt = lastNmapScanAt.Time
+        }
+        d.NmapAttemptCount = nmapAttemptCount
+        d.IsFullyIdentified = isFullyIdentified == 1
+        
         d.MACs = []string{}
         d.IPs = []string{}
         d.SourceInfo = make(map[string]models.SourceMeta)
@@ -260,7 +294,6 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
         deviceMap[d.PDID] = &devCopy
     }
 
-    // Hydrate MACs
     macRows, err := s.db.Query("SELECT pdid, mac FROM device_macs")
     if err == nil {
         defer macRows.Close()
@@ -274,7 +307,6 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
         }
     }
 
-    // Hydrate IPs
     ipRows, err := s.db.Query("SELECT pdid, ip FROM device_ips")
     if err == nil {
         defer ipRows.Close()
@@ -348,12 +380,7 @@ func (s *Storage) DeleteHostnameOwner(canonicalHost string) error {
     return err
 }
 
-// GAP-D03: Save MACs and IPs to relational tables
 func (s *Storage) SaveDevice(d *models.Device) error {
-    if d == nil || d.PDID == "" {
-        return nil
-    }
-
     s.mu.Lock()
     defer s.mu.Unlock()
 
@@ -363,14 +390,63 @@ func (s *Storage) SaveDevice(d *models.Device) error {
     }
     defer func() { _ = tx.Rollback() }()
 
+    if err := s.saveDeviceTx(tx, d); err != nil {
+        return err
+    }
+
+    return tx.Commit()
+}
+
+func (s *Storage) SaveDevicesBatch(devs []*models.Device) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    tx, err := s.db.Begin()
+    if err != nil {
+        return err
+    }
+    defer func() { _ = tx.Rollback() }()
+
+    for i, d := range devs {
+        spName := fmt.Sprintf("sp_%d", i)
+        if _, err := tx.Exec("SAVEPOINT " + spName); err != nil {
+            slog.Error("Failed to create savepoint, aborting batch", "error", err)
+            return err
+        }
+
+        if err := s.saveDeviceTx(tx, d); err != nil {
+            slog.Error("Failed to save device in batch, rolling back savepoint", "pdid", d.PDID, "error", err)
+            _, _ = tx.Exec("ROLLBACK TO " + spName)
+            _, _ = tx.Exec("RELEASE " + spName)
+            continue
+        }
+        _, _ = tx.Exec("RELEASE " + spName)
+    }
+
+    return tx.Commit()
+}
+
+func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
+    if d == nil || d.PDID == "" {
+        return nil
+    }
+
     onlineInt := 0
     if d.Online {
         onlineInt = 1
     }
 
-    _, err = tx.Exec(`
-        INSERT INTO devices (pdid, identity_tier, identity_anchor, canonical_hostname, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    isFullyIdentifiedInt := 0
+    if d.IsFullyIdentified {
+        isFullyIdentifiedInt = 1
+    }
+
+    _, err := tx.Exec(`
+        INSERT INTO devices (pdid, identity_tier, identity_anchor, canonical_hostname, 
+            current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, 
+            model, device_type, confidence, first_seen, last_seen, online,
+            last_enriched_at, last_nmap_scan_at, nmap_attempt_count, is_fully_identified)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(pdid) DO UPDATE SET
             identity_tier=excluded.identity_tier,
             identity_anchor=excluded.identity_anchor,
@@ -385,27 +461,100 @@ func (s *Storage) SaveDevice(d *models.Device) error {
             device_type=excluded.device_type,
             confidence=excluded.confidence,
             last_seen=excluded.last_seen,
-            online=excluded.online
-    `, d.PDID, string(d.IdentityTier), d.IdentityAnchor, d.CanonicalHostname, d.CurrentMAC, d.CurrentIP, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt)
+            online=excluded.online,
+            last_enriched_at=excluded.last_enriched_at,
+            last_nmap_scan_at=excluded.last_nmap_scan_at,
+            nmap_attempt_count=excluded.nmap_attempt_count,
+            is_fully_identified=excluded.is_fully_identified
+    `, d.PDID, string(d.IdentityTier), d.IdentityAnchor, d.CanonicalHostname, d.CurrentMAC, d.CurrentIP, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt, d.LastEnrichedAt, d.LastNmapScanAt, d.NmapAttemptCount, isFullyIdentifiedInt)
 
     if err != nil {
         return fmt.Errorf("failed to upsert device %s: %w", d.PDID, err)
     }
 
-    // Clear and re-insert MAC cluster
-    _, _ = tx.Exec("DELETE FROM device_macs WHERE pdid = ?", d.PDID)
+    existingMACs := make(map[string]bool)
+    macRows, err := tx.Query("SELECT mac FROM device_macs WHERE pdid = ?", d.PDID)
+    if err == nil {
+        for macRows.Next() {
+            var mac string
+            macRows.Scan(&mac)
+            existingMACs[mac] = true
+        }
+        macRows.Close()
+    }
+
+    desiredMACs := make(map[string]bool)
     for _, mac := range d.MACs {
         if mac != "" {
-            _, _ = tx.Exec("INSERT OR IGNORE INTO device_macs (pdid, mac) VALUES (?, ?)", d.PDID, mac)
+            desiredMACs[mac] = true
         }
     }
 
-    // Clear and re-insert IP history
-    _, _ = tx.Exec("DELETE FROM device_ips WHERE pdid = ?", d.PDID)
+    for mac := range desiredMACs {
+        if !existingMACs[mac] {
+            _, _ = tx.Exec("INSERT OR IGNORE INTO device_macs (pdid, mac) VALUES (?, ?)", d.PDID, mac)
+        }
+    }
+    for mac := range existingMACs {
+        if !desiredMACs[mac] {
+            _, _ = tx.Exec("DELETE FROM device_macs WHERE pdid = ? AND mac = ?", d.PDID, mac)
+        }
+    }
+
+    existingIPs := make(map[string]bool)
+    ipRows, err := tx.Query("SELECT ip FROM device_ips WHERE pdid = ?", d.PDID)
+    if err == nil {
+        for ipRows.Next() {
+            var ip string
+            ipRows.Scan(&ip)
+            existingIPs[ip] = true
+        }
+        ipRows.Close()
+    }
+
+    desiredIPs := make(map[string]bool)
     for _, ip := range d.IPs {
         if ip != "" {
+            desiredIPs[ip] = true
+        }
+    }
+
+    for ip := range desiredIPs {
+        if !existingIPs[ip] {
             _, _ = tx.Exec("INSERT OR IGNORE INTO device_ips (pdid, ip) VALUES (?, ?)", d.PDID, ip)
         }
+    }
+    for ip := range existingIPs {
+        if !desiredIPs[ip] {
+            _, _ = tx.Exec("DELETE FROM device_ips WHERE pdid = ? AND ip = ?", d.PDID, ip)
+        }
+    }
+
+    return nil
+}
+
+func (s *Storage) ReplaceDevicePDID(oldPDID, newPDID string, d *models.Device) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    tx, err := s.db.Begin()
+    if err != nil {
+        return err
+    }
+    defer func() { _ = tx.Rollback() }()
+
+    if err := s.saveDeviceTx(tx, d); err != nil {
+        return err
+    }
+
+    _, _ = tx.Exec("UPDATE device_macs SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
+    _, _ = tx.Exec("UPDATE device_ips SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
+    _, _ = tx.Exec("UPDATE hostname_owners SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
+    _, _ = tx.Exec("UPDATE pending_events SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
+    
+    _, err = tx.Exec("DELETE FROM devices WHERE pdid = ?", oldPDID)
+    if err != nil {
+        return err
     }
 
     return tx.Commit()
@@ -433,7 +582,6 @@ func (s *Storage) DeleteDevice(pdid string) error {
     return tx.Commit()
 }
 
-// GAP-D11: Pending Events for Crash Recovery
 func (s *Storage) SavePendingEvent(pdid, eventType string, payload []byte, firstSeen, lastSeen time.Time, confirmations int, sources string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -450,6 +598,25 @@ func (s *Storage) SavePendingEvent(pdid, eventType string, payload []byte, first
     `, pdid, eventType, payloadStr, firstSeen, lastSeen, confirmations, sources)
 
     return err
+}
+
+func (s *Storage) DeletePendingEventsBatch(records []PendingEventRecord) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    tx, err := s.db.Begin()
+    if err != nil {
+        return err
+    }
+    defer func() { _ = tx.Rollback() }()
+
+    for _, r := range records {
+        if _, err := tx.Exec("DELETE FROM pending_events WHERE pdid = ? AND event_type = ?", r.PDID, r.EventType); err != nil {
+            return err
+        }
+    }
+
+    return tx.Commit()
 }
 
 func (s *Storage) DeletePendingEvent(pdid, eventType string) error {
@@ -487,35 +654,4 @@ func (s *Storage) Close() error {
         return s.db.Close()
     }
     return nil
-}
-
-// canonicalizeHostnameLocal duplicates the correlation canonicalizer to avoid circular imports during DB migration.
-func canonicalizeHostnameLocal(raw string) string {
-    h := strings.ToLower(strings.TrimSpace(raw))
-    h = strings.TrimSuffix(h, ".")
-    if h == "" {
-        return ""
-    }
-
-    var canonicalSuffixes = []string{
-        ".home.arpa", ".localdomain", ".internal", ".local", ".lan", ".home", ".corp", ".priv", ".intranet",
-    }
-
-    changed := true
-    for changed {
-        changed = false
-        for _, suf := range canonicalSuffixes {
-            if strings.HasSuffix(h, suf) {
-                h = strings.TrimSuffix(h, suf)
-                changed = true
-                break
-            }
-        }
-    }
-
-    for strings.Contains(h, "..") {
-        h = strings.ReplaceAll(h, "..", ".")
-    }
-
-    return strings.Trim(h, ".")
 }

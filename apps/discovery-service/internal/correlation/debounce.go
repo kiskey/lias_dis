@@ -1,7 +1,7 @@
 // Package correlation implements the correlation, identity, and enrichment engine for DIS.
 //
 // File:    apps/discovery-service/internal/correlation/debounce.go
-// Version: 2.4
+// Version: 2.8 (Fixed PendingEventRecord Interface Mismatch)
 package correlation
 
 import (
@@ -14,12 +14,13 @@ import (
 
     "github.com/user/lias-dis/apps/discovery-service/internal/api"
     "github.com/user/lias-dis/apps/discovery-service/internal/discovery"
+    "github.com/user/lias-dis/apps/discovery-service/internal/storage"
     "github.com/user/lias-dis/shared/models"
 )
 
 type PendingEventStore interface {
     SavePendingEvent(pdid, eventType string, payload []byte, firstSeen, lastSeen time.Time, confirmations int, sources string) error
-    DeletePendingEvent(pdid, eventType string) error
+    DeletePendingEventsBatch(records []storage.PendingEventRecord) error
 }
 
 type PendingChange struct {
@@ -59,7 +60,7 @@ func (d *Debouncer) SetStore(store PendingEventStore) {
     d.store = store
 }
 
-func (d *Debouncer) LoadPending(records []PendingEventRecord) {
+func (d *Debouncer) LoadPending(records []storage.PendingEventRecord) {
     d.mu.Lock()
     defer d.mu.Unlock()
 
@@ -71,7 +72,6 @@ func (d *Debouncer) LoadPending(records []PendingEventRecord) {
 
         reqConf := 1
         evtType := models.EventType(r.EventType)
-        // Gap 3 Fix: MAC Changed only requires 1 confirmation
         if evtType == models.EventHostnameChanged || evtType == models.EventDeviceOnline {
             reqConf = 2
         }
@@ -98,16 +98,6 @@ func (d *Debouncer) LoadPending(records []PendingEventRecord) {
             ConfirmedBy:           confirmedBy,
         }
     }
-}
-
-type PendingEventRecord struct {
-    PDID          string
-    EventType     string
-    Payload       []byte
-    FirstSeen     time.Time
-    LastSeen      time.Time
-    Confirmations int
-    Sources       string
 }
 
 func (d *Debouncer) Run(ctx context.Context) {
@@ -160,7 +150,6 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
     p, exists := d.pending[key]
     if !exists {
         reqConf := 1
-        // Gap 3 Fix: MAC Changed only requires 1 confirmation
         if eventType == models.EventHostnameChanged || eventType == models.EventDeviceOnline {
             reqConf = 2
         }
@@ -195,11 +184,19 @@ func (d *Debouncer) Submit(pdid string, eventType models.EventType, source strin
     } else {
         p.Confirmations = len(p.Sources)
     }
+}
 
-    if d.store != nil {
-        payloadBytes, _ := json.Marshal(p.Payload)
-        sourcesStr := strings.Join(p.ConfirmedBy, ",")
-        _ = d.store.SavePendingEvent(p.PDID, string(p.EventType), payloadBytes, p.FirstSeen, p.LastSeen, p.Confirmations, sourcesStr)
+func (d *Debouncer) MigratePDID(oldPDID, newPDID string) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+
+    for key, p := range d.pending {
+        if p.PDID == oldPDID {
+            newKey := newPDID + ":" + string(p.EventType)
+            p.PDID = newPDID
+            d.pending[newKey] = p
+            delete(d.pending, key)
+        }
     }
 }
 
@@ -208,17 +205,30 @@ func (d *Debouncer) Flush() {
     defer d.mu.Unlock()
 
     now := time.Now()
+    var confirmedRecords []storage.PendingEventRecord
+
     for key, p := range d.pending {
+        if d.store != nil {
+            payloadBytes, _ := json.Marshal(p.Payload)
+            sourcesStr := strings.Join(p.ConfirmedBy, ",")
+            _ = d.store.SavePendingEvent(p.PDID, string(p.EventType), payloadBytes, p.FirstSeen, p.LastSeen, p.Confirmations, sourcesStr)
+        }
+
         if p.Confirmations >= p.RequiredConfirmations || now.Sub(p.FirstSeen) > 10*time.Second {
             p.Payload.ConfirmedBy = p.ConfirmedBy
             evt := models.NewEvent(p.EventType, p.PDID, p.Payload)
             d.broker.Broadcast(evt)
+            
+            confirmedRecords = append(confirmedRecords, storage.PendingEventRecord{
+                PDID:      p.PDID,
+                EventType: string(p.EventType),
+            })
             delete(d.pending, key)
-
-            if d.store != nil {
-                _ = d.store.DeletePendingEvent(p.PDID, string(p.EventType))
-            }
         }
+    }
+
+    if d.store != nil && len(confirmedRecords) > 0 {
+        _ = d.store.DeletePendingEventsBatch(confirmedRecords)
     }
 
     for k, t := range d.recentValTime {

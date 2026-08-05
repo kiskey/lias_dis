@@ -1,9 +1,8 @@
 // Package config handles loading, parsing, and validating configuration
-// for the LIAS binary. It expects a YAML file following the structure
-// defined in Appendix A of the implementation specification.
+// for the LIAS binary.
 //
 // File:    apps/lias/internal/config/config.go
-// Version: 1.1
+// Version: 1.2
 package config
 
 import (
@@ -14,7 +13,6 @@ import (
     "gopkg.in/yaml.v3"
 )
 
-// Config represents the root configuration object for LIAS.
 type Config struct {
     HTTP      HTTPConfig      `yaml:"http"`
     DIS       DISConfig       `yaml:"dis"`
@@ -24,12 +22,11 @@ type Config struct {
     Logging   LoggingConfig   `yaml:"logging"`
 }
 
-// HTTPConfig defines the listen address for the LIAS REST API.
 type HTTPConfig struct {
-    Listen string `yaml:"listen"`
+    Listen    string `yaml:"listen"`
+    AuthToken string `yaml:"auth_token"`
 }
 
-// DISConfig defines connection parameters to the Discovery Intelligence Service.
 type DISConfig struct {
     URL          string        `yaml:"url"`
     AuthToken    string        `yaml:"auth_token"`
@@ -38,29 +35,25 @@ type DISConfig struct {
 
 // NftablesConfig defines the isolated netdev table properties.
 type NftablesConfig struct {
-    Interface        string `yaml:"interface"`
-    TableName        string `yaml:"table_name"`
-    ShutdownBehavior string `yaml:"shutdown_behavior"` // "flush" or "persist"
+    Interface        string   `yaml:"interface"`
+    TableName        string   `yaml:"table_name"`
+    ShutdownBehavior string   `yaml:"shutdown_behavior"`
+    LanSubnets       []string `yaml:"lan_subnets"` // NEW: Subnets to bypass block rules (LAN traffic allowed)
 }
 
-// SchedulesConfig defines the default timezone for schedule evaluation.
 type SchedulesConfig struct {
     Timezone string `yaml:"timezone"`
 }
 
-// StorageConfig defines the path to the persistent state database.
 type StorageConfig struct {
     Path string `yaml:"path"`
 }
 
-// LoggingConfig defines the log output format and verbosity.
 type LoggingConfig struct {
     Level  string `yaml:"level"`
     Format string `yaml:"format"`
 }
 
-// Load reads the YAML configuration file from the provided path, applies
-// default values for missing fields, and returns a populated Config struct.
 func Load(path string) (*Config, error) {
     data, err := os.ReadFile(path)
     if err != nil {
@@ -72,7 +65,6 @@ func Load(path string) (*Config, error) {
         return nil, fmt.Errorf("failed to parse config file: %w", err)
     }
 
-    // Apply defaults
     if cfg.HTTP.Listen == "" {
         cfg.HTTP.Listen = ":8081"
     }
@@ -85,10 +77,21 @@ func Load(path string) (*Config, error) {
     if cfg.Nftables.TableName == "" {
         cfg.Nftables.TableName = "lancontrol"
     }
-    // GAP-L-H03 Fix: Default to "persist" to prevent fail-open during service restarts
     if cfg.Nftables.ShutdownBehavior == "" {
         cfg.Nftables.ShutdownBehavior = "persist"
     }
+    
+    // Default LAN subnets if none provided (Standard RFC1918 + IPv6 ULA/Link-Local)
+    if len(cfg.Nftables.LanSubnets) == 0 {
+        cfg.Nftables.LanSubnets = []string{
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "fc00::/7",   // IPv6 Unique Local Addresses
+            "fe80::/10", // IPv6 Link-Local
+        }
+    }
+
     if cfg.Schedules.Timezone == "" {
         cfg.Schedules.Timezone = "UTC"
     }

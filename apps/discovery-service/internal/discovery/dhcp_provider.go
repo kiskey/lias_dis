@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/dhcp_provider.go
-// Version: 1.3
+// Version: 1.9 (Replaced Bridge FDB with ARP Table for L3 accuracy)
 package discovery
 
 import (
@@ -16,17 +16,13 @@ import (
     "net/http"
     "os"
     "os/exec"
+    "strconv"
     "strings"
     "time"
 
     "github.com/user/lias-dis/apps/discovery-service/internal/config"
 )
 
-// DHCPProvider reads DHCP lease files to map hostnames and MACs to IPs.
-// It supports:
-// 1. Local file reading (lease_file)
-// 2. HTTP fetching (lease_url)
-// 3. Native SSH execution (ssh_host) for OpenWrt/dnsmasq routers
 type DHCPProvider struct {
     cfg    config.DHCPConfig
     ctx    context.Context
@@ -36,27 +32,23 @@ type DHCPProvider struct {
     client *http.Client
 }
 
-// NewDHCPProvider initializes the DHCP lease file parser.
 func NewDHCPProvider(cfg config.DHCPConfig) *DHCPProvider {
     return &DHCPProvider{
         cfg:    cfg,
-        events: make(chan Observation, 128),
+        events: make(chan Observation, 256),
         done:   make(chan struct{}),
         client: &http.Client{Timeout: 10 * time.Second},
     }
 }
 
-// Name returns the provider's identifier.
 func (p *DHCPProvider) Name() string { return "dhcp" }
 
-// Start begins the polling loop.
 func (p *DHCPProvider) Start(ctx context.Context) error {
     p.ctx, p.cancel = context.WithCancel(ctx)
     go p.run()
     return nil
 }
 
-// Stop terminates the polling loop.
 func (p *DHCPProvider) Stop() error {
     if p.cancel != nil {
         p.cancel()
@@ -65,7 +57,6 @@ func (p *DHCPProvider) Stop() error {
     return nil
 }
 
-// Events returns the read-only channel for observations.
 func (p *DHCPProvider) Events() <-chan Observation {
     return p.events
 }
@@ -92,104 +83,263 @@ func (p *DHCPProvider) poll() {
     var reader io.Reader
     var err error
 
-    // Determine the data source based on configuration
     if p.cfg.SSHHost != "" {
-        // 1. SSH Execution (Best practice for OpenWrt remote reading)
         user := p.cfg.SSHUser
         if user == "" {
             user = "root"
         }
         
         target := fmt.Sprintf("%s@%s", user, p.cfg.SSHHost)
-        cmd := exec.CommandContext(p.ctx, "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", target, "cat /tmp/dhcp.leases")
+        
+        leaseFile := p.cfg.LeaseFile
+        if leaseFile == "" {
+            leaseFile = "/tmp/dhcp.leases"
+        }
+        
+        // V1.9 ADD: Build compound command to fetch Leases, Wi-Fi APs, and ARP Table
+        cmdStr := "cat " + leaseFile
+        if p.cfg.OpenWrtAPEnabled {
+            cmdStr += "; echo '===AP_ASSOC==='; iw dev | grep -E 'Interface|Station' | awk '/Interface/{iface=$2} /Station/{print iface, $2}'"
+        }
+        if p.cfg.ArpTableEnabled {
+            // ip neigh show pulls the kernel ARP cache.
+            // We grep for lladdr to ensure we only get resolved MACs.
+            // awk prints IP (field 1) and MAC (field 5).
+            // Format: 192.168.1.50 aa:bb:cc:dd:ee:ff
+            cmdStr += "; echo '===ARP_TABLE==='; ip neigh show | grep lladdr | awk '{print $1, $5}'"
+        }
+
+        cmd := exec.CommandContext(p.ctx, "ssh", 
+            "-o", "StrictHostKeyChecking=accept-new", 
+            "-o", "UserKnownHostsFile=/etc/dis/known_hosts",
+            "-o", "ConnectTimeout=5", 
+            target, cmdStr)
         
         var stdout bytes.Buffer
         cmd.Stdout = &stdout
         err = cmd.Run()
         if err != nil {
-            slog.Debug("Failed to fetch DHCP leases via SSH", "host", p.cfg.SSHHost, "error", err)
+            slog.Debug("Failed to fetch DHCP/ARP data via SSH", "host", p.cfg.SSHHost, "error", err)
             return
         }
         reader = &stdout
         
     } else if p.cfg.LeaseURL != "" {
-        // 2. HTTP Fetching
         req, reqErr := http.NewRequestWithContext(p.ctx, "GET", p.cfg.LeaseURL, nil)
         if reqErr != nil {
-            slog.Debug("Failed to create DHCP lease request", "url", p.cfg.LeaseURL, "error", reqErr)
             return
         }
         
         resp, httpErr := p.client.Do(req)
         if httpErr != nil {
-            slog.Debug("Failed to fetch DHCP leases via HTTP", "url", p.cfg.LeaseURL, "error", httpErr)
             return
         }
         defer resp.Body.Close()
         
         if resp.StatusCode != http.StatusOK {
-            slog.Debug("DHCP lease URL returned non-200", "url", p.cfg.LeaseURL, "status", resp.StatusCode)
             return
         }
         
         reader = resp.Body
         
     } else if p.cfg.LeaseFile != "" {
-        // 3. Local File Reading
         file, fileErr := os.Open(p.cfg.LeaseFile)
         if fileErr != nil {
-            slog.Debug("Failed to open local DHCP lease file", "file", p.cfg.LeaseFile, "error", fileErr)
             return
         }
         defer file.Close()
         reader = file
     } else {
-        return // No source configured
+        return
     }
 
     scanner := bufio.NewScanner(reader)
+    currentSection := "dhcp"
+    
     for scanner.Scan() {
         line := scanner.Text()
-        // Standard dnsmasq/OpenWrt format: <expiry_timestamp> <mac> <ip> <hostname> <client_id>
-        parts := strings.Fields(line)
-        if len(parts) < 4 {
+        
+        if line == "===AP_ASSOC===" {
+            currentSection = "ap"
             continue
         }
-        
-        mac, err := net.ParseMAC(parts[1])
-        if err != nil {
+        if line == "===ARP_TABLE===" {
+            currentSection = "arp"
             continue
         }
-        
-        ip := net.ParseIP(parts[2])
-        if ip == nil {
-            continue
+
+        if currentSection == "dhcp" {
+            p.parseDHCPLine(line)
+        } else if currentSection == "ap" {
+            p.parseAPLine(line)
+        } else if currentSection == "arp" {
+            p.parseARPLine(line)
         }
-        
-        hostname := parts[3]
-        if hostname == "*" {
-            hostname = ""
-        }
-        
-obs := Observation{
-    Source:     p.Name(),
-    Group:      GroupB,
-    MAC:        mac,
-    IP:         ip,
-    Hostname:   hostname,
-    Online:     true,
-    Confidence: 0.50,
-    Timestamp:  time.Now(),
+    }
 }
-        
-        select {
-        case p.events <- obs:
-        default:
-            slog.Warn("DHCP observation channel full, dropping event")
-        }
+
+func (p *DHCPProvider) parseDHCPLine(line string) {
+    parts := strings.Fields(line)
+    if len(parts) < 4 {
+        return
     }
     
-    if err := scanner.Err(); err != nil {
-        slog.Error("Error reading DHCP leases", "error", err)
+    mac, err := net.ParseMAC(parts[1])
+    if err != nil {
+        return
     }
+    
+    ip := net.ParseIP(parts[2])
+    if ip == nil {
+        return
+    }
+    
+    hostname := parts[3]
+    if hostname == "*" {
+        hostname = ""
+    }
+
+    obs := Observation{
+        Source:     p.Name(),
+        Group:      GroupB,
+        MAC:        mac,
+        IP:         ip,
+        Hostname:   hostname,
+        Online:     true,
+        Confidence: 0.50,
+        Timestamp:  time.Now(),
+        Raw:        make(map[string]interface{}),
+    }
+
+    if len(parts) > 5 {
+        opt55 := parts[5]
+        obs.Raw["dhcp_option_55"] = opt55
+        osGuess := fingerprintOSFromDHCP(opt55)
+        if osGuess != "" {
+            obs.Raw["dhcp_os"] = osGuess
+            obs.Confidence = 0.70
+        }
+    } else if len(parts) > 4 {
+        obs.Raw["client_id"] = parts[4]
+    }
+    
+    select {
+    case p.events <- obs:
+    default:
+        slog.Warn("DHCP observation channel full, dropping event")
+    }
+}
+
+// V1.8 ADD: Parse Wi-Fi AP Associations (iw dev)
+func (p *DHCPProvider) parseAPLine(line string) {
+    parts := strings.Fields(line)
+    if len(parts) != 2 {
+        return
+    }
+    
+    iface := parts[0]
+    macStr := parts[1]
+    
+    mac, err := net.ParseMAC(macStr)
+    if err != nil {
+        return
+    }
+
+    obs := Observation{
+        Source:     "openwrt_ap",
+        Group:      GroupA, // Layer-2 Ground Truth
+        MAC:        mac,
+        IP:         nil,
+        Online:     true,
+        Confidence: 0.99,
+        Timestamp:  time.Now(),
+        Raw: map[string]interface{}{
+            "wifi_interface": iface,
+        },
+    }
+
+    select {
+    case p.events <- obs:
+    default:
+        slog.Warn("AP observation channel full, dropping event")
+    }
+}
+
+// V1.9 ADD: Parse ARP Table entries (ip neigh show)
+// Line format: 192.168.1.50 aa:bb:cc:dd:ee:ff
+func (p *DHCPProvider) parseARPLine(line string) {
+    parts := strings.Fields(line)
+    if len(parts) != 2 {
+        return
+    }
+    
+    ipStr := parts[0]
+    macStr := parts[1]
+    
+    ip := net.ParseIP(ipStr)
+    if ip == nil {
+        return
+    }
+    
+    mac, err := net.ParseMAC(macStr)
+    if err != nil {
+        return
+    }
+
+    obs := Observation{
+        Source:     "openwrt_arp",
+        Group:      GroupA, // Layer-2 + Layer-3 Ground Truth
+        MAC:        mac,
+        IP:         ip,     // We now have the IP binding!
+        Online:     true,
+        Confidence: 0.99,
+        Timestamp:  time.Now(),
+        Raw:        make(map[string]interface{}),
+    }
+
+    select {
+    case p.events <- obs:
+    default:
+        slog.Warn("ARP observation channel full, dropping event")
+    }
+}
+
+func fingerprintOSFromDHCP(opt55 string) string {
+    set := make(map[byte]bool)
+    
+    if strings.Contains(opt55, ",") {
+        bytesStr := strings.Split(opt55, ",")
+        for _, b := range bytesStr {
+            n, err := strconv.Atoi(strings.TrimSpace(b))
+            if err == nil {
+                set[byte(n)] = true
+            }
+        }
+    } else {
+        cleanHex := strings.ReplaceAll(opt55, ":", "")
+        cleanHex = strings.ReplaceAll(cleanHex, " ", "")
+        if len(cleanHex)%2 == 0 {
+            for i := 0; i < len(cleanHex); i += 2 {
+                n, err := strconv.ParseUint(cleanHex[i:i+2], 16, 8)
+                if err == nil {
+                    set[byte(n)] = true
+                }
+            }
+        }
+    }
+
+    if set[31] && set[33] && set[44] {
+        return "Windows"
+    }
+    if set[119] && set[252] && set[95] {
+        return "Apple macOS/iOS"
+    }
+    if set[28] && set[51] && !set[44] {
+        return "Android"
+    }
+    if set[1] && set[28] && set[2] && set[5] && !set[119] {
+        return "Linux"
+    }
+
+    return ""
 }

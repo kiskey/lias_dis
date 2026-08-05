@@ -1,109 +1,254 @@
 # LIAS & DIS
 
-**LAN Internet Access Scheduler (LIAS)** + **Discovery Intelligence Service (DIS)**
+**LAN Internet Access Scheduler (LIAS) + Discovery Intelligence Service (DIS)**
 
-Two independent static Go binaries that work together to provide real-time network device discovery and policy-based firewall scheduling on Linux networks.
+LIAS and DIS are two independent, statically compiled Go binaries that work together to provide real-time network device discovery, deterministic device identity, and policy-based firewall scheduling for Linux networks.
 
-## Architecture
+---
 
-- **DIS (Discovery Intelligence Service):** Runs on a host with Layer-2 visibility (e.g., Proxmox host). Observes the network via netlink, IEEE OUI lookups, Pi-hole v6, and DHCP. Correlates devices and exposes a REST/SSE API on `:8080`.
-- **LIAS (LAN Internet Access Scheduler):** Runs on the VPN Gateway / Router. Consumes DIS data in real-time over SSE, evaluates policy precedence and time schedules, persists configuration to a pure-Go SQLite database, and manipulates an isolated `netdev lancontrol` nftables table to enforce access rules.
+# Architecture
 
-## Features & Audit Hardening
-- **Zero CGO:** Compiles 100% statically with `CGO_ENABLED=0` for `linux/amd64` and `linux/arm64`.
-- **Deterministic Device Identity (PDID):** Stable hardware identity tracking across service restarts.
-- **Embedded IEEE OUI Lookup:** Built-in MAC vendor database for instant hardware identification.
-- **Isolated Netfilter Architecture:** Operates strictly within `table netdev lancontrol` on ingress (`eth0`). Never alters system routing, NAT, or `sing-box` rules.
-- **Overnight Schedule Engine:** Supports cross-midnight time rules (e.g., 22:00 to 06:00 bedtime schedules).
-- **Persistent Storage:** Integrated pure-Go SQLite storage (`/var/lib/lias/state.db`).
-- **Apple HIG Embedded Web Dashboard:** Embedded SPA served directly from the LIAS binary (`:8081`).
+## Discovery Intelligence Service (DIS)
 
-## Prerequisites
+The Discovery Intelligence Service (DIS) runs on a host with Layer-2 visibility, such as a Proxmox host, Linux bridge, or network appliance.
+
+DIS continuously observes the network using multiple passive and active discovery providers, including:
+
+- Netlink neighbor monitoring
+- IEEE OUI vendor lookup
+- Pi-hole v6 activity
+- DHCP lease correlation
+- mDNS (Avahi)
+- SSDP / UPnP
+- NetBIOS
+- TLS fingerprinting
+- Nmap enrichment (optional)
+
+DIS correlates all observations into a persistent device database and exposes both:
+
+- REST API
+- Server-Sent Events (SSE)
+
+on port **8080** for downstream consumers.
+
+---
+
+## LAN Internet Access Scheduler (LIAS)
+
+LIAS runs on the VPN gateway or router.
+
+It consumes device updates from DIS in real time through the SSE stream, evaluates policy precedence, tag memberships, schedules, and firewall policies, stores configuration in a pure-Go SQLite database, and manages an isolated **netdev** nftables table dedicated to LAN access control.
+
+LIAS never modifies existing firewall tables, routing, NAT, VPN, or `sing-box` rules.
+
+---
+
+# Features
+
+## Zero CGO
+
+- 100% statically compiled
+- `CGO_ENABLED=0`
+- Supports:
+  - linux/amd64
+  - linux/arm64
+
+---
+
+## Deterministic Device Identity (PDID)
+
+Provides persistent hardware identities that survive:
+
+- service restarts
+- IP address changes
+- randomized MAC transitions (when validated)
+
+---
+
+## Embedded IEEE OUI Database
+
+Includes a built-in IEEE OUI database for immediate MAC vendor identification without requiring external lookups.
+
+---
+
+## Isolated Netfilter Architecture
+
+Firewall enforcement operates exclusively within:
+
+```text
+table netdev lancontrol
+```
+
+using the ingress hook on the LAN interface.
+
+LIAS never modifies:
+
+- filter tables
+- nat tables
+- routing
+- policy routing
+- VPN rules
+- sing-box
+- system nftables rules
+
+---
+
+## Overnight Schedule Engine
+
+Supports schedules that span midnight.
+
+Example:
+
+```text
+22:00 → 06:00
+```
+
+Ideal for:
+
+- bedtime schedules
+- overnight restrictions
+- weekend policies
+
+---
+
+## Persistent Storage
+
+Both services use embedded pure-Go SQLite databases.
+
+DIS:
+
+```text
+/var/lib/dis/state.db
+```
+
+LIAS:
+
+```text
+/var/lib/lias/state.db
+```
+
+No external database server is required.
+
+---
+
+## Embedded Apple HIG Dashboard
+
+LIAS embeds its entire web dashboard inside the executable.
+
+The dashboard is served directly from the binary on:
+
+```text
+http://<lias-ip>:8081
+```
+
+---
+
+# Prerequisites
 
 - Go 1.23+
-- Linux kernel 5.10+ (for `netdev` ingress hooks)
-- `nftables` utility and `CAP_NET_ADMIN` capability for LIAS
-- `nmap`, `avahi-tools` (optional, for DIS enrichment)
+- Linux Kernel 5.10+
+- nftables
+- CAP_NET_ADMIN capability (LIAS)
 
-## Build
+Optional enrichment tools:
 
-Both binaries are compiled statically without external C library dependencies.
+- nmap
+- avahi-tools
+
+---
+
+# Building
+
+Both binaries compile completely statically.
+
+## Build for the current architecture
 
 ```bash
-# Build for host architecture
 make build
+```
 
-# Cross-compile for linux/amd64 and linux/arm64
+## Cross-compile for Linux AMD64 and ARM64
+
+```bash
 make release
 ```
 
-Binaries will be placed in the `bin/` directory.
+Compiled binaries are placed in:
 
-## Configuration
+```text
+bin/
+```
 
-### DIS Config (`/etc/dis/config.yaml`)
+---
+
+# DIS Configuration
+
+**File**
+
+```text
+/etc/dis/config.yaml
+```
+
 ```yaml
 # ==============================================================================
 # Discovery Intelligence Service (DIS) Configuration
-# Version: 1.3
+# Version: 1.4
 # File Path: /etc/dis/config.yaml
 # ==============================================================================
 
-# HTTP REST API and SSE Event Stream Server Settings
 http:
-  listen: ":8080"            # Address and port to bind (default: ":8080")
-  auth_token: ""             # Optional Bearer token for API authentication (empty = open LAN)
+  listen: ":8080"
+  auth_token: ""
 
-# Network Discovery & Observation Providers
 discovery:
-  interface: "eth0"          # Primary LAN network interface to monitor (default: "eth0")
+  interface: "eth0"
 
-  # Real-time Kernel Netlink Provider (ARP/NDP table subscription)
   netlink:
-    enabled: true            # Enable real-time netlink neighbor monitoring
+    enabled: true
 
-  # Pi-hole v6 API Activity Intelligence Provider
   pihole:
-    enabled: true            # Enable polling active DNS clients from Pi-hole
-    url: "http://pi.hole"    # Pi-hole v6 base API URL (e.g., http://192.168.1.2 or http://pi.hole)
-    password: "your_pihole_password" # Pi-hole web/app password (used for /api/auth session token)
+    enabled: true
+    url: "http://pi.hole"
+    password: "your_pihole_password"
 
-  # DHCP Lease File Provider
   dhcp:
-    enabled: true            # Enable reading DHCP leases to map hostnames, IPs, and MACs
-    type: "router"           # DHCP server type: "router", "pihole", "dnsmasq", or "kea"
-    
-    # Select ONE of the data source options below:
-    # Option A: Local File Path (if DIS runs on the router itself or uses NFS)
+    enabled: true
+    type: "router"
+
     lease_file: "/tmp/dhcp.leases"
-    
-    # Option B: Remote HTTP URL Fetching
-    lease_url: ""            # e.g., "http://192.168.1.1/dhcp.leases"
-    
-    # Option C: Remote SSH Execution (Recommended for OpenWrt/Routers)
-    ssh_host: ""             # Router IP to fetch lease file via SSH (e.g., "192.168.1.1")
-    ssh_user: "root"         # SSH username (default: "root")
 
-  # On-Demand Device Fingerprinting & Enrichment Pipeline
+    lease_url: ""
+
+    ssh_host: ""
+    ssh_user: "root"
+
   enrichment:
-    avahi_enabled: true       # Enable mDNS service discovery via system avahi-browse
-    ssdp_enabled: true        # Enable native Go UPnP multicast M-SEARCH discovery
-    netbios_enabled: true     # Enable UDP port 137 NetBIOS node status queries
-    nmap_enabled: true        # Enable Nmap port and OS fingerprinting fallback
-    unknown_device_scan: true # Automatically trigger enrichment for unclassified devices
-    validation_interval: "24h"# Periodic re-validation check interval for known devices
+    avahi_enabled: true
+    ssdp_enabled: true
+    netbios_enabled: true
+    tls_enabled: true
+    nmap_enabled: true
+    unknown_device_scan: true
+    validation_interval: "24h"
 
-# CGO-Free Pure-Go SQLite Persistent Identity Engine
 storage:
-  path: "/var/lib/dis/state.db" # Database file path for persisting correlated device state
+  path: "/var/lib/dis/state.db"
 
-# Structured Logging Output Settings
 logging:
-  level: "info"              # Log verbosity: "debug", "info", "warn", or "error" (default: "info")
-  format: "json"             # Log format: "json" or "text" (default: "json")
+  level: "info"
+  format: "json"
 ```
 
-### LIAS Config (`/etc/lias/config.yaml`)
+---
+
+# LIAS Configuration
+
+**File**
+
+```text
+/etc/lias/config.yaml
+```
+
 ```yaml
 # ==============================================================================
 # LAN Internet Access Scheduler (LIAS) Configuration
@@ -111,50 +256,138 @@ logging:
 # File Path: /etc/lias/config.yaml
 # ==============================================================================
 
-# HTTP REST Server & Embedded Web UI Dashboard Settings
 http:
-  listen: ":8081"            # Address and port to bind (default: ":8081")
+  listen: ":8081"
 
-# Connection Parameters to Discovery Intelligence Service (DIS)
 dis:
-  url: "http://127.0.0.1:8080" # DIS server IP or URL (port :8080 targeted automatically)
-  auth_token: ""             # Bearer auth token if configured in DIS
-  sync_interval: "30s"       # Background REST polling fallback interval (default: "30s")
+  url: "http://127.0.0.1:8080"
+  auth_token: ""
+  sync_interval: "30s"
 
-# Isolated Netfilter Architecture (netdev ingress table)
 nftables:
-  interface: "eth0"          # LAN-facing network interface to apply packet filtering (default: "eth0")
-  table_name: "lancontrol"   # Isolated netdev table name (default: "lancontrol")
-  shutdown_behavior: "flush" # Action on SIGTERM shutdown: "flush" (remove table) or "persist" (keep rules)
+  interface: "eth0"
+  table_name: "lancontrol"
+  shutdown_behavior: "flush"
 
-# Schedule Engine Evaluation Defaults
 schedules:
-  timezone: "UTC"            # Default IANA timezone (e.g., "America/Los_Angeles", "Europe/London", "UTC")
+  timezone: "UTC"
 
-# CGO-Free Pure-Go SQLite Persistent Storage Engine
 storage:
-  path: "/var/lib/lias/state.db" # Database file path for persisting Tags, Policies, and Schedules
+  path: "/var/lib/lias/state.db"
 
-# Structured Logging Output Settings
 logging:
-  level: "info"              # Log verbosity: "debug", "info", "warn", or "error" (default: "info")
-  format: "json"             # Log format: "json" or "text" (default: "json")
+  level: "info"
+  format: "json"
 ```
 
-## Deployment
+---
 
-1. Place the `dis` binary on your Proxmox host or primary switch/router.
-2. Place the `lias` binary on your VPN Gateway / Router.
-3. Copy the respective `config.yaml` files to `/etc/dis/` and `/etc/lias/`.
-4. Run via systemd or supervisor:
-   ```bash
-   ./dis -config /etc/dis/config.yaml
-   ./lias -config /etc/lias/config.yaml
-   ```
+# Deployment
 
-## Dashboard
+## Discovery Intelligence Service
 
-The LIAS Web UI is embedded in the `lias` binary and accessible at `http://<lias-ip>:8081/`. It provides real-time device management, tag assignments, time schedule creation, and firewall rule status.
+Install the `dis` binary on:
+
+- Proxmox host
+- Linux bridge
+- Router
+- Layer-2 monitoring host
+
+Copy the configuration file to:
+
+```text
+/etc/dis/config.yaml
+```
+
+Run:
+
+```bash
+./dis -config /etc/dis/config.yaml
+```
+
+---
+
+## LAN Internet Access Scheduler
+
+Install the `lias` binary on:
+
+- VPN Gateway
+- Router
+- Firewall host
+
+Copy the configuration file to:
+
+```text
+/etc/lias/config.yaml
+```
+
+Run:
+
+```bash
+./lias -config /etc/lias/config.yaml
+```
+
+Both services are intended to run continuously under:
+
+- systemd
+- OpenRC
+- Supervisor
+- another process manager
+
+---
+
+# Dashboard
+
+The LIAS dashboard is fully embedded within the `lias` executable.
+
+Open:
+
+```text
+http://<lias-ip>:8081/
+```
+
+The web interface provides:
+
+- Real-time device discovery
+- Device fingerprint information
+- Tag management
+- Infrastructure device management
+- Multi-tag assignment
+- Schedule creation
+- Policy management
+- Vacation Mode
+- Device enable/disable
+- Firewall status
+- nftables synchronization status
+- Real-time SSE updates
+- Policy evaluation visibility
+- Schedule visualization
+- Device search and filtering
+- Embedded Apple Human Interface Guidelines (HIG) user experience
+
+---
+
+# Overall Design
+
+The architecture intentionally separates network discovery from policy enforcement.
+
+**DIS** is responsible for:
+
+- discovering devices
+- correlating identities
+- fingerprinting hardware
+- enriching metadata
+- exposing a real-time API
+
+**LIAS** is responsible for:
+
+- consuming discovery updates
+- evaluating policy precedence
+- enforcing schedules
+- maintaining deterministic firewall state
+- managing isolated nftables rules
+
+This separation of responsibilities keeps both binaries lightweight, resource-efficient, and independently deployable while ensuring deterministic behavior and minimal CPU, memory, and disk I/O overhead.
 
 # LIAS Multi-Schedule & Policy Management Guide
 

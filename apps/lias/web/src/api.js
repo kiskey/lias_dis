@@ -1,14 +1,10 @@
 /**
  * LIAS REST API Client & Real-time EventSource Subscriber
  * File:    apps/lias/web/src/api.js
- * Version: 2.1 (Audited & Merged per Enhancement 3.0 & 4.0)
+ * Version: 2.4 (Fixed Error Message Overwrite and Tag Payload)
  */
 
 export const API = {
-    /**
-     * Internal generic fetch helper handling JSON responses, status validation,
-     * and attaching 409 Conflict metadata to thrown errors.
-     */
     async request(endpoint, options = {}) {
         const config = {
             headers: {
@@ -44,13 +40,21 @@ export const API = {
             errorObj.status = response.status;
             if (errData) {
                 errorObj.error = errData.error;
-                errorObj.message = errData.message;
+                // Fix: Only overwrite message if errData.message is actually present
+                if (errData.message) {
+                    errorObj.message = errData.message;
+                }
                 errorObj.conflicts = errData.conflicts;
             }
             throw errorObj;
         }
 
-        return await response.json();
+        // Handle raw blob/text for export/import
+        const contentType = response.headers.get("content-type");
+        if (contentType && contentType.indexOf("application/json") !== -1) {
+            return await response.json();
+        }
+        return await response.text();
     },
 
     // --- DEVICE ENDPOINTS ---
@@ -62,10 +66,41 @@ export const API = {
         return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}`);
     },
 
-    async assignDeviceTag(pdid, tagId) {
+    async getDeviceLogs(pdid) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/logs`);
+    },
+
+    async assignDeviceTag(pdid, tagIds) {
+        const payload = Array.isArray(tagIds) ? { tag_ids: tagIds } : { tag_id: tagIds };
         return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/tags`, {
             method: 'POST',
-            body: JSON.stringify({ tag_id: tagId })
+            body: JSON.stringify(payload)
+        });
+    },
+
+    async pauseDeviceInternet(pdid) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/pause`, {
+            method: 'POST'
+        });
+    },
+
+    async unpauseDeviceInternet(pdid) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/pause`, {
+            method: 'DELETE'
+        });
+    },
+
+    async renameDevice(pdid, name) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/rename`, {
+            method: 'POST',
+            body: JSON.stringify({ name })
+        });
+    },
+
+    async assignDeviceUser(pdid, userId) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/user`, {
+            method: 'POST',
+            body: JSON.stringify({ user_id: userId })
         });
     },
 
@@ -120,9 +155,7 @@ export const API = {
             try {
                 return await this.updatePolicy(policyData.id, policyData);
             } catch (err) {
-                // If update failed due to 409 Conflict, rethrow immediately
                 if (err.status === 409) throw err;
-                // Fall back to create if policy record doesn't exist yet
                 return await this.createPolicy(policyData);
             }
         }
@@ -139,6 +172,20 @@ export const API = {
     async deletePolicy(id) {
         return await this.request(`/api/v1/policies/${encodeURIComponent(id)}`, {
             method: 'DELETE'
+        });
+    },
+
+    async exportPolicies() {
+        const response = await fetch('/api/v1/policies/export');
+        if (!response.ok) throw new Error('Failed to export policies');
+        return response.blob();
+    },
+
+    async importPolicies(jsonFile) {
+        const text = await jsonFile.text();
+        return await this.request('/api/v1/policies/import', {
+            method: 'POST',
+            body: text
         });
     },
 
@@ -179,7 +226,26 @@ export const API = {
         });
     },
 
-    // --- NFTABLES ENDPOINTS ---
+    // --- USER ENDPOINTS ---
+    async createUser(userData) {
+        return await this.request('/api/v1/users', {
+            method: 'POST',
+            body: JSON.stringify(userData)
+        });
+    },
+
+    // --- SYSTEM & REPORTING ENDPOINTS ---
+    async getNetworkStats() {
+        return await this.request('/api/v1/stats');
+    },
+
+    async toggleVacationMode(enabled) {
+        return await this.request('/api/v1/vacation', {
+            method: 'POST',
+            body: JSON.stringify({ enabled })
+        });
+    },
+
     async flushNftables() {
         return await this.request('/api/v1/nftables/flush', {
             method: 'POST'
@@ -208,7 +274,8 @@ export const API = {
             'device.fingerprint_updated',
             'device.ip_changed',
             'device.mac_changed',
-            'device.reidentified' // GAP-I01: Added missing event type
+            'device.reidentified',
+            'security.alert'
         ];
 
         eventTypes.forEach(evtType => {

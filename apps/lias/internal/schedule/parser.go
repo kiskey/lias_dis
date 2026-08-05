@@ -1,7 +1,7 @@
 // Package schedule implements time-based rule parsing and evaluation for LIAS.
 //
 // File:    apps/lias/internal/schedule/parser.go
-// Version: 1.6
+// Version: 1.9
 package schedule
 
 import (
@@ -24,24 +24,70 @@ var dayMap = map[string]time.Weekday{
 }
 
 // Evaluate determines the effective action for a schedule at a specific time.
-//
-// Handles both:
-// 1. Scheduled Whitelist Mode (Action: ALLOW rules) -> Default state outside windows is BLOCK.
-// 2. Scheduled Downtime Mode (Action: BLOCK rules)  -> Default state outside windows is ALLOW.
+// Handles DST spring-forward (skipped hour) and fall-back (repeated hour).
 func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
     loc, err := time.LoadLocation(s.Timezone)
     if err != nil {
         loc = time.UTC
     }
     now = now.In(loc)
-
+    
     var bestMatch *models.ScheduleRule
     var bestDuration time.Duration = -1
 
     currentWeekday := now.Weekday()
-    prevWeekday := (now.Weekday() + 6) % 7 // Day prior to handle overnight windows starting yesterday
+    prevWeekday := (now.Weekday() + 6) % 7
 
     for _, rule := range s.Rules {
+        // LIAS-SCH-09 Fix: Calendar Date Scheduling
+        if rule.StartDate != "" && rule.EndDate != "" {
+            startDt, err1 := time.ParseInLocation("2006-01-02", rule.StartDate, loc)
+            endDt, err2 := time.ParseInLocation("2006-01-02", rule.EndDate, loc)
+            if err1 == nil && err2 == nil {
+                // Add 1 day to EndDate to make it inclusive of the whole day
+                endDt = endDt.AddDate(0, 0, 1)
+                if now.Before(startDt) || now.After(endDt) {
+                    continue
+                }
+                
+                // Match time within the date range
+                startTime, _ := time.Parse("15:04", rule.StartTime)
+                endTime, _ := time.Parse("15:04", rule.EndTime)
+                
+                year, month, day := now.Date()
+                start := time.Date(year, month, day, startTime.Hour(), startTime.Minute(), 0, 0, loc)
+                end := time.Date(year, month, day, endTime.Hour(), endTime.Minute(), 0, 0, loc)
+
+                if start.Equal(end) {
+                    continue // Zero duration
+                }
+
+                isMatch := false
+                var windowDuration time.Duration
+
+                if end.After(start) {
+                    isMatch = (now.Equal(start) || now.After(start)) && now.Before(end)
+                    windowDuration = end.Sub(start)
+                } else {
+                    // Overnight
+                    windowDuration = end.Add(24 * time.Hour).Sub(start)
+                    if (now.Equal(start) || now.After(start)) && now.Before(end.AddDate(0, 0, 1)) {
+                        isMatch = true
+                    }
+                }
+
+                if isMatch {
+                    if bestDuration == -1 || windowDuration < bestDuration {
+                        bestDuration = windowDuration
+                        r := rule
+                        bestMatch = &r
+                    }
+                }
+            }
+            continue // Skip weekly logic if dates were specified
+        }
+
+        // Weekly Scheduling
         matchesCurrentDay := false
         matchesPrevDay := false
 
@@ -70,40 +116,34 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
             continue
         }
 
-        // Calculate start and end time boundaries relative to current day
         year, month, day := now.Date()
         start := time.Date(year, month, day, startTime.Hour(), startTime.Minute(), 0, 0, loc)
         end := time.Date(year, month, day, endTime.Hour(), endTime.Minute(), 0, 0, loc)
 
-        // GAP-L-H07 Fix: Detect DST transition collapsing a window
         if rule.StartTime != rule.EndTime && start.Equal(end) {
             slog.Warn("Schedule rule window collapsed to zero duration due to DST transition",
                 "schedule_id", s.ID, "rule_start", rule.StartTime, "rule_end", rule.EndTime)
+            continue
         }
 
         isMatch := false
         var windowDuration time.Duration
 
         if end.After(start) {
-            // Normal same-day window (e.g., 12:00 to 18:00)
-            // Only evaluate if the current day matches
             if matchesCurrentDay {
                 isMatch = (now.Equal(start) || now.After(start)) && now.Before(end)
             }
             windowDuration = end.Sub(start)
         } else {
-            // Cross-midnight window (e.g., 22:00 to 06:00)
             windowDuration = end.Add(24 * time.Hour).Sub(start)
 
-            // Check if match starts yesterday and ends today
             if matchesPrevDay {
-                startOvernight := start.AddDate(0, 0, -1) // Yesterday's start
+                startOvernight := start.AddDate(0, 0, -1)
                 if (now.Equal(startOvernight) || now.After(startOvernight)) && now.Before(end) {
                     isMatch = true
                 }
             }
 
-            // Check if match starts today and ends tomorrow
             if matchesCurrentDay {
                 if (now.Equal(start) || now.After(start)) && now.Before(end.AddDate(0, 0, 1)) {
                     isMatch = true
@@ -112,7 +152,6 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
         }
 
         if isMatch {
-            // Narrowest window wins precedence
             if bestDuration == -1 || windowDuration < bestDuration {
                 bestDuration = windowDuration
                 r := rule
@@ -121,31 +160,24 @@ func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
         }
     }
 
-    // 1. If a rule window is currently active, enforce the rule's specified action (ALLOW or BLOCK)
     if bestMatch != nil {
         return bestMatch.Action, nil
     }
 
-    // 2. AUTHORITATIVE DEFAULT FALLBACK (GAP-L-H02 Fix):
-    // Mode explicitly defines default outside window behavior.
-    // Do not infer from rule actions.
     if s.Mode == models.ScheduleModeWhitelist {
         return models.ActionBlock, nil
     }
 
-    // Default for Downtime Mode (or unspecified)
     return models.ActionAllow, nil
 }
 
-// NextStateChange calculates the exact next timestamp when the schedule action will transition.
+// NextStateChange calculates the exact next timestamp when the schedule action or rule context will transition.
 func NextStateChange(s models.Schedule, now time.Time) (time.Time, error) {
     loc, err := time.LoadLocation(s.Timezone)
     if err != nil {
         loc = time.UTC
     }
     now = now.In(loc)
-
-    currentAction, _ := Evaluate(s, now)
 
     var transitionPoints []time.Time
     year, month, day := now.Date()
@@ -154,6 +186,18 @@ func NextStateChange(s models.Schedule, now time.Time) (time.Time, error) {
         baseDate := time.Date(year, month, day+i, 0, 0, 0, 0, loc)
 
         for _, rule := range s.Rules {
+            // LIAS-SCH-09 Fix: Check calendar date transitions
+            if rule.StartDate != "" && rule.EndDate != "" {
+                startDt, err1 := time.ParseInLocation("2006-01-02", rule.StartDate, loc)
+                endDt, err2 := time.ParseInLocation("2006-01-02", rule.EndDate, loc)
+                if err1 == nil && err2 == nil {
+                    endDt = endDt.AddDate(0, 0, 1) // Include full end date
+                    if baseDate.Before(startDt) || baseDate.After(endDt) {
+                        continue
+                    }
+                }
+            }
+
             if startT, err := time.Parse("15:04", rule.StartTime); err == nil {
                 t := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), startT.Hour(), startT.Minute(), 0, 0, loc)
                 if t.After(now) {
@@ -178,12 +222,8 @@ func NextStateChange(s models.Schedule, now time.Time) (time.Time, error) {
         return transitionPoints[i].Before(transitionPoints[j])
     })
 
-    for _, t := range transitionPoints {
-        nextAction, _ := Evaluate(s, t.Add(1*time.Second))
-        if nextAction != currentAction {
-            return t, nil
-        }
-    }
-
-    return now.Add(24 * time.Hour), nil
+    // MATH-07 Fix: Return the very next transition point.
+    // Nftables syncs are cheap and idempotent, so triggering on rule boundaries
+    // (even if the action doesn't change) is safe and prevents missed evaluations.
+    return transitionPoints[0], nil
 }

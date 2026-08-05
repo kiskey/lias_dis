@@ -2,226 +2,337 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netlink_provider.go
-// Version: 2.0
+// Version: 2.6 (Enhanced UDP Probe to Force L2 Resolution)
 package discovery
 
 import (
-	"context"
-	"fmt"
-	"log/slog"
-	"net"
-	"sync"
-	"time"
+    "context"
+    "fmt"
+    "log/slog"
+    "net"
+    "os"
+    "sync"
+    "time"
 
-	"github.com/user/lias-dis/pkg/oui"
-	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
+    "github.com/user/lias-dis/pkg/oui"
+    "github.com/vishvananda/netlink"
+    "golang.org/x/sys/unix"
 )
 
 type NetlinkProvider struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	events    chan Observation
-	done      chan struct{}
-	iface     string
-	targetIdx int
-	mu        sync.RWMutex
+    ctx       context.Context
+    cancel    context.CancelFunc
+    events    chan Observation
+    done      chan struct{}
+    iface     string
+    targetIdx int
+    mu        sync.RWMutex
+    probeSem  chan struct{}
 }
 
 func NewNetlinkProvider(iface string) *NetlinkProvider {
-	return &NetlinkProvider{
-		events: make(chan Observation, 256),
-		done:   make(chan struct{}),
-		iface:  iface,
-	}
+    return &NetlinkProvider{
+        events:   make(chan Observation, 256),
+        done:     make(chan struct{}),
+        iface:    iface,
+        probeSem: make(chan struct{}, 10),
+    }
 }
 
 func (p *NetlinkProvider) Name() string { return "netlink" }
 
 func (p *NetlinkProvider) Start(ctx context.Context) error {
-	p.ctx, p.cancel = context.WithCancel(ctx)
+    p.ctx, p.cancel = context.WithCancel(ctx)
 
-	if p.iface != "" {
-		link, err := netlink.LinkByName(p.iface)
-		if err != nil {
-			slog.Warn("Target interface not found immediately", "iface", p.iface, "error", err)
-			p.targetIdx = 0
-		} else {
-			p.targetIdx = link.Attrs().Index
-			slog.Info("Netlink provider bound to interface", "iface", p.iface, "index", p.targetIdx)
-		}
-	}
+    p.resolveInterface()
+    p.checkGcStaleTime()
 
-	ch := make(chan netlink.NeighUpdate)
-	done := make(chan struct{})
+    go p.runSubscriptionLoop()
+    go p.monitorStaleNeighbors()
 
-	opt := netlink.NeighSubscribeOptions{
-		ListExisting: true,
-	}
-
-	if err := netlink.NeighSubscribeWithOptions(ch, done, opt); err != nil {
-		return fmt.Errorf("failed to subscribe to netlink neighbor updates: %w", err)
-	}
-
-	// Start Active L2 Neighbor Reachability Monitor
-	go p.monitorStaleNeighbors()
-
-	go func() {
-		defer close(p.done)
-
-		for {
-			select {
-			case <-p.ctx.Done():
-				close(done)
-				return
-			case update, ok := <-ch:
-				if !ok {
-					return
-				}
-				p.handleNeighUpdate(update)
-			}
-		}
-	}()
-
-	return nil
+    return nil
 }
 
-// monitorStaleNeighbors periodically audits kernel neighbor states and triggers active probes for STALE entries.
-func (p *NetlinkProvider) monitorStaleNeighbors() {
-	ticker := time.NewTicker(20 * time.Second)
-	defer ticker.Stop()
+func (p *NetlinkProvider) resolveInterface() {
+    if p.iface == "" {
+        return
+    }
+    link, err := netlink.LinkByName(p.iface)
+    if err != nil {
+        slog.Warn("Target interface not found, will retry", "iface", p.iface, "error", err)
+        p.mu.Lock()
+        p.targetIdx = 0
+        p.mu.Unlock()
+        return
+    }
+    p.mu.Lock()
+    p.targetIdx = link.Attrs().Index
+    p.mu.Unlock()
+    slog.Info("Netlink provider bound to interface", "iface", p.iface, "index", link.Attrs().Index)
+}
 
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case <-ticker.C:
-			p.auditKernelNeighbors()
-		}
-	}
+func (p *NetlinkProvider) checkGcStaleTime() {
+    if p.iface == "" {
+        return
+    }
+    path := "/proc/sys/net/ipv4/neigh/" + p.iface + "/gc_stale_time"
+    data, err := os.ReadFile(path)
+    if err == nil {
+        var val int
+        _, err := fmt.Sscanf(string(data), "%d", &val)
+        if err == nil && val < 180 {
+            slog.Warn("Kernel neighbor gc_stale_time is lower than DIS staleThreshold (180s). Devices may flap between online/offline.",
+                "iface", p.iface, "gc_stale_time", val, "path", path)
+        }
+    }
+}
+
+func (p *NetlinkProvider) runSubscriptionLoop() {
+    defer close(p.done)
+
+    ifaceRetry := time.NewTicker(30 * time.Second)
+    defer ifaceRetry.Stop()
+
+    for {
+        select {
+        case <-p.ctx.Done():
+            return
+        case <-ifaceRetry.C:
+            p.mu.RLock()
+            idx := p.targetIdx
+            p.mu.RUnlock()
+            if idx == 0 {
+                p.resolveInterface()
+            }
+        default:
+        }
+
+        p.mu.RLock()
+        idx := p.targetIdx
+        p.mu.RUnlock()
+        if idx == 0 {
+            select {
+            case <-p.ctx.Done():
+                return
+            case <-time.After(5 * time.Second):
+                continue
+            }
+        }
+
+        ch := make(chan netlink.NeighUpdate)
+        innerDone := make(chan struct{})
+
+        opt := netlink.NeighSubscribeOptions{
+            ListExisting: true,
+        }
+
+        if err := netlink.NeighSubscribeWithOptions(ch, innerDone, opt); err != nil {
+            slog.Error("Failed to subscribe to netlink neighbor updates, retrying in 5s", "error", err)
+            select {
+            case <-p.ctx.Done():
+                return
+            case <-time.After(5 * time.Second):
+            }
+            continue
+        }
+
+        for {
+            select {
+            case <-p.ctx.Done():
+                close(innerDone)
+                return
+            case <-innerDone:
+                slog.Warn("Netlink subscription closed by kernel, attempting reconnect...")
+                select {
+                case <-p.ctx.Done():
+                    return
+                case <-time.After(2 * time.Second):
+                }
+            case update, ok := <-ch:
+                if !ok {
+                    close(innerDone)
+                    goto ReconnectLoop
+                }
+                p.handleNeighUpdate(update)
+            }
+        }
+
+    ReconnectLoop:
+        p.resolveInterface()
+        select {
+        case <-p.ctx.Done():
+            return
+        default:
+        }
+    }
+}
+
+func (p *NetlinkProvider) monitorStaleNeighbors() {
+    ticker := time.NewTicker(20 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-p.ctx.Done():
+            return
+        case <-ticker.C:
+            p.auditKernelNeighbors()
+        }
+    }
 }
 
 func (p *NetlinkProvider) auditKernelNeighbors() {
-	neighs, err := netlink.NeighList(p.targetIdx, netlink.FAMILY_V4)
-	if err != nil {
-		return
-	}
+    p.mu.RLock()
+    idx := p.targetIdx
+    p.mu.RUnlock()
+    if idx == 0 {
+        return
+    }
 
-	for _, n := range neighs {
-		if n.HardwareAddr == nil || len(n.HardwareAddr) != 6 {
-			continue
-		}
-		if IsMulticastOrBroadcast(n.HardwareAddr, n.IP) {
-			continue
-		}
+    families := []int{netlink.FAMILY_V4, netlink.FAMILY_V6}
 
-		// If neighbor is in NUD_FAILED or NUD_INCOMPLETE, emit explicit offline observation with confidence 0.95
-		if (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0 {
-			obs := Observation{
-				Source:     p.Name(),
-				MAC:        n.HardwareAddr,
-				IP:         n.IP,
-				Vendor:     oui.Lookup(n.HardwareAddr.String()),
-				Online:     false,
-				Confidence: 0.95,
-				Timestamp:  time.Now(),
-			}
-			select {
-			case p.events <- obs:
-			default:
-			}
-			continue
-		}
+    for _, fam := range families {
+        neighs, err := netlink.NeighList(idx, fam)
+        if err != nil {
+            continue
+        }
 
-		// If neighbor is NUD_STALE or NUD_DELAY, transmit an active L2 probe to force kernel transition to REACHABLE or FAILED
-		if (n.State & (unix.NUD_STALE | unix.NUD_DELAY)) != 0 && n.IP != nil {
-			go p.probeNeighborIP(n.IP)
-		}
-	}
+        for _, n := range neighs {
+            if n.HardwareAddr == nil || len(n.HardwareAddr) != 6 {
+                continue
+            }
+            if IsMulticastOrBroadcast(n.HardwareAddr, n.IP) {
+                continue
+            }
+
+            if (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0 {
+                obs := Observation{
+                    Source:     p.Name(),
+                    MAC:        n.HardwareAddr,
+                    IP:         n.IP,
+                    Vendor:     oui.Lookup(n.HardwareAddr.String()),
+                    Online:     false,
+                    Confidence: 0.95,
+                    Timestamp:  time.Now(),
+                }
+                select {
+                case p.events <- obs:
+                default:
+                }
+                continue
+            }
+
+            if (n.State & (unix.NUD_STALE | unix.NUD_DELAY)) != 0 && n.IP != nil {
+                select {
+                case p.probeSem <- struct{}{}:
+                    go func(ip net.IP) {
+                        defer func() { <-p.probeSem }()
+                        p.probeNeighborIP(ip)
+                    }(n.IP)
+                default:
+                }
+            }
+        }
+    }
 }
 
-// probeNeighborIP transmits an active L2 probe packet to force kernel ARP state resolution.
 func (p *NetlinkProvider) probeNeighborIP(ip net.IP) {
-	addr := net.JoinHostPort(ip.String(), "64111")
-	conn, err := net.DialTimeout("udp4", addr, 1*time.Second)
-	if err == nil {
-		_, _ = conn.Write([]byte{0x00})
-		_ = conn.Close()
-	}
+    var addr string
+    if ip.To4() != nil {
+        addr = net.JoinHostPort(ip.String(), "9")
+    } else {
+        if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+            addr = net.JoinHostPort(ip.String()+"%"+p.iface, "9")
+        } else {
+            addr = net.JoinHostPort(ip.String(), "9")
+        }
+    }
+
+    conn, err := net.DialTimeout("udp", addr, 1*time.Second)
+    if err == nil {
+        // High 1 Fix Enhancement: Actually send a packet to force kernel L2 resolution
+        // and trigger an ICMP Port Unreachable if the host is up.
+        _, _ = conn.Write([]byte{0})
+        _ = conn.Close()
+    }
 }
 
 func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
-	n := update.Neigh
+    n := update.Neigh
 
-	if p.targetIdx > 0 && n.LinkIndex != p.targetIdx {
-		return
-	}
+    p.mu.RLock()
+    idx := p.targetIdx
+    p.mu.RUnlock()
 
-	if n.HardwareAddr == nil || len(n.HardwareAddr) != 6 {
-		return
-	}
+    if idx > 0 && n.LinkIndex != idx {
+        return
+    }
 
-	if IsMulticastOrBroadcast(n.HardwareAddr, n.IP) {
-		return
-	}
+    if n.HardwareAddr == nil || len(n.HardwareAddr) != 6 {
+        return
+    }
 
-	isFailed := (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0
-	isOnline := !isFailed && (n.State&(unix.NUD_REACHABLE|unix.NUD_PERMANENT|unix.NUD_STALE|unix.NUD_DELAY|unix.NUD_PROBE|unix.NUD_NOARP)) != 0
+    if IsMulticastOrBroadcast(n.HardwareAddr, n.IP) {
+        return
+    }
 
-	if update.Type == unix.RTM_DELNEIGH {
-		isOnline = false
-	}
+    isFailed := (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0
+    isOnline := !isFailed && (n.State&(unix.NUD_REACHABLE|unix.NUD_PERMANENT|unix.NUD_STALE|unix.NUD_DELAY|unix.NUD_PROBE|unix.NUD_NOARP)) != 0
 
-	vendor := oui.Lookup(n.HardwareAddr.String())
+    if update.Type == unix.RTM_DELNEIGH {
+        isOnline = false
+    }
 
-obs := Observation{
-    Source:     p.Name(),
-    Group:      GroupA,
-    MAC:        n.HardwareAddr,
-    IP:         n.IP,
-    Vendor:     vendor,
-    Online:     isOnline,
-    Confidence: 0.95,
-    Timestamp:  time.Now(),
-}
+    vendor := oui.Lookup(n.HardwareAddr.String())
 
-	select {
-	case p.events <- obs:
-	default:
-		slog.Warn("Netlink observation channel full, dropping event", "mac", n.HardwareAddr.String())
-	}
+    obs := Observation{
+        Source:     p.Name(),
+        Group:      GroupA,
+        MAC:        n.HardwareAddr,
+        IP:         n.IP,
+        Vendor:     vendor,
+        Online:     isOnline,
+        Confidence: 0.95,
+        Timestamp:  time.Now(),
+    }
+
+    select {
+    case p.events <- obs:
+    default:
+        slog.Warn("Netlink observation channel full, dropping event", "mac", n.HardwareAddr.String())
+    }
 }
 
 func IsMulticastOrBroadcast(mac net.HardwareAddr, ip net.IP) bool {
-	if mac != nil && len(mac) == 6 {
-		if mac[0] == 0x01 && mac[1] == 0x00 && mac[2] == 0x5e {
-			return true
-		}
-		if mac[0] == 0x33 && mac[1] == 0x33 {
-			return true
-		}
-		if mac[0] == 0xff && mac[1] == 0xff && mac[2] == 0xff && mac[3] == 0xff && mac[4] == 0xff && mac[5] == 0xff {
-			return true
-		}
-	}
+    if mac != nil && len(mac) == 6 {
+        if mac[0] == 0x01 && mac[1] == 0x00 && mac[2] == 0x5e {
+            return true
+        }
+        if mac[0] == 0x33 && mac[1] == 0x33 {
+            return true
+        }
+        if mac[0] == 0xff && mac[1] == 0xff && mac[2] == 0xff && mac[3] == 0xff && mac[4] == 0xff && mac[5] == 0xff {
+            return true
+        }
+    }
 
-	if ip != nil {
-		if ip.IsMulticast() || ip.IsLoopback() || ip.IsUnspecified() || ip.Equal(net.IPv4bcast) {
-			return true
-		}
-	}
+    if ip != nil {
+        if ip.IsMulticast() || ip.IsLoopback() || ip.IsUnspecified() || ip.Equal(net.IPv4bcast) {
+            return true
+        }
+    }
 
-	return false
+    return false
 }
 
 func (p *NetlinkProvider) Stop() error {
-	if p.cancel != nil {
-		p.cancel()
-		<-p.done
-	}
-	return nil
+    if p.cancel != nil {
+        p.cancel()
+        <-p.done
+    }
+    return nil
 }
 
 func (p *NetlinkProvider) Events() <-chan Observation {
-	return p.events
+    return p.events
 }

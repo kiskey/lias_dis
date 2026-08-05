@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/ssdp_enricher.go
-// Version: 1.0
+// Version: 1.8 (Added Material Change Guard to Background Fetcher)
 package discovery
 
 import (
@@ -12,45 +12,64 @@ import (
     "log/slog"
     "net"
     "net/http"
+    "net/url"
     "strings"
+    "sync"
+    "syscall"
     "time"
 
+    "github.com/user/lias-dis/apps/discovery-service/internal/inventory"
     "github.com/user/lias-dis/shared/models"
+    "golang.org/x/sys/unix"
 )
 
-// SSDPEnricher uses native Go multicast UDP to discover UPnP devices.
-// It sends an M-SEARCH, listens for responses, and fetches the XML
-// descriptor at the LOCATION header.
-// See §3.5 for details.
+type EnrichmentTriggerer interface {
+    TriggerEnrichment(pdid string, force bool)
+}
+
 type SSDPEnricher struct {
-    ctx    context.Context
-    cancel context.CancelFunc
+    ctx       context.Context
+    cancel    context.CancelFunc
+    ifaceName string
+    cache     *inventory.Cache
+    trigger   EnrichmentTriggerer
+    bgQueue   chan string
+    wg        sync.WaitGroup
 }
 
-// NewSSDPEnricher initializes the enricher.
-func NewSSDPEnricher() *SSDPEnricher {
-    return &SSDPEnricher{}
+func NewSSDPEnricher(ifaceName string) *SSDPEnricher {
+    return &SSDPEnricher{
+        ifaceName: ifaceName,
+        bgQueue:   make(chan string, 64),
+    }
 }
 
-// Name returns the provider's identifier.
 func (e *SSDPEnricher) Name() string { return "ssdp" }
 
-// Start satisfies the Provider interface.
 func (e *SSDPEnricher) Start(ctx context.Context) error {
     e.ctx, e.cancel = context.WithCancel(ctx)
+    go e.runPassiveListener()
+    go e.runBackgroundFetcher()
     return nil
 }
 
-// Stop satisfies the Provider interface.
 func (e *SSDPEnricher) Stop() error {
     if e.cancel != nil {
         e.cancel()
     }
+    close(e.bgQueue)
+    e.wg.Wait()
     return nil
 }
 
-// Enrich broadcasts an SSDP M-SEARCH, waits for responses, and if a response
-// is received from the target device's IP, fetches and parses the XML descriptor.
+func (e *SSDPEnricher) SetCache(cache *inventory.Cache) {
+    e.cache = cache
+}
+
+func (e *SSDPEnricher) SetEnrichmentTriggerer(t EnrichmentTriggerer) {
+    e.trigger = t
+}
+
 func (e *SSDPEnricher) Enrich(ctx context.Context, d *models.Device) (*models.Enrichment, error) {
     if d == nil || d.CurrentIP == "" {
         return nil, fmt.Errorf("cannot enrich without IP")
@@ -58,10 +77,9 @@ func (e *SSDPEnricher) Enrich(ctx context.Context, d *models.Device) (*models.En
 
     location, err := e.searchSSDP(ctx, d.CurrentIP)
     if err != nil || location == "" {
-        return nil, nil // No SSDP response from this IP
+        return nil, nil
     }
 
-    // Fetch the device descriptor
     enr, err := e.fetchDescriptor(ctx, location)
     if err != nil {
         return nil, err
@@ -69,10 +87,8 @@ func (e *SSDPEnricher) Enrich(ctx context.Context, d *models.Device) (*models.En
     return enr, nil
 }
 
-// searchSSDP sends an M-SEARCH packet and waits for a response from the target IP.
 func (e *SSDPEnricher) searchSSDP(ctx context.Context, targetIP string) (string, error) {
-    // Set a short timeout for the multicast search
-    searchCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+    searchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
     defer cancel()
 
     addr, err := net.ResolveUDPAddr("udp4", "239.255.255.250:1900")
@@ -86,7 +102,6 @@ func (e *SSDPEnricher) searchSSDP(ctx context.Context, targetIP string) (string,
     }
     defer conn.Close()
 
-    // Set read deadline to match context
     deadline, _ := searchCtx.Deadline()
     _ = conn.SetReadDeadline(deadline)
 
@@ -105,12 +120,11 @@ func (e *SSDPEnricher) searchSSDP(ctx context.Context, targetIP string) (string,
         n, src, err := conn.ReadFrom(buf)
         if err != nil {
             if searchCtx.Err() != nil {
-                return "", nil // Timed out, no response
+                return "", nil
             }
             return "", err
         }
 
-        // Check if the response came from our target device
         if srcIP, ok := src.(*net.UDPAddr); ok && srcIP.IP.String() == targetIP {
             headers := string(buf[:n])
             return parseLocation(headers), nil
@@ -118,7 +132,120 @@ func (e *SSDPEnricher) searchSSDP(ctx context.Context, targetIP string) (string,
     }
 }
 
-// parseLocation extracts the LOCATION header value from an SSDP response.
+func (e *SSDPEnricher) runPassiveListener() {
+    addr, err := net.ResolveUDPAddr("udp4", "239.255.255.250:1900")
+    if err != nil {
+        slog.Error("Failed to resolve SSDP multicast addr", "error", err)
+        return
+    }
+
+    var iface *net.Interface
+    if e.ifaceName != "" {
+        iface, err = net.InterfaceByName(e.ifaceName)
+        if err != nil {
+            slog.Warn("Failed to find interface for SSDP multicast, binding to all", "iface", e.ifaceName, "error", err)
+        }
+    }
+
+    conn, err := net.ListenMulticastUDP("udp4", iface, addr)
+    if err != nil {
+        slog.Error("Failed to listen on SSDP multicast", "error", err)
+        return
+    }
+    defer conn.Close()
+
+    sc, err := conn.SyscallConn()
+    if err == nil {
+        _ = sc.Control(func(fd uintptr) {
+            _ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+        })
+    }
+
+    buf := make([]byte, 4096)
+    for {
+        select {
+        case <-e.ctx.Done():
+            return
+        default:
+        }
+
+        _ = conn.SetReadDeadline(time.Now().Add(1 * time.Minute))
+        n, src, err := conn.ReadFromUDP(buf)
+        if err != nil {
+            if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+                continue
+            }
+            if e.ctx.Err() != nil {
+                return
+            }
+            slog.Debug("SSDP passive read error", "error", err)
+            time.Sleep(1 * time.Second)
+            continue
+        }
+
+        headers := string(buf[:n])
+        if strings.HasPrefix(headers, "NOTIFY") {
+            loc := parseLocation(headers)
+            if loc != "" {
+                select {
+                case e.bgQueue <- loc:
+                default:
+                    slog.Debug("SSDP background queue full, dropping NOTIFY location", "src", src.IP)
+                }
+            }
+        }
+    }
+}
+
+func (e *SSDPEnricher) runBackgroundFetcher() {
+    e.wg.Add(1)
+    defer e.wg.Done()
+
+    // P1-FIX: Per-device last-triggered timestamp for rate limiting
+    var lastTrigger sync.Map
+
+    for loc := range e.bgQueue {
+        if e.cache == nil || e.trigger == nil {
+            continue
+        }
+
+        ip := extractIPFromURL(loc)
+        if ip == "" {
+            continue
+        }
+
+        // P1-FIX: Rate limit per-device triggers to once per 5 minutes
+        if last, ok := lastTrigger.Load(ip); ok {
+            if time.Since(last.(time.Time)) < 5*time.Minute {
+                continue
+            }
+        }
+        lastTrigger.Store(ip, time.Now())
+
+        dev := e.cache.GetByIP(ip)
+        if dev == nil {
+            continue
+        }
+
+        // P1-FIX: Skip if device is already fully identified
+        if dev.IsFullyIdentified || (dev.Vendor != "" && dev.DeviceType != "" && (dev.FriendlyName != "" || dev.Hostname != "")) {
+            continue
+        }
+
+        slog.Debug("Passive SSDP: Triggering enrichment for device", "ip", ip, "pdid", dev.PDID)
+        e.trigger.TriggerEnrichment(dev.PDID, false)
+    }
+}
+
+// Medium 1 Fix: Use net/url.Parse to safely extract Hostname
+func extractIPFromURL(rawURL string) string {
+    u, err := url.Parse(rawURL)
+    if err != nil {
+        return ""
+    }
+    return u.Hostname()
+}
+
 func parseLocation(headers string) string {
     lines := strings.Split(headers, "\r\n")
     for _, line := range lines {
@@ -129,7 +256,6 @@ func parseLocation(headers string) string {
     return ""
 }
 
-// fetchDescriptor downloads and parses the UPnP device descriptor XML.
 func (e *SSDPEnricher) fetchDescriptor(ctx context.Context, url string) (*models.Enrichment, error) {
     client := &http.Client{Timeout: 5 * time.Second}
     req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -148,8 +274,8 @@ func (e *SSDPEnricher) fetchDescriptor(ctx context.Context, url string) (*models
     }
 
     var dev struct {
-        XMLName     xml.Name `xml:"root"`
-        Device      struct {
+        XMLName xml.Name `xml:"root"`
+        Device  struct {
             FriendlyName string `xml:"friendlyName"`
             Manufacturer string `xml:"manufacturer"`
             ModelName    string `xml:"modelName"`
@@ -165,7 +291,7 @@ func (e *SSDPEnricher) fetchDescriptor(ctx context.Context, url string) (*models
 
     enr := &models.Enrichment{
         Source:       e.Name(),
-        Confidence:   0.8, // High confidence for device self-reporting
+        Confidence:   0.85,
         FriendlyName: dev.Device.FriendlyName,
         Manufacturer: dev.Device.Manufacturer,
         Model:        dev.Device.ModelName,
@@ -175,7 +301,6 @@ func (e *SSDPEnricher) fetchDescriptor(ctx context.Context, url string) (*models
         },
     }
     
-    // Infer device type from UPnP type
     if strings.Contains(dev.Device.DeviceType, "MediaRenderer") {
         enr.DeviceType = "tv"
     } else if strings.Contains(dev.Device.DeviceType, "MediaServer") {

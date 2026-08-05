@@ -1,7 +1,7 @@
 // Package inventory provides the in-memory device store for DIS.
 //
 // File:    apps/discovery-service/internal/inventory/cache.go
-// Version: 2.8
+// Version: 2.10 (Added TouchLastSeen for CPU-01)
 package inventory
 
 import (
@@ -73,13 +73,18 @@ func (c *Cache) AcquireHostname(canonicalHost, pdid string) HostnameAcquisitionR
 
     c.mu.Lock()
     ownerPDID, exists := c.hostnameOwners[canonicalHost]
+
     if !exists || ownerPDID == pdid {
-        c.hostnameOwners[canonicalHost] = pdid
-        listener := c.ownerListener
-        c.mu.Unlock()
-        if listener != nil {
-            listener(canonicalHost, pdid, false)
+        if !exists {
+            c.hostnameOwners[canonicalHost] = pdid
+            listener := c.ownerListener
+            c.mu.Unlock()
+            if listener != nil {
+                listener(canonicalHost, pdid, false)
+            }
+            return AcquireSuccess
         }
+        c.mu.Unlock()
         return AcquireSuccess
     }
 
@@ -244,7 +249,7 @@ func (c *Cache) RemoveIPIndex(ipStr string) {
             }
         }
         delete(c.ipIndex, cleanIP)
-        slog.Info("Invalidated stale IP index mapping", "ip", cleanIP, "pdid", d.PDID) // FIXED SYNTAX
+        slog.Info("Invalidated stale IP index mapping", "ip", cleanIP, "pdid", d.PDID)
     }
 }
 
@@ -292,7 +297,7 @@ func (c *Cache) SetCurrentMAC(pdid, macStr string) {
     }
 
     if oldDev, exists := c.macIndex[cleanMAC]; exists && oldDev.PDID != pdid {
-        slog.Warn("MAC index collision during SetCurrentMAC", "mac", cleanMAC, "old_pdid", oldDev.PDID, "new_pdid", pdid) // FIXED SYNTAX
+        slog.Warn("MAC index collision during SetCurrentMAC", "mac", cleanMAC, "old_pdid", oldDev.PDID, "new_pdid", pdid)
     }
 
     d.AddMAC(cleanMAC)
@@ -332,7 +337,7 @@ func (c *Cache) List() []models.Device {
     return list
 }
 
-// Gap 1 Fix Reinforcement: Clean up old indices strictly on Upsert
+// MATH-02 Fix: Clean up old indices strictly on Upsert based on the OLD cache entry
 func (c *Cache) Upsert(d *models.Device) {
     if d == nil || d.PDID == "" {
         return
@@ -342,12 +347,16 @@ func (c *Cache) Upsert(d *models.Device) {
     defer c.mu.Unlock()
 
     if old, exists := c.devices[d.PDID]; exists {
-        if oldMAC := NormalizeMAC(old.CurrentMAC); oldMAC != "" && oldMAC != NormalizeMAC(d.CurrentMAC) {
+        oldMAC := NormalizeMAC(old.CurrentMAC)
+        newMAC := NormalizeMAC(d.CurrentMAC)
+        if oldMAC != "" && oldMAC != newMAC {
             if idx, ok := c.macIndex[oldMAC]; ok && idx.PDID == d.PDID {
                 delete(c.macIndex, oldMAC)
             }
         }
-        if oldIP := strings.TrimSpace(old.CurrentIP); oldIP != "" && oldIP != strings.TrimSpace(d.CurrentIP) {
+        oldIP := strings.TrimSpace(old.CurrentIP)
+        newIP := strings.TrimSpace(d.CurrentIP)
+        if oldIP != "" && oldIP != newIP {
             if idx, ok := c.ipIndex[oldIP]; ok && idx.PDID == d.PDID {
                 delete(c.ipIndex, oldIP)
             }
@@ -363,6 +372,18 @@ func (c *Cache) Upsert(d *models.Device) {
 
     if cleanIP := strings.TrimSpace(d.CurrentIP); cleanIP != "" {
         c.ipIndex[cleanIP] = &devCopy
+    }
+}
+
+// CPU-01 Fix: Lightweight timestamp update that doesn't rebuild indices
+func (c *Cache) TouchLastSeen(pdid string, ts time.Time) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    if d, ok := c.devices[pdid]; ok {
+        d.LastSeen = ts
+        if d.FirstSeen.IsZero() {
+            d.FirstSeen = ts
+        }
     }
 }
 
@@ -420,7 +441,7 @@ func (c *Cache) purgeOffline() {
 
     for pdid, d := range c.devices {
         if !d.Online && now.Sub(d.LastSeen) > offlineTTL {
-            slog.Info("Purging offline device from cache", "pdid", pdid, "mac", d.CurrentMAC) // FIXED SYNTAX
+            slog.Info("Purging offline device from cache", "pdid", pdid, "mac", d.CurrentMAC)
             if cleanMAC := NormalizeMAC(d.CurrentMAC); cleanMAC != "" {
                 delete(c.macIndex, cleanMAC)
             }

@@ -2,7 +2,7 @@
 // the device inventory from the Discovery Intelligence Service (DIS).
 //
 // File:    apps/lias/internal/sync/cache.go
-// Version: 2.0
+// Version: 2.3 (Added PatchDeviceOnline for instant SSE updates)
 package sync
 
 import (
@@ -21,31 +21,31 @@ type LocalDevice struct {
 }
 
 type Cache struct {
-    mu         sync.Mutex
+    mu         sync.RWMutex // CPU-03 Fix: Use RWMutex
     devices    map[string]*LocalDevice
-    stickyTags map[string]string
-    stickyMACs map[string]string
+    stickyTags map[string][]string
+    stickyMACs map[string][]string
 }
 
 func NewCache() *Cache {
     return &Cache{
         devices:    make(map[string]*LocalDevice),
-        stickyTags: make(map[string]string),
-        stickyMACs: make(map[string]string),
+        stickyTags: make(map[string][]string),
+        stickyMACs: make(map[string][]string),
     }
 }
 
-func (c *Cache) LoadStickyTags(pdidTags, macTags map[string]string) {
+func (c *Cache) LoadStickyTags(pdidTags, macTags map[string][]string) {
     c.mu.Lock()
     defer c.mu.Unlock()
 
-    for pdid, tagID := range pdidTags {
-        c.stickyTags[pdid] = tagID
+    for pdid, tags := range pdidTags {
+        c.stickyTags[pdid] = tags
     }
-    for mac, tagID := range macTags {
+    for mac, tags := range macTags {
         cleanMAC := strings.ToLower(strings.TrimSpace(mac))
         if cleanMAC != "" {
-            c.stickyMACs[cleanMAC] = tagID
+            c.stickyMACs[cleanMAC] = tags
         }
     }
 
@@ -55,38 +55,28 @@ func (c *Cache) LoadStickyTags(pdidTags, macTags map[string]string) {
 }
 
 func (c *Cache) applyStickyTagLocked(d *LocalDevice) {
-    assignedTag := "generic"
+    if tags, found := c.stickyTags[d.PDID]; found && len(tags) > 0 {
+        d.Tags = tags
+        d.Device.Tags = tags
+        return
+    }
 
-    if tag, found := c.stickyTags[d.PDID]; found && tag != "" {
-        assignedTag = tag
-    } else {
-        for _, mac := range d.MACs {
-            cleanMAC := strings.ToLower(strings.TrimSpace(mac))
-            if macTag, found := c.stickyMACs[cleanMAC]; found && macTag != "" {
-                assignedTag = macTag
-                c.stickyTags[d.PDID] = assignedTag
-                break
-            }
+    for _, mac := range d.MACs {
+        cleanMAC := strings.ToLower(strings.TrimSpace(mac))
+        if macTags, found := c.stickyMACs[cleanMAC]; found && len(macTags) > 0 {
+            d.Tags = macTags
+            d.Device.Tags = macTags
+            c.stickyTags[d.PDID] = macTags
+            return
         }
     }
 
-    if assignedTag == "generic" {
-        if len(d.Tags) > 0 && d.Tags[0] != "" {
-            assignedTag = d.Tags[0]
-        } else if len(d.Device.Tags) > 0 && d.Device.Tags[0] != "" {
-            assignedTag = d.Device.Tags[0]
-        }
-    }
-
-    d.Tags = []string{assignedTag}
-    d.Device.Tags = []string{assignedTag}
-
-    if assignedTag != "generic" {
-        for _, mac := range d.MACs {
-            cleanMAC := strings.ToLower(strings.TrimSpace(mac))
-            if cleanMAC != "" {
-                c.stickyMACs[cleanMAC] = assignedTag
-            }
+    if len(d.Tags) == 0 {
+        if len(d.Device.Tags) > 0 {
+            d.Tags = d.Device.Tags
+        } else {
+            d.Tags = []string{"generic"}
+            d.Device.Tags = []string{"generic"}
         }
     }
 }
@@ -95,52 +85,43 @@ func (c *Cache) MigrateDeviceIdentity(oldPDID, newPDID string, migratedMACs []st
     c.mu.Lock()
     defer c.mu.Unlock()
 
-    if tag, found := c.stickyTags[oldPDID]; found {
-        c.stickyTags[newPDID] = tag
+    if tags, found := c.stickyTags[oldPDID]; found {
+        c.stickyTags[newPDID] = tags
         delete(c.stickyTags, oldPDID)
     }
 
     delete(c.devices, oldPDID)
 }
 
+// CPU-03 Fix: Get uses RLock and does not mutate the cache.
 func (c *Cache) Get(pdid string) *LocalDevice {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+    c.mu.RLock()
+    defer c.mu.RUnlock()
 
     d, ok := c.devices[pdid]
     if !ok {
         return nil
     }
     devCopy := *d
-    c.applyStickyTagLocked(&devCopy)
-    if ptr, exists := c.devices[pdid]; exists {
-        ptr.Tags = devCopy.Tags
-        ptr.Device.Tags = devCopy.Device.Tags
-    }
     return &devCopy
 }
 
+// CPU-03 Fix: List uses RLock and does not mutate the cache.
 func (c *Cache) List() []LocalDevice {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+    c.mu.RLock()
+    defer c.mu.RUnlock()
 
     list := make([]LocalDevice, 0, len(c.devices))
-    for pdid, d := range c.devices {
+    for _, d := range c.devices {
         devCopy := *d
-        c.applyStickyTagLocked(&devCopy)
-        if ptr, exists := c.devices[pdid]; exists {
-            ptr.Tags = devCopy.Tags
-            ptr.Device.Tags = devCopy.Device.Tags
-        }
         list = append(list, devCopy)
     }
     return list
 }
 
-// ListPDIDs returns a slice of all PDIDs currently in the cache.
 func (c *Cache) ListPDIDs() []string {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+    c.mu.RLock()
+    defer c.mu.RUnlock()
 
     list := make([]string, 0, len(c.devices))
     for pdid := range c.devices {
@@ -192,22 +173,21 @@ func (c *Cache) SetTags(pdid string, tags []string) {
     c.mu.Lock()
     defer c.mu.Unlock()
 
-    tagID := "generic"
-    if len(tags) > 0 && tags[0] != "" {
-        tagID = tags[0]
+    if len(tags) == 0 {
+        tags = []string{"generic"}
     }
 
-    c.stickyTags[pdid] = tagID
+    c.stickyTags[pdid] = tags
 
     if d, ok := c.devices[pdid]; ok {
         for _, mac := range d.MACs {
             cleanMAC := strings.ToLower(strings.TrimSpace(mac))
             if cleanMAC != "" {
-                c.stickyMACs[cleanMAC] = tagID
+                c.stickyMACs[cleanMAC] = tags
             }
         }
-        d.Tags = []string{tagID}
-        d.Device.Tags = []string{tagID}
+        d.Tags = tags
+        d.Device.Tags = tags
     }
 }
 
@@ -216,5 +196,19 @@ func (c *Cache) SetNextStateChange(pdid string, t *time.Time) {
     defer c.mu.Unlock()
     if d, ok := c.devices[pdid]; ok {
         d.NextStateChange = t
+    }
+}
+
+// V2.3 FIX: PatchDeviceOnline updates the online status of a device in the cache
+// without overwriting the rest of the device struct. This is used for instant SSE updates.
+func (c *Cache) PatchDeviceOnline(pdid string, online bool) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    
+    if d, ok := c.devices[pdid]; ok {
+        if d.Online != online {
+            d.Online = online
+            d.Device.Online = online
+        }
     }
 }

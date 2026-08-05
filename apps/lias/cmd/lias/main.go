@@ -1,7 +1,7 @@
 // Binary lias implements the LAN Internet Access Scheduler.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 2.3
+// Version: 2.5 (Verified Wiring)
 package main
 
 import (
@@ -18,6 +18,7 @@ import (
 
     liasAPI "github.com/user/lias-dis/apps/lias/internal/api"
     "github.com/user/lias-dis/apps/lias/internal/config"
+    "github.com/user/lias-dis/apps/lias/internal/metrics"
     "github.com/user/lias-dis/apps/lias/internal/nftables"
     "github.com/user/lias-dis/apps/lias/internal/policy"
     "github.com/user/lias-dis/apps/lias/internal/schedule"
@@ -66,15 +67,11 @@ func main() {
     cache := liasSync.NewCache()
     trigger := make(chan struct{}, 1)
 
-    // Initialize LIAS Real-Time SSE Broker for Web Dashboard clients on :8081
     broker := liasAPI.NewBroker()
     defer broker.Stop()
 
     tagMgr := tags.NewManager()
     polEng := policy.NewEngine()
-    
-    // FIX: Pass polEng and trigger to schedule.NewEngine to satisfy the new signature
-    // This fixes GAP-L-CR04 (NextStateChange computation) and GAP-L-H05 (Immediate sync trigger)
     schedEng := schedule.NewEngine(cache, polEng, trigger)
 
     var store *storage.Storage
@@ -88,7 +85,6 @@ func main() {
         store = st
     }
 
-    // Pass broker (satisfying sync.EventBroadcaster interface) and store (satisfying sync.StorageMigrator) to DISClient
     disClient := liasSync.NewDISClient(cfg.DIS, cache, trigger, broker, store)
 
     nftCtrl := nftables.NewController(cfg.Nftables)
@@ -107,15 +103,15 @@ func main() {
     go schedEng.Run(ctx)
     go nftSync.Run(ctx)
 
-    // Atomic initial resync guarantee on boot
     if err := builder.Sync(polEng, schedEng); err != nil {
         slog.Warn("Initial nftables sync warning", "error", err)
     }
 
     mux := http.NewServeMux()
-    // Pass broker handle to API handlers to serve GET /api/v1/events on :8081
     handlers := liasAPI.NewHandlers(cache, tagMgr, polEng, schedEng, nftCtrl, store, trigger, broker)
-    handlers.RegisterRoutes(mux)
+    handlers.RegisterRoutes(mux, cfg.HTTP.AuthToken)
+
+    metrics.RegisterHandler(mux, "/metrics")
 
     mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")

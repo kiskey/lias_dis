@@ -1,5 +1,5 @@
 // File:    shared/models/event.go
-// Version: 2.1
+// Version: 2.2
 package models
 
 import (
@@ -19,6 +19,7 @@ const (
     EventIPChanged          EventType = "device.ip_changed"
     EventMACChanged         EventType = "device.mac_changed"
     EventDeviceReidentified EventType = "device.reidentified"
+    EventSecurityAlert      EventType = "security.alert" // NEW: DIS-SEC-06
 )
 
 type Event struct {
@@ -48,8 +49,16 @@ type DeviceReidentifiedPayload struct {
     NewPDID          string    `json:"new_pdid"`
     Reason           string    `json:"reason"`
     MigratedTags     []string  `json:"migrated_tags,omitempty"`
-    MigratedMACs     []string  `json:"migrated_macs,omitempty"` // NEW: GAP-D08
+    MigratedMACs     []string  `json:"migrated_macs,omitempty"`
     Timestamp        time.Time `json:"timestamp"`
+}
+
+// SecurityAlertPayload represents a security anomaly detected by DIS.
+type SecurityAlertPayload struct {
+    AlertType string    `json:"alert_type"` // e.g. "mac_spoof_detected"
+    PDID      string    `json:"pdid"`
+    Details   string    `json:"details"`
+    Timestamp time.Time `json:"timestamp"`
 }
 
 func NewEvent(t EventType, deviceID string, payload interface{}) Event {

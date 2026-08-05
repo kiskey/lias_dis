@@ -1,7 +1,7 @@
 // Binary discovery-service implements the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 2.2
+// Version: 2.7 (Wired ValidationInterval to Orchestrator)
 package main
 
 import (
@@ -90,13 +90,19 @@ func main() {
 
     var providers []discovery.DiscoveryProvider
     if cfg.Discovery.Netlink.Enabled {
-        providers = append(providers, discovery.NewNetlinkProvider(cfg.Discovery.Interface))
+        p := discovery.NewNetlinkProvider(cfg.Discovery.Interface)
+        providers = append(providers, p)
+        defer p.Stop()
     }
     if cfg.Discovery.Pihole.Enabled {
-        providers = append(providers, discovery.NewPiholeProvider(cfg.Discovery.Pihole))
+        p := discovery.NewPiholeProvider(cfg.Discovery.Pihole)
+        providers = append(providers, p)
+        defer p.Stop()
     }
     if cfg.Discovery.DHCP.Enabled {
-        providers = append(providers, discovery.NewDHCPProvider(cfg.Discovery.DHCP))
+        p := discovery.NewDHCPProvider(cfg.Discovery.DHCP)
+        providers = append(providers, p)
+        defer p.Stop()
     }
 
     for _, p := range providers {
@@ -108,20 +114,31 @@ func main() {
     }
 
     var primaries []discovery.Enricher
+    var ssdpEnricher *discovery.SSDPEnricher
+    
     if cfg.Discovery.Enrichment.AvahiEnabled {
         e := discovery.NewAvahiEnricher()
         _ = e.Start(ctx)
         primaries = append(primaries, e)
+        defer e.Stop()
     }
     if cfg.Discovery.Enrichment.SSDPEnabled {
-        e := discovery.NewSSDPEnricher()
-        _ = e.Start(ctx)
-        primaries = append(primaries, e)
+        ssdpEnricher = discovery.NewSSDPEnricher(cfg.Discovery.Interface)
+        _ = ssdpEnricher.Start(ctx)
+        primaries = append(primaries, ssdpEnricher)
+        defer ssdpEnricher.Stop()
     }
     if cfg.Discovery.Enrichment.NetbiosEnabled {
         e := discovery.NewNetBIOSEnricher()
         _ = e.Start(ctx)
         primaries = append(primaries, e)
+        defer e.Stop()
+    }
+    if cfg.Discovery.Enrichment.TLSEnabled {
+        e := discovery.NewTLSFingerprinter()
+        _ = e.Start(ctx)
+        primaries = append(primaries, e)
+        defer e.Stop()
     }
 
     var fallback discovery.Enricher
@@ -129,19 +146,25 @@ func main() {
         e := discovery.NewNmapEnricher()
         _ = e.Start(ctx)
         fallback = e
+        defer e.Stop()
     }
 
-    orch := discovery.NewOrchestrator(cache, broker, primaries, fallback)
+    // P3-FIX: Pass ValidationInterval to Orchestrator
+    orch := discovery.NewOrchestrator(cache, broker, primaries, fallback, cfg.Discovery.Enrichment.ValidationInterval)
     eng.SetOrchestrator(orch)
     
-    // Wire the DeviceManager (Engine) to the Orchestrator
     orch.SetDeviceManager(eng)
+
+    if ssdpEnricher != nil {
+        ssdpEnricher.SetCache(cache)
+        ssdpEnricher.SetEnrichmentTriggerer(orch)
+    }
 
     eng.Run(ctx, providers)
 
     mux := http.NewServeMux()
     handlers := disAPI.NewHandlers(cache, broker, orch)
-    handlers.RegisterRoutes(mux)
+    handlers.RegisterRoutes(mux, cfg.HTTP.AuthToken)
 
     mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")
