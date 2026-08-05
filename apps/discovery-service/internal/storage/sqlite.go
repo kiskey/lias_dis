@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for DIS device state.
 //
 // File:    apps/discovery-service/internal/storage/sqlite.go
-// Version: 2.9 (Fixed Batch Save Transaction Corruption)
+// Version: 3.0 (Added Pending Events TTL Purge)
 package storage
 
 import (
@@ -68,8 +68,28 @@ func NewStorage(dbPath string) (*Storage, error) {
         slog.Warn("v1 to v2 PDID migration encountered an error", "error", err)
     }
 
+    // Technical Debt Fix: Start pending events retention loop
+    go s.pendingEventsRetentionLoop()
+
     slog.Info("DIS SQLite storage engine initialized", "path", dbPath)
     return s, nil
+}
+
+func (s *Storage) pendingEventsRetentionLoop() {
+    ticker := time.NewTicker(1 * time.Hour)
+    defer ticker.Stop()
+
+    for {
+        s.mu.Lock()
+        _, err := s.db.Exec("DELETE FROM pending_events WHERE last_seen < datetime('now', '-1 hour')")
+        s.mu.Unlock()
+
+        if err != nil {
+            slog.Warn("Failed to clean up old pending events", "error", err)
+        }
+
+        <-ticker.C
+    }
 }
 
 func (s *Storage) initSchema() error {
