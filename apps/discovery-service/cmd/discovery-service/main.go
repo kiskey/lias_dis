@@ -1,7 +1,7 @@
 // Binary discovery-service implements the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 2.5
+// Version: 2.6 (Added Graceful Shutdown for Providers)
 package main
 
 import (
@@ -90,13 +90,19 @@ func main() {
 
     var providers []discovery.DiscoveryProvider
     if cfg.Discovery.Netlink.Enabled {
-        providers = append(providers, discovery.NewNetlinkProvider(cfg.Discovery.Interface))
+        p := discovery.NewNetlinkProvider(cfg.Discovery.Interface)
+        providers = append(providers, p)
+        defer p.Stop() // Medium 4 Fix: Graceful shutdown
     }
     if cfg.Discovery.Pihole.Enabled {
-        providers = append(providers, discovery.NewPiholeProvider(cfg.Discovery.Pihole))
+        p := discovery.NewPiholeProvider(cfg.Discovery.Pihole)
+        providers = append(providers, p)
+        defer p.Stop()
     }
     if cfg.Discovery.DHCP.Enabled {
-        providers = append(providers, discovery.NewDHCPProvider(cfg.Discovery.DHCP))
+        p := discovery.NewDHCPProvider(cfg.Discovery.DHCP)
+        providers = append(providers, p)
+        defer p.Stop()
     }
 
     for _, p := range providers {
@@ -114,22 +120,25 @@ func main() {
         e := discovery.NewAvahiEnricher()
         _ = e.Start(ctx)
         primaries = append(primaries, e)
+        defer e.Stop() // Medium 4 Fix: Graceful shutdown
     }
     if cfg.Discovery.Enrichment.SSDPEnabled {
-        ssdpEnricher = discovery.NewSSDPEnricher(cfg.Discovery.Interface) // NET-05 Fix: Pass interface
+        ssdpEnricher = discovery.NewSSDPEnricher(cfg.Discovery.Interface)
         _ = ssdpEnricher.Start(ctx)
         primaries = append(primaries, ssdpEnricher)
+        defer ssdpEnricher.Stop()
     }
     if cfg.Discovery.Enrichment.NetbiosEnabled {
         e := discovery.NewNetBIOSEnricher()
         _ = e.Start(ctx)
         primaries = append(primaries, e)
+        defer e.Stop()
     }
-    // NET-01 & ENR-01 Fix: Wire the TLS Fingerprinter
     if cfg.Discovery.Enrichment.TLSEnabled {
         e := discovery.NewTLSFingerprinter()
         _ = e.Start(ctx)
         primaries = append(primaries, e)
+        defer e.Stop()
     }
 
     var fallback discovery.Enricher
@@ -137,6 +146,7 @@ func main() {
         e := discovery.NewNmapEnricher()
         _ = e.Start(ctx)
         fallback = e
+        defer e.Stop()
     }
 
     orch := discovery.NewOrchestrator(cache, broker, primaries, fallback)
