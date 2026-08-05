@@ -1,7 +1,7 @@
 // Binary discovery-service implements the Discovery Intelligence Service (DIS).
 //
 // File:    apps/discovery-service/cmd/discovery-service/main.go
-// Version: 2.6 (Added Graceful Shutdown for Providers)
+// Version: 2.7 (Wired ValidationInterval to Orchestrator)
 package main
 
 import (
@@ -92,7 +92,7 @@ func main() {
     if cfg.Discovery.Netlink.Enabled {
         p := discovery.NewNetlinkProvider(cfg.Discovery.Interface)
         providers = append(providers, p)
-        defer p.Stop() // Medium 4 Fix: Graceful shutdown
+        defer p.Stop()
     }
     if cfg.Discovery.Pihole.Enabled {
         p := discovery.NewPiholeProvider(cfg.Discovery.Pihole)
@@ -120,7 +120,7 @@ func main() {
         e := discovery.NewAvahiEnricher()
         _ = e.Start(ctx)
         primaries = append(primaries, e)
-        defer e.Stop() // Medium 4 Fix: Graceful shutdown
+        defer e.Stop()
     }
     if cfg.Discovery.Enrichment.SSDPEnabled {
         ssdpEnricher = discovery.NewSSDPEnricher(cfg.Discovery.Interface)
@@ -149,7 +149,8 @@ func main() {
         defer e.Stop()
     }
 
-    orch := discovery.NewOrchestrator(cache, broker, primaries, fallback)
+    // P3-FIX: Pass ValidationInterval to Orchestrator
+    orch := discovery.NewOrchestrator(cache, broker, primaries, fallback, cfg.Discovery.Enrichment.ValidationInterval)
     eng.SetOrchestrator(orch)
     
     orch.SetDeviceManager(eng)
