@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/netbios_enricher.go
-// Version: 1.2 (Verified Offsets)
+// Version: 1.3 (Hardened Bounds Checking)
 package discovery
 
 import (
@@ -109,7 +109,7 @@ func (e *NetBIOSEnricher) queryNodeStatus(ctx context.Context, ip string) ([]net
 
     req := make([]byte, 50)
     binary.BigEndian.PutUint16(req[0:2], 0x0001)     // TID
-    binary.BigEndian.PutUint16(req[2:4], 0x0000)     // MATH-04 Fix: Flags (Standard query)
+    binary.BigEndian.PutUint16(req[2:4], 0x0000)     // Flags (Standard query)
     binary.BigEndian.PutUint16(req[4:6], 1)          // Questions
     req[12] = 32                                     // Length of encoded name
     encodeNetBIOSName([]byte("*               \x00"), req[13:45])
@@ -139,8 +139,7 @@ func encodeNetBIOSName(name []byte, dst []byte) {
 }
 
 func parseNodeStatusResponse(data []byte) ([]netbiosName, error) {
-    // MATH-03 Fix: Corrected off-by-one parsing offsets.
-    // Header(12) + Name Len(1) + Encoded Name(32) + Null(1) + Type(2) + Class(2) + TTL(4) = 54
+    // Security 2 Fix: Strict bounds checking to prevent index out-of-bounds panics
     if len(data) < 57 {
         return nil, fmt.Errorf("packet too short")
     }
@@ -151,8 +150,13 @@ func parseNodeStatusResponse(data []byte) ([]netbiosName, error) {
     }
 
     numNames := int(data[56])
-    if 57+numNames*18 > len(data) {
-        return nil, fmt.Errorf("malformed netbios response")
+    if numNames == 0 {
+        return nil, nil
+    }
+
+    endOffset := 57 + numNames*18
+    if endOffset > len(data) {
+        return nil, fmt.Errorf("malformed netbios response: numNames exceeds packet bounds")
     }
 
     var names []netbiosName
