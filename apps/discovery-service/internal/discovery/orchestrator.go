@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/orchestrator.go
-// Version: 2.2
+// Version: 2.3 (Fixed Cooldown Bypass & Implemented Nmap Negative Cache)
 package discovery
 
 import (
@@ -19,6 +19,8 @@ import (
 
 const (
     enrichmentCooldown = 1 * time.Hour
+    nmapCooldownPeriod = 24 * time.Hour
+    maxNmapRetries     = 3
 )
 
 type DeviceManager interface {
@@ -27,27 +29,73 @@ type DeviceManager interface {
 }
 
 type Orchestrator struct {
-    cache          *inventory.Cache
-    broker         *disAPI.Broker
-    primaries      []Enricher
-    fallback       Enricher
-    activeLocks    sync.Map
-    lastAttemptMap sync.Map
-    nmapFailures   sync.Map // ENR-06 Fix: Track nmap failures to prevent aggressive retries
-    manager        DeviceManager
+    cache              *inventory.Cache
+    broker             *disAPI.Broker
+    primaries          []Enricher
+    fallback           Enricher
+    activeLocks        sync.Map
+    lastAttemptMap     sync.Map
+    manager            DeviceManager
+    validationInterval time.Duration
 }
 
-func NewOrchestrator(cache *inventory.Cache, broker *disAPI.Broker, primaries []Enricher, fallback Enricher) *Orchestrator {
-    return &Orchestrator{
-        cache:     cache,
-        broker:    broker,
-        primaries: primaries,
-        fallback:  fallback,
+func NewOrchestrator(cache *inventory.Cache, broker *disAPI.Broker, primaries []Enricher, fallback Enricher, validationInterval time.Duration) *Orchestrator {
+    o := &Orchestrator{
+        cache:              cache,
+        broker:             broker,
+        primaries:          primaries,
+        fallback:           fallback,
+        validationInterval: validationInterval,
     }
+    go o.cleanupLoop()
+    if validationInterval > 0 {
+        go o.runValidationSweep()
+    }
+    return o
 }
 
 func (o *Orchestrator) SetDeviceManager(m DeviceManager) {
     o.manager = m
+}
+
+// P3-FIX: Periodic cleanup of lastAttemptMap to prevent unbounded memory growth
+func (o *Orchestrator) cleanupLoop() {
+    ticker := time.NewTicker(10 * time.Minute)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ticker.C:
+            cutoff := time.Now().Add(-enrichmentCooldown * 2)
+            o.lastAttemptMap.Range(func(key, value any) bool {
+                if value.(time.Time).Before(cutoff) {
+                    o.lastAttemptMap.Delete(key)
+                }
+                return true
+            })
+        }
+    }
+}
+
+// P3-FIX: Periodic validation sweep to re-enrich all known devices
+func (o *Orchestrator) runValidationSweep() {
+    // Initial delay to avoid clashing with startup
+    time.Sleep(1 * time.Minute)
+    
+    ticker := time.NewTicker(o.validationInterval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ticker.C:
+            slog.Info("Starting periodic validation sweep for all devices")
+            devs := o.cache.List()
+            for _, d := range devs {
+                // Force enrichment to bypass cooldowns, but respect active locks
+                go o.TriggerEnrichment(d.PDID, true)
+            }
+        }
+    }
 }
 
 func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
@@ -60,14 +108,13 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
         return
     }
 
+    // P0-FIX: Cooldown applies to ALL devices, not just complete ones
     if !force {
         if lastAttempt, found := o.lastAttemptMap.Load(pdid); found {
             if time.Since(lastAttempt.(time.Time)) < enrichmentCooldown {
-                // MATH-05 Fix: Only skip if the device is already fully enriched.
-                // Incomplete devices must fall through and re-enrich.
-                if dev.Vendor != "" && dev.DeviceType != "" && dev.FriendlyName != "" {
-                    return
-                }
+                slog.Debug("Enrichment skipped due to cooldown", "pdid", pdid, 
+                    "remaining", enrichmentCooldown - time.Since(lastAttempt.(time.Time)))
+                return
             }
         }
     }
@@ -113,27 +160,36 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
         }
     }
 
-    // ENR-06 Fix: Check if nmap previously failed for this device before retrying
-    nmapFailedBefore := false
-    if v, ok := o.nmapFailures.Load(pdid); ok {
-        nmapFailedBefore = v.(bool)
-    }
-
-    if (!changed || dev.Vendor == "" || dev.DeviceType == "") && o.fallback != nil && !nmapFailedBefore {
-        slog.Info("Primary enrichment incomplete, executing Nmap fallback", "pdid", pdid)
+    nmapStateUpdated := false
+    shouldRunNmap := o.shouldRunNmap(dev, force)
+    if shouldRunNmap && o.fallback != nil {
+        slog.Info("Executing Nmap fallback", "pdid", pdid, "attempt", dev.NmapAttemptCount+1, "force", force)
+        
         ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
         res, err := o.fallback.Enrich(ctx, dev)
         cancel()
 
+        // Update nmap tracking fields regardless of success/failure
+        dev.LastNmapScanAt = time.Now()
+        dev.NmapAttemptCount++
+        nmapStateUpdated = true
+
         if err != nil {
-            slog.Debug("Fallback enricher failed", "enricher", o.fallback.Name(), "error", err)
-            o.nmapFailures.Store(pdid, true) // Mark as failed to prevent retry storm
+            slog.Debug("Nmap fallback failed or produced no results", "pdid", pdid, "attempt", dev.NmapAttemptCount, "error", err)
         } else if res != nil {
             changed = applyEnrichment(dev, res) || changed
+            if changed {
+                dev.NmapAttemptCount = 0 // Reset attempt count on success
+            }
         }
     }
 
-    if changed {
+    // Update fully identified flag
+    dev.IsFullyIdentified = dev.Vendor != "" && dev.DeviceType != "" && 
+        (dev.FriendlyName != "" || dev.Hostname != "")
+    dev.LastEnrichedAt = time.Now()
+
+    if changed || nmapStateUpdated {
         dev.Touch(time.Now())
         o.cache.Upsert(dev)
         
@@ -151,11 +207,42 @@ func (o *Orchestrator) TriggerEnrichment(pdid string, force bool) {
             o.manager.PersistDevice(finalDev.PDID)
         }
         
-        o.broker.Broadcast(models.NewEvent(models.EventFingerprintUpdated, finalDev.PDID, finalDev))
-        slog.Info("Enrichment pipeline completed with device updates", "pdid", finalDev.PDID, "type", finalDev.DeviceType, "vendor", finalDev.Vendor)
+        if changed {
+            o.broker.Broadcast(models.NewEvent(models.EventFingerprintUpdated, finalDev.PDID, finalDev))
+            slog.Info("Enrichment pipeline completed with device updates", "pdid", finalDev.PDID, "type", finalDev.DeviceType, "vendor", finalDev.Vendor)
+        } else {
+            slog.Debug("Enrichment state updated (negative cache persisted)", "pdid", pdid)
+        }
     } else {
         slog.Debug("Enrichment pipeline completed without new findings", "pdid", pdid)
     }
+}
+
+// P1-FIX: Proper Nmap gating with cooldown, retry limit, and completeness check
+func (o *Orchestrator) shouldRunNmap(d *models.Device, force bool) bool {
+    if force {
+        return true
+    }
+
+    // Rule 1: Already fully identified - never scan
+    if d.IsFullyIdentified {
+        return false
+    }
+    if d.Vendor != "" && d.DeviceType != "" && (d.FriendlyName != "" || d.Hostname != "") {
+        return false
+    }
+
+    // Rule 2: Max retries reached without new attributes
+    if d.NmapAttemptCount >= maxNmapRetries {
+        return false
+    }
+
+    // Rule 3: Enforce 24-hour cooldown between Nmap scans
+    if !d.LastNmapScanAt.IsZero() && time.Since(d.LastNmapScanAt) < nmapCooldownPeriod {
+        return false
+    }
+
+    return true
 }
 
 func isGenericHostname(host string) bool {
@@ -232,13 +319,12 @@ func applyEnrichment(dev *models.Device, enr *models.Enrichment) bool {
             shouldUpdate = true
         } else if isGenericHostname(dev.Hostname) && !isGenericHostname(enr.Hostname) {
             shouldUpdate = true
-        } else if sourceRank(enr.Source) > sourceRank(dev.SourceInfo["hostname"].Source) { // Safe because SourceInfo defaults to empty struct
+        } else if sourceRank(enr.Source) > sourceRank(dev.SourceInfo["hostname"].Source) {
             shouldUpdate = true
         }
 
         if shouldUpdate && dev.Hostname != enr.Hostname {
             dev.Hostname = enr.Hostname
-            // ENR-04 Fix: Populate SourceInfo for provenance tracking
             if dev.SourceInfo == nil {
                 dev.SourceInfo = make(map[string]models.SourceMeta)
             }
