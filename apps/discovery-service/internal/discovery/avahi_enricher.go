@@ -2,7 +2,7 @@
 // correlation logic for the Discovery Intelligence Service.
 //
 // File:    apps/discovery-service/internal/discovery/avahi_enricher.go
-// Version: 1.4 (Verified Persistent Listener)
+// Version: 1.5 (Fixed Memory Leak via Deduplication)
 package discovery
 
 import (
@@ -22,7 +22,7 @@ type AvahiEnricher struct {
     ctx     context.Context
     cancel  context.CancelFunc
     mu      sync.RWMutex
-    records map[string][]avahiRecord
+    records map[string]map[string]avahiRecord // High 3 Fix: Key by ServiceType to deduplicate
 }
 
 type avahiRecord struct {
@@ -30,11 +30,12 @@ type avahiRecord struct {
     Hostname     string
     ServiceType  string
     IP           string
+    Timestamp    time.Time
 }
 
 func NewAvahiEnricher() *AvahiEnricher {
     return &AvahiEnricher{
-        records: make(map[string][]avahiRecord),
+        records: make(map[string]map[string]avahiRecord),
     }
 }
 
@@ -53,7 +54,6 @@ func (e *AvahiEnricher) Stop() error {
     return nil
 }
 
-// ENR-05 Fix: Run a persistent avahi-browse in the background.
 func (e *AvahiEnricher) runPersistentListener() {
     for {
         select {
@@ -62,7 +62,6 @@ func (e *AvahiEnricher) runPersistentListener() {
         default:
         }
 
-        // -a: all services, -r: resolve, -p: parse-friendly, -k: keep alive
         cmd := exec.CommandContext(e.ctx, "avahi-browse", "-a", "-r", "-p", "-k")
         stdout, err := cmd.StdoutPipe()
         if err != nil {
@@ -90,14 +89,21 @@ func (e *AvahiEnricher) runPersistentListener() {
                 ServiceType:  parts[4],
                 Hostname:     normalizeDomain(parts[6]),
                 IP:           parts[7],
+                Timestamp:    time.Now(),
             }
 
             e.mu.Lock()
             if rec.IP != "" {
-                e.records[rec.IP] = append(e.records[rec.IP], rec)
+                if _, ok := e.records[rec.IP]; !ok {
+                    e.records[rec.IP] = make(map[string]avahiRecord)
+                }
+                e.records[rec.IP][rec.ServiceType] = rec
             }
             if rec.Hostname != "" {
-                e.records[rec.Hostname] = append(e.records[rec.Hostname], rec)
+                if _, ok := e.records[rec.Hostname]; !ok {
+                    e.records[rec.Hostname] = make(map[string]avahiRecord)
+                }
+                e.records[rec.Hostname][rec.ServiceType] = rec
             }
             e.mu.Unlock()
         }
@@ -125,12 +131,16 @@ func (e *AvahiEnricher) Enrich(ctx context.Context, d *models.Device) (*models.E
     e.mu.RLock()
     if targetIPStr != "" {
         if recs, ok := e.records[targetIPStr]; ok {
-            foundRecords = append(foundRecords, recs...)
+            for _, r := range recs {
+                foundRecords = append(foundRecords, r)
+            }
         }
     }
     if targetHostNormalized != "" {
         if recs, ok := e.records[targetHostNormalized]; ok {
-            foundRecords = append(foundRecords, recs...)
+            for _, r := range recs {
+                foundRecords = append(foundRecords, r)
+            }
         }
     }
     e.mu.RUnlock()
