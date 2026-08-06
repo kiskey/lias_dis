@@ -1,10 +1,11 @@
 // Package policy implements the rule evaluation engine for LIAS.
 //
 // File:    apps/lias/internal/policy/engine.go
-// Version: 2.5
+// Version: 2.6 (Added SweepExpired for Extend Access temporary policy lifecycle)
 package policy
 
 import (
+    "strings"
     "sync"
 
     liasSync "github.com/user/lias-dis/apps/lias/internal/sync"
@@ -130,9 +131,6 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
     }
 
     // 4. TAG-GROUP POLICIES (MATH-06 Fix: Fail-Closed OR Model)
-    // If ANY tag says BLOCK, return BLOCK immediately.
-    // If ANY tag says ALLOW, return ALLOW (overrides schedules).
-    // Otherwise, collect all schedule IDs and evaluate as a bundle.
     var hasAllowTag bool
     var tagSchedIDs []string
     for _, tagID := range d.Tags {
@@ -190,7 +188,8 @@ func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
     }
 }
 
-// EvaluateAction resolves final action for a device record using strict precedence hierarchy.
+// EvaluateAction resolves final action for a device record using strict
+// precedence hierarchy.
 func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvaluator) models.Action {
     if d == nil {
         return models.ActionAllow
@@ -272,4 +271,32 @@ func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvalu
     }
 
     return models.ActionAllow
+}
+
+// SweepExpired removes any policy whose ExpiresAt has passed, and returns
+// the IDs of any schedules that were privately owned by those policies
+// (so the caller can also delete them via schedEng). A schedule is
+// considered "privately owned" if its ID has the sched_pause_ or
+// sched_extend_ prefix — i.e. it was synthesized for exactly one
+// temporary policy and nothing else references it.
+//
+// This method is the single authoritative expiry code path for both
+// Pause Internet and Extend Access temporary policies. It must be called
+// on a periodic ticker (e.g. every 15 seconds) from the server main loop.
+func (e *Engine) SweepExpired(now time.Time) (expiredPolicyIDs []string, ownedScheduleIDs []string) {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+
+    for id, p := range e.policies {
+        if p.ExpiresAt != nil && now.After(*p.ExpiresAt) {
+            expiredPolicyIDs = append(expiredPolicyIDs, id)
+            for _, sid := range p.GetScheduleIDs() {
+                if strings.HasPrefix(sid, "sched_pause_") || strings.HasPrefix(sid, "sched_extend_") {
+                    ownedScheduleIDs = append(ownedScheduleIDs, sid)
+                }
+            }
+            delete(e.policies, id)
+        }
+    }
+    return
 }
