@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 4.0 (Added Extend Access UI, Minute Picker, Effective Status polling)
+// Version: 4.1 (Fixed Active Enforcements to accurately list all block/allow policies in effect)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -237,7 +237,7 @@ class App {
       const tz = schedule.timezone || 'UTC';
       const fmt = new Intl.DateTimeFormat('en-US', {
         timeZone: tz,
-        weekday: 'Short',
+        weekday: 'short',
         hour: '2-digit',
         minute: '2-digit',
         hour12: false
@@ -280,56 +280,113 @@ class App {
 
   renderActiveEnforcementsHtml() {
     const activeItems = [];
+    const now = new Date();
     const globalPol = this.policies.find(p => p.id === 'global_default');
     
-    if (globalPol && globalPol.action === 'block') {
-      activeItems.push({
-        policyName: 'Global Kill-Switch',
-        targetName: 'Entire Network',
-        targetColor: 'var(--danger)',
-        scheduleName: 'Vacation Mode / Block All',
-        action: 'block',
-        isGlobal: true
-      });
-    } else if (globalPol && globalPol.action === 'allow') {
-      activeItems.push({
-        policyName: 'Global Allow Override',
-        targetName: 'Entire Network',
-        targetColor: 'var(--success)',
-        scheduleName: 'Allow All Active',
-        action: 'allow',
-        isGlobal: true
-      });
-    } else {
-      this.policies.forEach(p => {
-        if (p.action === 'schedule' && p.type !== 'global' && p.enabled) {
-          const targetTag = this.tags.find(t => t.id === p.target_id);
-          const targetName = p.type === 'tag' 
-              ? (targetTag?.name || p.target_id) 
-              : (this.devices.find(d => d.pdid === p.target_id)?.hostname || p.target_id);
-          const targetColor = p.type === 'tag' 
-              ? (targetTag?.color || '#8e8e93') 
-              : '#8e8e93';
-
-          const scheds = this.resolvePolicySchedules(p);
+    // 1. Evaluate Global Switch
+    if (globalPol && globalPol.enabled) {
+      if (!globalPol.expires_at || new Date(globalPol.expires_at) > now) {
+        if (globalPol.action === 'block') {
+          activeItems.push({
+            policyName: 'Global Kill-Switch', targetName: 'Entire Network', targetColor: 'var(--danger)',
+            scheduleName: 'Vacation Mode / Block All', action: 'block', isGlobal: true, type: 'global'
+          });
+        } else if (globalPol.action === 'allow') {
+          activeItems.push({
+            policyName: 'Global Allow Override', targetName: 'Entire Network', targetColor: 'var(--success)',
+            scheduleName: 'Allow All Active', action: 'allow', isGlobal: true, type: 'global'
+          });
+        } else if (globalPol.action === 'schedule') {
+          const scheds = this.resolvePolicySchedules(globalPol);
+          let hasBlock = false, hasAllow = false, isDST = false;
           for (const s of scheds) {
-            const activeAction = this.getActiveScheduleAction(s);
-            if (activeAction) {
-              activeItems.push({
-                policyName: p.name,
-                targetName: targetName,
-                targetColor: targetColor,
-                scheduleName: s.name,
-                action: activeAction,
-                timezone: s.timezone,
-                isDST: this.isTimezoneInDST(s.timezone)
-              });
-              break;
-            }
+            const act = this.getActiveScheduleAction(s);
+            if (act === 'block') hasBlock = true;
+            if (act === 'allow') hasAllow = true;
+            if (this.isTimezoneInDST(s.timezone)) isDST = true;
+          }
+          if (hasBlock) {
+            activeItems.push({ policyName: 'Global Schedule', targetName: 'Entire Network', targetColor: 'var(--danger)', scheduleName: 'Scheduled Block Active', action: 'block', isGlobal: true, type: 'global', isDST });
+          } else if (hasAllow) {
+            activeItems.push({ policyName: 'Global Schedule', targetName: 'Entire Network', targetColor: 'var(--success)', scheduleName: 'Scheduled Allow Active', action: 'allow', isGlobal: true, type: 'global', isDST });
           }
         }
-      });
+      }
     }
+
+    // 2. Evaluate all other policies (Tags & Devices)
+    this.policies.forEach(p => {
+      if (!p.enabled || p.id === 'global_default') return;
+      // Filter out expired policies immediately on the client side
+      if (p.expires_at && new Date(p.expires_at) < now) return;
+      if (p.target_id === 'infrastructure') return; // Skip infra
+
+      let targetName = 'Unknown';
+      let targetColor = '#8e8e93';
+      let isDST = false;
+
+      if (p.type === 'tag') {
+        const tag = this.tags.find(t => t.id === p.target_id);
+        targetName = tag ? tag.name : p.target_id;
+        targetColor = tag ? tag.color : '#8e8e93';
+      } else if (p.type === 'device') {
+        const dev = this.devices.find(d => d.pdid === p.target_id);
+        targetName = dev ? (dev.friendly_name || dev.hostname || dev.pdid) : p.target_id;
+      }
+
+      let action = null;
+      let scheduleName = p.name;
+
+      if (p.action === 'schedule') {
+        const scheds = this.resolvePolicySchedules(p);
+        if (p.id.startsWith('pol_pause_')) {
+          action = 'block';
+          scheduleName = 'Paused Internet';
+        } else {
+          let hasBlock = false, hasAllow = false;
+          for (const s of scheds) {
+            const act = this.getActiveScheduleAction(s);
+            if (act === 'block') hasBlock = true;
+            if (act === 'allow') hasAllow = true;
+            if (this.isTimezoneInDST(s.timezone)) isDST = true;
+          }
+          if (hasBlock) action = 'block';
+          else if (hasAllow) action = 'allow';
+          
+          if (action === 'block') scheduleName += ' (Schedule Block)';
+          else if (action === 'allow') scheduleName += ' (Schedule Allow)';
+        }
+      } else if (p.action === 'block') {
+        action = 'block';
+        scheduleName += ' (Block Always)';
+      } else if (p.action === 'allow') {
+        action = 'allow';
+        if (p.id.startsWith('pol_extend_')) {
+          scheduleName = 'Extended Access';
+        } else {
+          scheduleName += ' (Allow Always)';
+        }
+      }
+
+      if (action) {
+        activeItems.push({
+          policyName: p.name,
+          targetName: targetName,
+          targetColor: targetColor,
+          scheduleName: scheduleName,
+          action: action,
+          isGlobal: false,
+          type: p.type,
+          isDST: isDST
+        });
+      }
+    });
+
+    // Sort items: Global -> Tag -> Device
+    activeItems.sort((a, b) => {
+      const typeOrder = { 'global': 0, 'tag': 1, 'device': 2 };
+      return typeOrder[a.type] - typeOrder[b.type];
+    });
 
     if (activeItems.length === 0) {
       return `
@@ -339,7 +396,7 @@ class App {
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
             </div>
             <div>
-              <h3 style="font-size: 16px; font-weight: 700; margin-bottom: 2px;">No Active Schedules</h3>
+              <h3 style="font-size: 16px; font-weight: 700; margin-bottom: 2px;">No Active Enforcements</h3>
               <p style="font-size: 13px; color: var(--text-secondary);">All devices are currently operating under their default policies.</p>
             </div>
           </div>
