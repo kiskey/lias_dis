@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/handlers.go
-// Version: 3.3 (Fixed missing base methods + Extend Access integration)
+// Version: 3.4 (Enforced Enabled state for global policy to fix hierarchy reset bug)
 package api
 
 import (
@@ -964,6 +964,12 @@ func (h *Handlers) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
         return
     }
     p.ID = id
+    
+    // V3.4 Fix: Strictly enforce enabled state for global policy to fix hierarchy reset bug
+    if p.ID == "global_default" {
+        p.Enabled = true
+    }
+
     if p.Type == models.PolicyTypeTag && p.TargetID == "infrastructure" {
         w.Header().Set("Content-Type", "application/json"); w.WriteHeader(http.StatusBadRequest)
         _ = json.NewEncoder(w).Encode(map[string]string{"error": "policy_immutable_target", "message": "The 'infrastructure' tag is super-immutable."})
