@@ -1,7 +1,5 @@
-// Package models defines canonical data structures shared between DIS and LIAS.
-//
 // File:    shared/models/event.go
-// Version: 2.3 (Added EventEffectiveStatusChanged for Extend Access feature)
+// Version: 2.3 (Added EventEffectiveStatusChanged; removed accidental reporting duplicates)
 package models
 
 import (
@@ -26,8 +24,7 @@ const (
 
     // EventEffectiveStatusChanged is fired whenever a device or tag's
     // effective policy status changes (e.g. temporary extension activated
-    // or expired, global switch toggled, schedule transition). The frontend
-    // should re-fetch /effective-status for the indicated target.
+    // or expired, global switch toggled, schedule transition).
     EventEffectiveStatusChanged EventType = "effective.status_changed"
 )
 
@@ -120,19 +117,4 @@ type EffectiveStatusChangedPayload struct {
     TargetType string    `json:"target_type"` // "device" | "tag"
     TargetID   string    `json:"target_id"`
     Timestamp  time.Time `json:"timestamp"`
-}
-
-// FlowLog is a single recorded policy decision used for analytics and
-// per-device activity history.
-type FlowLog struct {
-    PDID      string    `json:"pdid"`
-    Action    Action    `json:"action"`
-    Bytes     int64     `json:"bytes,omitempty"`
-    Timestamp time.Time `json:"timestamp"`
-}
-
-// NetworkStats is the aggregate analytics snapshot returned by /api/v1/stats.
-type NetworkStats struct {
-    BlockedEvents24h     int    `json:"blocked_events_24h"`
-    TopBlockedDevicePDID string `json:"top_blocked_device_pdid"`
 }
