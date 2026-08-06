@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 4.1 (Fixed Active Enforcements to accurately list all block/allow policies in effect)
+// Version: 4.2 (Fixed Global Switch toggle to strictly enforce policy hierarchy)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -520,7 +520,10 @@ class App {
           priority: 0
         };
 
+        // V4.2 Fix: Strictly enforce enabled state and action hierarchy
+        globalPol.enabled = true;
         globalPol.action = action;
+        
         try {
           await API.savePolicy(globalPol);
           this.showToast(`Global Switch set to: ${action.toUpperCase()}`);
