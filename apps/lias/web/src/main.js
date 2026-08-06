@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 3.8 (Moved Policy Toggle to Card, Removed from Wizard)
+// Version: 3.9 (Added Global Override Visibility to Active Enforcements)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -259,35 +259,58 @@ class App {
 
   renderActiveEnforcementsHtml() {
     const activeItems = [];
+    const globalPol = this.policies.find(p => p.id === 'global_default');
     
-    this.policies.forEach(p => {
-      if (p.action === 'schedule' && p.type !== 'global') {
-        const targetTag = this.tags.find(t => t.id === p.target_id);
-        const targetName = p.type === 'tag' 
-            ? (targetTag?.name || p.target_id) 
-            : (this.devices.find(d => d.pdid === p.target_id)?.hostname || p.target_id);
-        const targetColor = p.type === 'tag' 
-            ? (targetTag?.color || '#8e8e93') 
-            : '#8e8e93';
+    // 1. Evaluate Global Overrides (Block All / Allow All / Vacation Mode)
+    if (globalPol && globalPol.action === 'block') {
+      activeItems.push({
+        policyName: 'Global Kill-Switch',
+        targetName: 'Entire Network',
+        targetColor: 'var(--danger)',
+        scheduleName: 'Vacation Mode / Block All',
+        action: 'block',
+        isGlobal: true
+      });
+    } else if (globalPol && globalPol.action === 'allow') {
+      activeItems.push({
+        policyName: 'Global Allow Override',
+        targetName: 'Entire Network',
+        targetColor: 'var(--success)',
+        scheduleName: 'Allow All Active',
+        action: 'allow',
+        isGlobal: true
+      });
+    } else {
+      // 2. Evaluate Individual Schedules only if no global override is active
+      this.policies.forEach(p => {
+        if (p.action === 'schedule' && p.type !== 'global' && p.enabled) {
+          const targetTag = this.tags.find(t => t.id === p.target_id);
+          const targetName = p.type === 'tag' 
+              ? (targetTag?.name || p.target_id) 
+              : (this.devices.find(d => d.pdid === p.target_id)?.hostname || p.target_id);
+          const targetColor = p.type === 'tag' 
+              ? (targetTag?.color || '#8e8e93') 
+              : '#8e8e93';
 
-        const scheds = this.resolvePolicySchedules(p);
-        for (const s of scheds) {
-          const activeAction = this.getActiveScheduleAction(s);
-          if (activeAction) {
-            activeItems.push({
-              policyName: p.name,
-              targetName: targetName,
-              targetColor: targetColor,
-              scheduleName: s.name,
-              action: activeAction,
-              timezone: s.timezone,
-              isDST: this.isTimezoneInDST(s.timezone)
-            });
-            break; // One active schedule per policy is enough to show
+          const scheds = this.resolvePolicySchedules(p);
+          for (const s of scheds) {
+            const activeAction = this.getActiveScheduleAction(s);
+            if (activeAction) {
+              activeItems.push({
+                policyName: p.name,
+                targetName: targetName,
+                targetColor: targetColor,
+                scheduleName: s.name,
+                action: activeAction,
+                timezone: s.timezone,
+                isDST: this.isTimezoneInDST(s.timezone)
+              });
+              break; // One active schedule per policy is enough to show
+            }
           }
         }
-      }
-    });
+      });
+    }
 
     if (activeItems.length === 0) {
       return `
@@ -308,7 +331,7 @@ class App {
     return `
       <div class="active-enforcements-container">
         ${activeItems.map(item => `
-          <div class="live-activity-card ${item.action === 'block' ? 'is-blocking' : 'is-allowing'}">
+          <div class="live-activity-card ${item.action === 'block' ? 'is-blocking' : 'is-allowing'} ${item.isGlobal ? 'is-global' : ''}">
             <div class="live-activity-icon">
               ${item.action === 'block' 
                 ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line></svg>'
@@ -316,7 +339,7 @@ class App {
               }
             </div>
             <div class="live-activity-content">
-              <div class="live-activity-status">${item.action === 'block' ? 'Internet Blocked' : 'Internet Allowed'}</div>
+              <div class="live-activity-status">${item.isGlobal ? (item.action === 'block' ? 'Global Block Active' : 'Global Allow Active') : (item.action === 'block' ? 'Internet Blocked' : 'Internet Allowed')}</div>
               <div class="live-activity-details">
                 <span class="group-dot" style="background-color: ${item.targetColor};"></span>
                 <strong>${item.targetName}</strong> 
