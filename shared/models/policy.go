@@ -1,7 +1,7 @@
 // Package models defines canonical data structures shared between DIS and LIAS.
 //
 // File:    shared/models/policy.go
-// Version: 2.0 (Added ExpiresAt, ReasonTag, CreatedAt, UpdatedAt for Extend Access)
+// Version: 2.0 (Added ExpiresAt & ReasonTag for Extend Access; removed accidental schedule duplicates)
 package models
 
 import "time"
@@ -24,14 +24,6 @@ const (
     ActionSchedule Action = "schedule"
 )
 
-// ScheduleMode determines the default behavior outside a schedule's rules.
-type ScheduleMode string
-
-const (
-    ScheduleModeDowntime  ScheduleMode = "downtime"
-    ScheduleModeWhitelist ScheduleMode = "whitelist"
-)
-
 // Policy is the canonical policy rule exchanged between LIAS components.
 type Policy struct {
     ID          string     `json:"id"`
@@ -48,13 +40,11 @@ type Policy struct {
 
     // ExpiresAt, when set, marks this policy as temporary: it is honored
     // normally until ExpiresAt, then automatically removed on the next
-    // engine sweep tick. nil means "permanent" — all existing policies
-    // keep working unchanged. Used by Pause Internet and Extend Access.
+    // engine sweep tick. nil means "permanent". Used by Pause & Extend Access.
     ExpiresAt *time.Time `json:"expires_at,omitempty"`
 
     // ReasonTag is informational only (e.g. "pause", "extend_access") and
-    // lets the dashboard/app render provenance ("Extending access — 42m left")
-    // without recomputing it. Not used for any policy evaluation logic.
+    // lets the dashboard/app render provenance without recomputing it.
     ReasonTag string `json:"reason_tag,omitempty"`
 }
 
@@ -71,24 +61,4 @@ func (p Policy) GetScheduleIDs() []string {
         return []string{*p.ScheduleID}
     }
     return nil
-}
-
-// Schedule is a reusable time window bundle that can be attached to any
-// number of policies.
-type Schedule struct {
-    ID       string         `json:"id"`
-    Name     string         `json:"name"`
-    Mode     ScheduleMode   `json:"mode"`
-    Timezone string         `json:"timezone"`
-    Rules    []ScheduleRule `json:"rules"`
-}
-
-// ScheduleRule defines a single time window within a Schedule.
-type ScheduleRule struct {
-    Days      []string `json:"days"`
-    StartTime string   `json:"start_time"`
-    EndTime   string   `json:"end_time"`
-    Action    Action   `json:"action"`
-    StartDate string   `json:"start_date,omitempty"`
-    EndDate   string   `json:"end_date,omitempty"`
 }
