@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 3.3 (Added Explicit Online/Offline Text)
+// Version: 3.9 (Added Global Override Visibility to Active Enforcements)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -259,35 +259,58 @@ class App {
 
   renderActiveEnforcementsHtml() {
     const activeItems = [];
+    const globalPol = this.policies.find(p => p.id === 'global_default');
     
-    this.policies.forEach(p => {
-      if (p.action === 'schedule' && p.type !== 'global') {
-        const targetTag = this.tags.find(t => t.id === p.target_id);
-        const targetName = p.type === 'tag' 
-            ? (targetTag?.name || p.target_id) 
-            : (this.devices.find(d => d.pdid === p.target_id)?.hostname || p.target_id);
-        const targetColor = p.type === 'tag' 
-            ? (targetTag?.color || '#8e8e93') 
-            : '#8e8e93';
+    // 1. Evaluate Global Overrides (Block All / Allow All / Vacation Mode)
+    if (globalPol && globalPol.action === 'block') {
+      activeItems.push({
+        policyName: 'Global Kill-Switch',
+        targetName: 'Entire Network',
+        targetColor: 'var(--danger)',
+        scheduleName: 'Vacation Mode / Block All',
+        action: 'block',
+        isGlobal: true
+      });
+    } else if (globalPol && globalPol.action === 'allow') {
+      activeItems.push({
+        policyName: 'Global Allow Override',
+        targetName: 'Entire Network',
+        targetColor: 'var(--success)',
+        scheduleName: 'Allow All Active',
+        action: 'allow',
+        isGlobal: true
+      });
+    } else {
+      // 2. Evaluate Individual Schedules only if no global override is active
+      this.policies.forEach(p => {
+        if (p.action === 'schedule' && p.type !== 'global' && p.enabled) {
+          const targetTag = this.tags.find(t => t.id === p.target_id);
+          const targetName = p.type === 'tag' 
+              ? (targetTag?.name || p.target_id) 
+              : (this.devices.find(d => d.pdid === p.target_id)?.hostname || p.target_id);
+          const targetColor = p.type === 'tag' 
+              ? (targetTag?.color || '#8e8e93') 
+              : '#8e8e93';
 
-        const scheds = this.resolvePolicySchedules(p);
-        for (const s of scheds) {
-          const activeAction = this.getActiveScheduleAction(s);
-          if (activeAction) {
-            activeItems.push({
-              policyName: p.name,
-              targetName: targetName,
-              targetColor: targetColor,
-              scheduleName: s.name,
-              action: activeAction,
-              timezone: s.timezone,
-              isDST: this.isTimezoneInDST(s.timezone)
-            });
-            break; // One active schedule per policy is enough to show
+          const scheds = this.resolvePolicySchedules(p);
+          for (const s of scheds) {
+            const activeAction = this.getActiveScheduleAction(s);
+            if (activeAction) {
+              activeItems.push({
+                policyName: p.name,
+                targetName: targetName,
+                targetColor: targetColor,
+                scheduleName: s.name,
+                action: activeAction,
+                timezone: s.timezone,
+                isDST: this.isTimezoneInDST(s.timezone)
+              });
+              break; // One active schedule per policy is enough to show
+            }
           }
         }
-      }
-    });
+      });
+    }
 
     if (activeItems.length === 0) {
       return `
@@ -308,7 +331,7 @@ class App {
     return `
       <div class="active-enforcements-container">
         ${activeItems.map(item => `
-          <div class="live-activity-card ${item.action === 'block' ? 'is-blocking' : 'is-allowing'}">
+          <div class="live-activity-card ${item.action === 'block' ? 'is-blocking' : 'is-allowing'} ${item.isGlobal ? 'is-global' : ''}">
             <div class="live-activity-icon">
               ${item.action === 'block' 
                 ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line></svg>'
@@ -316,7 +339,7 @@ class App {
               }
             </div>
             <div class="live-activity-content">
-              <div class="live-activity-status">${item.action === 'block' ? 'Internet Blocked' : 'Internet Allowed'}</div>
+              <div class="live-activity-status">${item.isGlobal ? (item.action === 'block' ? 'Global Block Active' : 'Global Allow Active') : (item.action === 'block' ? 'Internet Blocked' : 'Internet Allowed')}</div>
               <div class="live-activity-details">
                 <span class="group-dot" style="background-color: ${item.targetColor};"></span>
                 <strong>${item.targetName}</strong> 
@@ -717,6 +740,11 @@ class App {
       <div style="display:flex; flex-direction:column; gap:16px;">
         ${this.policies.map(p => {
           const isInfra = p.target_id === 'infrastructure';
+          const isGlobal = p.id === 'global_default';
+          const isPaused = p.id.startsWith('pol_pause_');
+          const canCopy = !isGlobal && !isPaused && !isInfra;
+          const canToggle = !isGlobal && !isPaused && !isInfra;
+          
           const schedSummary = this.getScheduleSummary(p);
           const scheds = this.resolvePolicySchedules(p);
           
@@ -729,16 +757,27 @@ class App {
 
           return `
             <div class="card" style="margin-bottom:0;">
-              <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                <div>
-                  <div style="font-size:16px; font-weight:700;">${p.name} ${isInfra ? '🔒' : ''} ${!p.enabled ? '<span style="color:var(--text-secondary); font-size:12px;">(Disabled)</span>' : ''}</div>
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; gap: 16px;">
+                <div style="flex: 1;">
+                  <div style="font-size:16px; font-weight:700;">${p.name} ${isInfra ? '🔒' : ''} ${!p.enabled && canToggle ? '<span style="color:var(--text-secondary); font-size:12px;">(Disabled)</span>' : ''}</div>
                   <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
                     Scope: <strong style="text-transform:capitalize;">${p.type}</strong> | Target: <strong>${p.target_id || 'Global'}</strong> | Priority: <strong>${p.priority}</strong>
                   </div>
                 </div>
-                <div style="display:flex; gap:8px;">
-                  <button class="btn btn-secondary btn-edit-policy" data-id="${p.id}" ${isInfra ? 'disabled' : ''}>Edit</button>
-                  <button class="btn btn-danger btn-delete-policy" data-id="${p.id}">Delete</button>
+                <div style="display:flex; align-items:center; gap:16px; flex-shrink: 0;">
+                  ${canToggle ? `
+                    <div class="hig-toggle-row compact">
+                      <label class="hig-toggle-switch">
+                        <input type="checkbox" class="policy-enabled-toggle" data-id="${p.id}" ${p.enabled ? 'checked' : ''}>
+                        <span class="hig-slider"></span>
+                      </label>
+                    </div>
+                  ` : ''}
+                  <div style="display:flex; gap:8px; flex-wrap: wrap;">
+                    <button class="btn btn-secondary btn-edit-policy" data-id="${p.id}" ${isInfra ? 'disabled' : ''}>Edit</button>
+                    ${canCopy ? `<button class="btn btn-secondary btn-copy-policy" data-id="${p.id}">Copy</button>` : ''}
+                    <button class="btn btn-danger btn-delete-policy" data-id="${p.id}">Delete</button>
+                  </div>
                 </div>
               </div>
               ${isInfra ? `
@@ -772,6 +811,14 @@ class App {
       });
     });
 
+    document.querySelectorAll('.btn-copy-policy').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const id = e.currentTarget.dataset.id;
+        const p = this.policies.find(item => item.id === id);
+        if (p) this.openPolicyWizard(p, true);
+      });
+    });
+
     document.querySelectorAll('.btn-delete-policy').forEach(btn => {
       btn.addEventListener('click', (e) => {
         const id = e.currentTarget.dataset.id;
@@ -788,6 +835,26 @@ class App {
             this.showToast(`Failed to delete policy: ${err.message}`, 'danger');
           }
         });
+      });
+    });
+
+    // Bind Enable/Disable Toggles
+    document.querySelectorAll('.policy-enabled-toggle').forEach(toggle => {
+      toggle.addEventListener('change', async (e) => {
+        const id = e.currentTarget.dataset.id;
+        const enabled = e.currentTarget.checked;
+        const p = this.policies.find(item => item.id === id);
+        if (!p) return;
+
+        p.enabled = enabled;
+        try {
+          await API.savePolicy(p);
+          this.showToast(`Policy ${enabled ? 'enabled' : 'disabled'}`);
+          this.loadData(); // Reload to reflect the "(Disabled)" tag instantly
+        } catch (err) {
+          this.showToast(`Failed to update policy: ${err.message}`, 'danger');
+          e.currentTarget.checked = !enabled; // Revert UI on failure
+        }
       });
     });
 
@@ -874,7 +941,8 @@ class App {
                   Mode: <strong style="text-transform:uppercase;">${s.mode || 'downtime'}</strong> | Timezone: <strong>${s.timezone}</strong>
                 </div>
               </div>
-              <div style="display:flex; gap:8px;">
+              <div style="display:flex; gap:8px; flex-wrap: wrap;">
+                <button class="btn btn-secondary btn-copy-schedule" data-id="${s.id}">Copy</button>
                 <button class="btn btn-secondary btn-edit-schedule" data-id="${s.id}">Edit</button>
                 <button class="btn btn-danger btn-delete-schedule" data-id="${s.id}">Delete</button>
               </div>
@@ -895,6 +963,14 @@ class App {
         const id = e.currentTarget.dataset.id;
         const s = this.schedules.find(item => item.id === id);
         if (s) this.openScheduleModal(s);
+      });
+    });
+
+    document.querySelectorAll('.btn-copy-schedule').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const id = e.currentTarget.dataset.id;
+        const s = this.schedules.find(item => item.id === id);
+        if (s) this.openScheduleModal(s, true);
       });
     });
 
@@ -1062,7 +1138,7 @@ class App {
     return html;
   }
 
-  openPolicyWizard(existingPolicy = null) {
+  openPolicyWizard(existingPolicy = null, isCopy = false) {
     this.wizardState = {
       step: 1,
       policy: existingPolicy ? JSON.parse(JSON.stringify(existingPolicy)) : {
@@ -1071,9 +1147,15 @@ class App {
         target_id: '',
         action: 'schedule',
         schedule_ids: [],
-        priority: 50
+        priority: 50,
+        enabled: true
       }
     };
+
+    if (isCopy) {
+      this.wizardState.policy.id = '';
+      this.wizardState.policy.name = `Copy of ${this.wizardState.policy.name}`;
+    }
 
     if (!this.wizardState.policy.schedule_ids && this.wizardState.policy.schedule_id) {
       this.wizardState.policy.schedule_ids = [this.wizardState.policy.schedule_id];
@@ -1349,13 +1431,18 @@ class App {
     }
   }
 
-  openScheduleModal(existingSchedule = null) {
+  openScheduleModal(existingSchedule = null, isCopy = false) {
     const s = existingSchedule ? JSON.parse(JSON.stringify(existingSchedule)) : {
       name: '',
       mode: 'downtime',
       timezone: 'UTC',
       rules: [{ days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_time: '22:00', end_time: '06:00', action: 'block' }]
     };
+
+    if (isCopy) {
+      s.id = '';
+      s.name = `Copy of ${s.name}`;
+    }
 
     const bodyHtml = `
       <div style="display:flex; flex-direction:column; gap:16px;">
@@ -1403,33 +1490,45 @@ class App {
     const daysArr = (rule.days || []).map(d => d.toLowerCase().substring(0, 3));
     const isAllDay = rule.start_time === '00:00' && rule.end_time === '23:59';
 
+    // ── Infer the original selection mode ──
+    // To prevent ambiguity where a contiguous "Specific Days" selection (e.g., Mon, Tue, Wed)
+    // is incorrectly reconstructed as a "Continuous Day Range", we default to "Specific Days"
+    // for all loaded weekly rules. This accurately represents the underlying data and allows
+    // full editability without unexpected mode switching.
+    let inferredMode = 'range'; // Default for new rules
+    if (rule.start_date && rule.end_date) {
+      inferredMode = 'calendar';
+    } else if (daysArr.length > 0) {
+      inferredMode = 'specific';
+    }
+
     return `
       <div class="card rule-row" data-idx="${idx}" style="padding:12px; margin-bottom:0; background:var(--bg-tertiary);">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
           <strong style="font-size:12px;">Rule #${idx + 1}</strong>
           <div style="display:flex; gap:6px; align-items:center;">
             <select class="day-mode-select" style="font-size:11px; padding:4px 8px;">
-              <option value="range">Continuous Day Range</option>
-              <option value="specific">Specific Days</option>
-              <option value="calendar">Calendar Dates</option>
+              <option value="range" ${inferredMode === 'range' ? 'selected' : ''}>Continuous Day Range</option>
+              <option value="specific" ${inferredMode === 'specific' ? 'selected' : ''}>Specific Days</option>
+              <option value="calendar" ${inferredMode === 'calendar' ? 'selected' : ''}>Calendar Dates</option>
             </select>
             <button class="btn btn-danger btn-remove-rule" data-idx="${idx}" style="padding:4px 8px; font-size:11px;">Remove</button>
           </div>
         </div>
         
         <div class="rule-mode-container" style="display:flex; flex-direction:column; gap:8px;">
-          <div class="day-range-picker" style="display:flex; gap:8px; align-items:center;">
+          <div class="day-range-picker" style="display:${inferredMode === 'range' ? 'flex' : 'none'}; gap:8px; align-items:center;">
             <label style="font-size:11px; font-weight:700;">From:</label>
             <select class="range-from" style="flex:1; font-size:12px; padding:6px;">${['mon','tue','wed','thu','fri','sat','sun'].map(d => `<option value="${d}" ${daysArr[0] === d ? 'selected' : ''}>${d.toUpperCase()}</option>`).join('')}</select>
             <label style="font-size:11px; font-weight:700;">To:</label>
             <select class="range-to" style="flex:1; font-size:12px; padding:6px;">${['mon','tue','wed','thu','fri','sat','sun'].map(d => `<option value="${d}" ${daysArr[daysArr.length - 1] === d ? 'selected' : ''}>${d.toUpperCase()}</option>`).join('')}</select>
           </div>
 
-          <div class="day-chip-group specific-days-picker" style="display:none; flex-wrap:wrap; gap:4px;">
+          <div class="day-chip-group specific-days-picker" style="display:${inferredMode === 'specific' ? 'flex' : 'none'}; flex-wrap:wrap; gap:4px;">
             ${['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'].map(day => `<div class="day-chip ${daysArr.includes(day) ? 'selected' : ''}" data-day="${day}">${day.toUpperCase()}</div>`).join('')}
           </div>
 
-          <div class="calendar-picker" style="display:none; gap:8px; align-items:center;">
+          <div class="calendar-picker" style="display:${inferredMode === 'calendar' ? 'flex' : 'none'}; gap:8px; align-items:center;">
             <label style="font-size:11px; font-weight:700;">Start Date:</label>
             <input type="date" class="rule-start-date" value="${rule.start_date || ''}" style="flex:1; font-size:12px; padding:6px;">
             <label style="font-size:11px; font-weight:700;">End Date:</label>
@@ -1460,107 +1559,136 @@ class App {
   }
 
   bindScheduleModalEvents(s) {
+    // ── Cancel button: single binding ──
     document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
 
-    // LIAS-SCH-09 Fix: Handle mode switching (Range/Specific/Calendar)
-    document.querySelectorAll('.day-mode-select').forEach(sel => {
-      sel.addEventListener('change', (e) => {
-        const row = e.target.closest('.rule-row');
-        const mode = e.target.value;
-        row.querySelector('.day-range-picker').style.display = mode === 'range' ? 'flex' : 'none';
-        row.querySelector('.specific-days-picker').style.display = mode === 'specific' ? 'flex' : 'none';
-        row.querySelector('.calendar-picker').style.display = mode === 'calendar' ? 'flex' : 'none';
-      });
-      // Trigger initial state if dates exist
-      const row = sel.closest('.rule-row');
-      if (row.querySelector('.rule-start-date').value) {
-        sel.value = 'calendar';
-        sel.dispatchEvent(new Event('change'));
-      }
-    });
-
-    document.querySelectorAll('.day-chip').forEach(chip => chip.addEventListener('click', (e) => e.currentTarget.classList.toggle('selected')));
-    
-    document.querySelectorAll('.rule-start, .rule-end').forEach(input => {
-      input.addEventListener('change', () => {
-        const row = input.closest('.rule-row');
-        const start = row.querySelector('.rule-start').value;
-        const end = row.querySelector('.rule-end').value;
-        const container = row.querySelector('.overnight-container');
-        const allDayChk = row.querySelector('.rule-all-day');
-        if (allDayChk && allDayChk.checked) return;
-        if (start && end && end <= start) {
-          container.innerHTML = `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${this.formatTimeTo12hr(end)} the FOLLOWING day</div>`;
-        } else {
-          container.innerHTML = '';
-        }
-      });
-    });
-
-    document.querySelectorAll('.rule-all-day').forEach(chk => {
-      chk.addEventListener('change', (e) => {
-        const row = e.target.closest('.rule-row');
-        const startInput = row.querySelector('.rule-start');
-        const endInput = row.querySelector('.rule-end');
-        const overnightContainer = row.querySelector('.overnight-container');
-        if (e.target.checked) {
-          startInput.value = '00:00'; endInput.value = '23:59';
-          startInput.disabled = true; endInput.disabled = true; overnightContainer.innerHTML = '';
-        } else { startInput.disabled = false; endInput.disabled = false; }
-      });
-    });
-
-    const addRuleBtn = document.getElementById('btn-add-rule');
-    if (addRuleBtn) {
-      addRuleBtn.addEventListener('click', () => {
-        const container = document.getElementById('sched-rules-container');
-        const newIdx = container.children.length;
-        const newRuleHtml = this.renderScheduleRuleRow({
-          days: ['mon', 'tue', 'wed', 'thu', 'fri'],
-          start_time: '22:00',
-          end_time: '06:00',
-          action: 'block'
-        }, newIdx);
-        container.insertAdjacentHTML('beforeend', newRuleHtml);
-        this.bindScheduleModalEvents(s);
-      });
-    }
-
-    document.querySelectorAll('.btn-remove-rule').forEach(btn => btn.addEventListener('click', (e) => e.currentTarget.closest('.rule-row').remove()));
-    
+    // ── Save button: single binding, reads LIVE DOM state ──
     document.getElementById('modal-save-sched').addEventListener('click', async () => {
       const name = document.getElementById('sched-name').value.trim();
       if (!name) { this.showToast('Schedule name is required', 'danger'); return; }
       const mode = document.getElementById('sched-mode').value;
       const timezone = document.getElementById('sched-tz').value;
       const rules = [];
-      document.querySelectorAll('.rule-row').forEach(row => {
+
+      // Read ONLY currently-existing rule rows from the DOM
+      document.querySelectorAll('#sched-rules-container .rule-row').forEach(row => {
         const start = row.querySelector('.rule-start').value;
         const end = row.querySelector('.rule-end').value;
         const action = row.querySelector('.rule-action').value;
         const modeSelect = row.querySelector('.day-mode-select').value;
-        
+
         let days = [];
         let startDate = '';
         let endDate = '';
 
         if (modeSelect === 'calendar') {
-            startDate = row.querySelector('.rule-start-date').value;
-            endDate = row.querySelector('.rule-end-date').value;
-            days = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']; // Dummy days to pass validation
+          startDate = row.querySelector('.rule-start-date').value;
+          endDate = row.querySelector('.rule-end-date').value;
+          days = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
         } else if (modeSelect === 'range') {
-            days = expandDayRange(row.querySelector('.range-from').value, row.querySelector('.range-to').value);
+          days = expandDayRange(row.querySelector('.range-from').value, row.querySelector('.range-to').value);
         } else {
-            days = Array.from(row.querySelectorAll('.day-chip.selected')).map(c => c.dataset.day);
+          days = Array.from(row.querySelectorAll('.day-chip.selected')).map(c => c.dataset.day);
         }
 
+        // Only persist rules with valid, confirmed data
         if (start && end && (days.length > 0 || (startDate && endDate))) {
-            rules.push({ days, start_time: start, end_time: end, action, start_date: startDate, end_date: endDate });
+          rules.push({ days, start_time: start, end_time: end, action, start_date: startDate, end_date: endDate });
         }
       });
-      s.name = name; s.mode = mode; s.timezone = timezone; s.rules = rules;
-      try { await API.saveSchedule(s); this.showToast('Schedule saved successfully'); this.closeModal(); this.loadData(); }
-      catch (err) { this.showToast(`Failed to save schedule: ${err.message}`, 'danger'); }
+
+      // Preserve schedule ID for updates (prevents duplicate creation)
+      const scheduleData = { id: s.id, name, mode, timezone, rules };
+
+      try {
+        await API.saveSchedule(scheduleData);
+        this.showToast('Schedule saved successfully');
+        this.closeModal();
+        this.loadData();
+      } catch (err) {
+        this.showToast(`Failed to save schedule: ${err.message}`, 'danger');
+      }
+    });
+
+    // ── Add Rule button: single binding, NO re-bind call ──
+    document.getElementById('btn-add-rule').addEventListener('click', () => {
+      const container = document.getElementById('sched-rules-container');
+      const newIdx = container.children.length;
+      const newRuleHtml = this.renderScheduleRuleRow({
+        days: ['mon', 'tue', 'wed', 'thu', 'fri'],
+        start_time: '22:00',
+        end_time: '06:00',
+        action: 'block'
+      }, newIdx);
+      container.insertAdjacentHTML('beforeend', newRuleHtml);
+      // NOTE: No call to bindScheduleModalEvents — delegation handles new elements
+    });
+
+    // ── Event Delegation on rules container (handles ALL rules, existing + future) ──
+    const rulesContainer = document.getElementById('sched-rules-container');
+
+    // Delegated 'change' listener: day-mode, time inputs, all-day checkbox
+    rulesContainer.addEventListener('change', (e) => {
+      // Day mode selector
+      if (e.target.classList.contains('day-mode-select')) {
+        const row = e.target.closest('.rule-row');
+        const mode = e.target.value;
+        row.querySelector('.day-range-picker').style.display = mode === 'range' ? 'flex' : 'none';
+        row.querySelector('.specific-days-picker').style.display = mode === 'specific' ? 'flex' : 'none';
+        row.querySelector('.calendar-picker').style.display = mode === 'calendar' ? 'flex' : 'none';
+      }
+
+      // Time input changes → overnight indicator
+      if (e.target.classList.contains('rule-start') || e.target.classList.contains('rule-end')) {
+        const row = e.target.closest('.rule-row');
+        const start = row.querySelector('.rule-start').value;
+        const end = row.querySelector('.rule-end').value;
+        const overnightContainer = row.querySelector('.overnight-container');
+        const allDayChk = row.querySelector('.rule-all-day');
+        if (allDayChk && allDayChk.checked) return;
+        if (start && end && end <= start) {
+          overnightContainer.innerHTML = `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${this.formatTimeTo12hr(end)} the FOLLOWING day</div>`;
+        } else {
+          overnightContainer.innerHTML = '';
+        }
+      }
+
+      // All-day checkbox
+      if (e.target.classList.contains('rule-all-day')) {
+        const row = e.target.closest('.rule-row');
+        const startInput = row.querySelector('.rule-start');
+        const endInput = row.querySelector('.rule-end');
+        const overnightContainer = row.querySelector('.overnight-container');
+        if (e.target.checked) {
+          startInput.value = '00:00'; endInput.value = '23:59';
+          startInput.disabled = true; endInput.disabled = true;
+          if (overnightContainer) overnightContainer.innerHTML = '';
+        } else {
+          startInput.disabled = false; endInput.disabled = false;
+        }
+      }
+    });
+
+    // Delegated 'click' listener: day chips, remove buttons
+    rulesContainer.addEventListener('click', (e) => {
+      // Day chip toggle
+      if (e.target.classList.contains('day-chip')) {
+        e.target.classList.toggle('selected');
+      }
+      // Remove rule button
+      if (e.target.classList.contains('btn-remove-rule')) {
+        e.target.closest('.rule-row').remove();
+        this.updateRuleIndices();
+      }
+    });
+  }
+
+  // ── New method: renumber rule labels after add/remove ──
+  updateRuleIndices() {
+    document.querySelectorAll('#sched-rules-container .rule-row').forEach((row, idx) => {
+      const label = row.querySelector('strong');
+      if (label) label.textContent = `Rule #${idx + 1}`;
+      row.dataset.idx = idx;
     });
   }
 
@@ -1593,7 +1721,6 @@ class App {
   }
 
   renderSettingsView(container) {
-    // Fix 3: Rewrote Vacation Mode Toggle HTML/CSS to be strictly HIG compliant and clickable
     container.innerHTML = `
       <div class="card">
         <h3>System Maintenance</h3>
@@ -1613,69 +1740,6 @@ class App {
           </div>
         </div>
       </div>
-      <style>
-        .hig-toggle-row {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          padding: 16px;
-          background: var(--bg-tertiary);
-          border-radius: 12px;
-        }
-        .hig-toggle-text strong {
-          font-size: 15px;
-          font-weight: 600;
-          color: var(--text-primary);
-          display: block;
-        }
-        .hig-toggle-text p {
-          font-size: 13px;
-          color: var(--text-secondary);
-          margin-top: 4px;
-        }
-        .hig-toggle-switch {
-          position: relative;
-          display: inline-block;
-          width: 51px;
-          height: 31px;
-          flex-shrink: 0;
-          cursor: pointer;
-        }
-        .hig-toggle-switch input {
-          opacity: 0;
-          width: 0;
-          height: 0;
-        }
-        .hig-slider {
-          position: absolute;
-          cursor: pointer;
-          top: 0;
-          left: 0;
-          right: 0;
-          bottom: 0;
-          background-color: #e9e9ea; /* Default Apple Gray for OFF */
-          transition: .4s;
-          border-radius: 31px;
-        }
-        .hig-slider:before {
-          position: absolute;
-          content: "";
-          height: 27px;
-          width: 27px;
-          left: 2px;
-          bottom: 2px;
-          background-color: white;
-          transition: .4s;
-          border-radius: 50%;
-          box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-        }
-        input:checked + .hig-slider {
-          background-color: #34c759; /* Apple Green for ON */
-        }
-        input:checked + .hig-slider:before {
-          transform: translateX(20px);
-        }
-      </style>
     `;
 
     document.getElementById('btn-flush-nft').addEventListener('click', () => {
@@ -1688,7 +1752,6 @@ class App {
     const vacChk = document.getElementById('chk-vacation');
     const globalPol = this.policies.find(p => p.id === 'global_default');
     
-    // Fix 3: Explicitly set initial state
     if (globalPol && globalPol.action === 'block') {
       vacChk.checked = true;
     } else {
@@ -1700,14 +1763,12 @@ class App {
         await API.toggleVacationMode(e.target.checked); 
         this.showToast(`Vacation Mode ${e.target.checked ? 'Enabled' : 'Disabled'}`); 
         
-        // Fix 3: Update local state immediately to prevent UI flicker, then delay reload
         if (globalPol) {
           globalPol.action = e.target.checked ? 'block' : 'schedule';
         } else {
           this.policies.push({ id: 'global_default', action: e.target.checked ? 'block' : 'schedule' });
         }
         
-        // Delay loadData to allow the toggle animation to complete smoothly
         setTimeout(() => this.loadData(), 300);
       } 
       catch (err) { 
