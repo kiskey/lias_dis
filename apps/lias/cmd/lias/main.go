@@ -1,7 +1,7 @@
 // Binary lias implements the LAN Internet Access Scheduler.
 //
 // File:    apps/lias/cmd/lias/main.go
-// Version: 2.5 (Verified Wiring)
+// Version: 2.6 (Added 15s sweep loop for temporary policies)
 package main
 
 import (
@@ -102,6 +102,44 @@ func main() {
     go disClient.Run(ctx)
     go schedEng.Run(ctx)
     go nftSync.Run(ctx)
+
+    // Temporary Policy Sweep Loop (Pause & Extend Access)
+    // Checks every 15 seconds for expired temporary policies and cleans them up.
+    go func() {
+        ticker := time.NewTicker(15 * time.Second)
+        defer ticker.Stop()
+        for range ticker.C {
+            expiredPolicies, ownedScheds := polEng.SweepExpired(time.Now())
+            if len(expiredPolicies) == 0 {
+                continue
+            }
+            for _, id := range expiredPolicies {
+                if store != nil {
+                    _ = store.DeletePolicy(id)
+                }
+                // Broadcast SSE update for the affected target
+                if strings.HasPrefix(id, "pol_extend_device_") || strings.HasPrefix(id, "pol_pause_") {
+                    pdid := strings.TrimPrefix(id, "pol_extend_device_")
+                    pdid = strings.TrimPrefix(pdid, "pol_pause_")
+                    broker.BroadcastEffectiveStatusChanged("device", pdid)
+                } else if strings.HasPrefix(id, "pol_extend_tag_") {
+                    tagID := strings.TrimPrefix(id, "pol_extend_tag_")
+                    broker.BroadcastEffectiveStatusChanged("tag", tagID)
+                }
+            }
+            for _, sid := range ownedScheds {
+                schedEng.DeleteSchedule(sid)
+                if store != nil {
+                    _ = store.DeleteSchedule(sid)
+                }
+            }
+            slog.Info("Swept expired temporary policies", "count", len(expiredPolicies))
+            select {
+            case trigger <- struct{}{}:
+            default:
+            }
+        }
+    }()
 
     if err := builder.Sync(polEng, schedEng); err != nil {
         slog.Warn("Initial nftables sync warning", "error", err)

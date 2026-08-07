@@ -1,7 +1,7 @@
 /**
  * LIAS REST API Client & Real-time EventSource Subscriber
  * File:    apps/lias/web/src/api.js
- * Version: 2.4 (Fixed Error Message Overwrite and Tag Payload)
+ * Version: 2.5 (Added Extend Access & Effective Status endpoints)
  */
 
 export const API = {
@@ -104,6 +104,24 @@ export const API = {
         });
     },
 
+    // --- EXTEND ACCESS (DEVICE) ---
+    async extendDeviceAccess(pdid, minutes) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/extend`, {
+            method: 'POST',
+            body: JSON.stringify({ minutes })
+        });
+    },
+
+    async cancelDeviceExtension(pdid) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/extend`, {
+            method: 'DELETE'
+        });
+    },
+
+    async getDeviceEffectiveStatus(pdid) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/effective-status`);
+    },
+
     // --- TAG ENDPOINTS ---
     async getTags() {
         return await this.request('/api/v1/tags');
@@ -129,6 +147,24 @@ export const API = {
         return await this.request(`/api/v1/tags/${encodeURIComponent(id)}`, {
             method: 'DELETE'
         });
+    },
+
+    // --- EXTEND ACCESS (TAG) ---
+    async extendTagAccess(tagId, minutes) {
+        return await this.request(`/api/v1/tags/${encodeURIComponent(tagId)}/extend`, {
+            method: 'POST',
+            body: JSON.stringify({ minutes })
+        });
+    },
+
+    async cancelTagExtension(tagId) {
+        return await this.request(`/api/v1/tags/${encodeURIComponent(tagId)}/extend`, {
+            method: 'DELETE'
+        });
+    },
+
+    async getTagEffectiveStatus(tagId) {
+        return await this.request(`/api/v1/tags/${encodeURIComponent(tagId)}/effective-status`);
     },
 
     // --- POLICY ENDPOINTS ---
@@ -275,7 +311,8 @@ export const API = {
             'device.ip_changed',
             'device.mac_changed',
             'device.reidentified',
-            'security.alert'
+            'security.alert',
+            'effective.status_changed'
         ];
 
         eventTypes.forEach(evtType => {

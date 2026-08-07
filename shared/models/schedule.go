@@ -1,41 +1,33 @@
-// Package models defines canonical data structures shared between the
-// Discovery Intelligence Service (DIS) and the LAN Internet Access Scheduler
-// (LIAS). Keeping these in a shared module prevents wire-format drift between
-// the two binaries that communicate solely via REST + SSE.
+// Package models defines canonical data structures shared between DIS and LIAS.
 //
 // File:    shared/models/schedule.go
-// Version: 1.2
+// Version: 1.0 (Restored to resolve build conflict)
 package models
 
-// ScheduleMode declares the schedule's intended default-outside-window behavior explicitly.
+// ScheduleMode determines the default behavior outside a schedule's rules.
 type ScheduleMode string
 
 const (
-    ScheduleModeWhitelist ScheduleMode = "whitelist" // rules define ALLOW windows; default OUTSIDE = block
-    ScheduleModeDowntime  ScheduleMode = "downtime"  // rules define BLOCK windows; default OUTSIDE = allow
+    ScheduleModeDowntime  ScheduleMode = "downtime"
+    ScheduleModeWhitelist ScheduleMode = "whitelist"
 )
 
-// Schedule defines a collection of time-based rules that determine whether
-// traffic is allowed or blocked for associated devices.
+// Schedule is a reusable time window bundle that can be attached to any
+// number of policies.
 type Schedule struct {
     ID       string         `json:"id"`
     Name     string         `json:"name"`
-    Mode     ScheduleMode   `json:"mode"`     // Mode explicitly defines default outside window behavior
-    Timezone string         `json:"timezone"` // IANA timezone name, e.g. "America/Los_Angeles"
+    Mode     ScheduleMode   `json:"mode"`
+    Timezone string         `json:"timezone"`
     Rules    []ScheduleRule `json:"rules"`
 }
 
-// ScheduleRule defines a specific time window on specific days of the week
-// during which an Action (allow or block) is enforced.
+// ScheduleRule defines a single time window within a Schedule.
 type ScheduleRule struct {
-    Days      []string `json:"days"`       // ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-    StartTime string   `json:"start_time"` // "15:04" 24-hour format
-    EndTime   string   `json:"end_time"`   // "15:04" 24-hour format
-    Action    Action   `json:"action"`     // allow or block within this window
-    
-    // LIAS-SCH-09 Fix: Calendar date scheduling (e.g., holidays, vacations)
-    // If StartDate and EndDate are set, the rule applies only within this date range.
-    // Format: "2006-01-02" (YYYY-MM-DD)
-    StartDate string `json:"start_date,omitempty"` 
-    EndDate   string `json:"end_date,omitempty"`   
+    Days      []string `json:"days"`
+    StartTime string   `json:"start_time"`
+    EndTime   string   `json:"end_time"`
+    Action    Action   `json:"action"`
+    StartDate string   `json:"start_date,omitempty"`
+    EndDate   string   `json:"end_date,omitempty"`
 }

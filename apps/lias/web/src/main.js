@@ -1,7 +1,7 @@
 // LIAS Dashboard SPA Controller
 //
 // File:    apps/lias/web/src/main.js
-// Version: 3.9 (Added Global Override Visibility to Active Enforcements)
+// Version: 4.2 (Fixed Global Switch toggle to strictly enforce policy hierarchy)
 import { API } from './api.js';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
 
@@ -17,6 +17,7 @@ class App {
 
     // UI-FN-11 Fix: Generate full IANA timezone list dynamically
     this.timezones = this.generateIANATimezones();
+    this.statusReloadTimer = null;
 
     this.initRouter();
     this.initSSE();
@@ -140,7 +141,14 @@ class App {
     } else if (event.type === 'security.alert') {
       this.showToast(`🚨 Security Alert: ${event.payload.details || 'Unknown alert'}`, 'danger');
     }
-    this.loadData();
+
+    // V4.0: Debounce rapid status updates to prevent flooding the API
+    if (event.type === 'effective.status_changed' || event.type.startsWith('device.') || event.type === 'policy.updated') {
+      clearTimeout(this.statusReloadTimer);
+      this.statusReloadTimer = setTimeout(() => this.loadData(), 250);
+    } else {
+      this.loadData();
+    }
   }
 
   async loadData() {
@@ -155,6 +163,19 @@ class App {
       this.tags = tags || [];
       this.policies = policies || [];
       this.schedules = schedules || [];
+
+      // V4.0: Fetch effective statuses in parallel to drive Extend/Pause UI availability
+      const [devStatuses, tagStatuses] = await Promise.all([
+        Promise.all(this.devices.map(d => API.getDeviceEffectiveStatus(d.pdid).catch(() => null))),
+        Promise.all(this.tags.map(t => API.getTagEffectiveStatus(t.id).catch(() => null)))
+      ]);
+
+      this.devices.forEach((d, i) => {
+        d.effective_status = devStatuses[i];
+      });
+      this.tags.forEach((t, i) => {
+        t.effective_status = tagStatuses[i];
+      });
 
       this.renderCurrentView();
     } catch (err) {
@@ -173,7 +194,7 @@ class App {
       devices: 'Tag Groups',
       schedules: 'Schedules',
       policies: 'Policies',
-      analytics: 'Analytics', // UI-FN-08
+      analytics: 'Analytics',
       settings: 'Settings'
     };
     document.getElementById('view-title').textContent = titleMap[view] || 'Dashboard';
@@ -198,7 +219,7 @@ class App {
       case 'policies':
         this.renderPoliciesView(container);
         break;
-      case 'analytics': // UI-FN-08
+      case 'analytics':
         this.renderAnalyticsView(container);
         break;
       case 'settings':
@@ -216,7 +237,7 @@ class App {
       const tz = schedule.timezone || 'UTC';
       const fmt = new Intl.DateTimeFormat('en-US', {
         timeZone: tz,
-        weekday: 'Short',
+        weekday: 'short',
         hour: '2-digit',
         minute: '2-digit',
         hour12: false
@@ -259,58 +280,113 @@ class App {
 
   renderActiveEnforcementsHtml() {
     const activeItems = [];
+    const now = new Date();
     const globalPol = this.policies.find(p => p.id === 'global_default');
     
-    // 1. Evaluate Global Overrides (Block All / Allow All / Vacation Mode)
-    if (globalPol && globalPol.action === 'block') {
-      activeItems.push({
-        policyName: 'Global Kill-Switch',
-        targetName: 'Entire Network',
-        targetColor: 'var(--danger)',
-        scheduleName: 'Vacation Mode / Block All',
-        action: 'block',
-        isGlobal: true
-      });
-    } else if (globalPol && globalPol.action === 'allow') {
-      activeItems.push({
-        policyName: 'Global Allow Override',
-        targetName: 'Entire Network',
-        targetColor: 'var(--success)',
-        scheduleName: 'Allow All Active',
-        action: 'allow',
-        isGlobal: true
-      });
-    } else {
-      // 2. Evaluate Individual Schedules only if no global override is active
-      this.policies.forEach(p => {
-        if (p.action === 'schedule' && p.type !== 'global' && p.enabled) {
-          const targetTag = this.tags.find(t => t.id === p.target_id);
-          const targetName = p.type === 'tag' 
-              ? (targetTag?.name || p.target_id) 
-              : (this.devices.find(d => d.pdid === p.target_id)?.hostname || p.target_id);
-          const targetColor = p.type === 'tag' 
-              ? (targetTag?.color || '#8e8e93') 
-              : '#8e8e93';
-
-          const scheds = this.resolvePolicySchedules(p);
+    // 1. Evaluate Global Switch
+    if (globalPol && globalPol.enabled) {
+      if (!globalPol.expires_at || new Date(globalPol.expires_at) > now) {
+        if (globalPol.action === 'block') {
+          activeItems.push({
+            policyName: 'Global Kill-Switch', targetName: 'Entire Network', targetColor: 'var(--danger)',
+            scheduleName: 'Vacation Mode / Block All', action: 'block', isGlobal: true, type: 'global'
+          });
+        } else if (globalPol.action === 'allow') {
+          activeItems.push({
+            policyName: 'Global Allow Override', targetName: 'Entire Network', targetColor: 'var(--success)',
+            scheduleName: 'Allow All Active', action: 'allow', isGlobal: true, type: 'global'
+          });
+        } else if (globalPol.action === 'schedule') {
+          const scheds = this.resolvePolicySchedules(globalPol);
+          let hasBlock = false, hasAllow = false, isDST = false;
           for (const s of scheds) {
-            const activeAction = this.getActiveScheduleAction(s);
-            if (activeAction) {
-              activeItems.push({
-                policyName: p.name,
-                targetName: targetName,
-                targetColor: targetColor,
-                scheduleName: s.name,
-                action: activeAction,
-                timezone: s.timezone,
-                isDST: this.isTimezoneInDST(s.timezone)
-              });
-              break; // One active schedule per policy is enough to show
-            }
+            const act = this.getActiveScheduleAction(s);
+            if (act === 'block') hasBlock = true;
+            if (act === 'allow') hasAllow = true;
+            if (this.isTimezoneInDST(s.timezone)) isDST = true;
+          }
+          if (hasBlock) {
+            activeItems.push({ policyName: 'Global Schedule', targetName: 'Entire Network', targetColor: 'var(--danger)', scheduleName: 'Scheduled Block Active', action: 'block', isGlobal: true, type: 'global', isDST });
+          } else if (hasAllow) {
+            activeItems.push({ policyName: 'Global Schedule', targetName: 'Entire Network', targetColor: 'var(--success)', scheduleName: 'Scheduled Allow Active', action: 'allow', isGlobal: true, type: 'global', isDST });
           }
         }
-      });
+      }
     }
+
+    // 2. Evaluate all other policies (Tags & Devices)
+    this.policies.forEach(p => {
+      if (!p.enabled || p.id === 'global_default') return;
+      // Filter out expired policies immediately on the client side
+      if (p.expires_at && new Date(p.expires_at) < now) return;
+      if (p.target_id === 'infrastructure') return; // Skip infra
+
+      let targetName = 'Unknown';
+      let targetColor = '#8e8e93';
+      let isDST = false;
+
+      if (p.type === 'tag') {
+        const tag = this.tags.find(t => t.id === p.target_id);
+        targetName = tag ? tag.name : p.target_id;
+        targetColor = tag ? tag.color : '#8e8e93';
+      } else if (p.type === 'device') {
+        const dev = this.devices.find(d => d.pdid === p.target_id);
+        targetName = dev ? (dev.friendly_name || dev.hostname || dev.pdid) : p.target_id;
+      }
+
+      let action = null;
+      let scheduleName = p.name;
+
+      if (p.action === 'schedule') {
+        const scheds = this.resolvePolicySchedules(p);
+        if (p.id.startsWith('pol_pause_')) {
+          action = 'block';
+          scheduleName = 'Paused Internet';
+        } else {
+          let hasBlock = false, hasAllow = false;
+          for (const s of scheds) {
+            const act = this.getActiveScheduleAction(s);
+            if (act === 'block') hasBlock = true;
+            if (act === 'allow') hasAllow = true;
+            if (this.isTimezoneInDST(s.timezone)) isDST = true;
+          }
+          if (hasBlock) action = 'block';
+          else if (hasAllow) action = 'allow';
+          
+          if (action === 'block') scheduleName += ' (Schedule Block)';
+          else if (action === 'allow') scheduleName += ' (Schedule Allow)';
+        }
+      } else if (p.action === 'block') {
+        action = 'block';
+        scheduleName += ' (Block Always)';
+      } else if (p.action === 'allow') {
+        action = 'allow';
+        if (p.id.startsWith('pol_extend_')) {
+          scheduleName = 'Extended Access';
+        } else {
+          scheduleName += ' (Allow Always)';
+        }
+      }
+
+      if (action) {
+        activeItems.push({
+          policyName: p.name,
+          targetName: targetName,
+          targetColor: targetColor,
+          scheduleName: scheduleName,
+          action: action,
+          isGlobal: false,
+          type: p.type,
+          isDST: isDST
+        });
+      }
+    });
+
+    // Sort items: Global -> Tag -> Device
+    activeItems.sort((a, b) => {
+      const typeOrder = { 'global': 0, 'tag': 1, 'device': 2 };
+      return typeOrder[a.type] - typeOrder[b.type];
+    });
 
     if (activeItems.length === 0) {
       return `
@@ -320,7 +396,7 @@ class App {
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
             </div>
             <div>
-              <h3 style="font-size: 16px; font-weight: 700; margin-bottom: 2px;">No Active Schedules</h3>
+              <h3 style="font-size: 16px; font-weight: 700; margin-bottom: 2px;">No Active Enforcements</h3>
               <p style="font-size: 13px; color: var(--text-secondary);">All devices are currently operating under their default policies.</p>
             </div>
           </div>
@@ -444,7 +520,10 @@ class App {
           priority: 0
         };
 
+        // V4.2 Fix: Strictly enforce enabled state and action hierarchy
+        globalPol.enabled = true;
         globalPol.action = action;
+        
         try {
           await API.savePolicy(globalPol);
           this.showToast(`Global Switch set to: ${action.toUpperCase()}`);
@@ -476,7 +555,6 @@ class App {
     this.tags.forEach(t => { grouped[t.id] = []; });
 
     this.devices.forEach(d => {
-      // LIAS-TAG-01 Fix: Handle multiple tags per device
       if (d.tags && d.tags.length > 0) {
         d.tags.forEach(tagId => {
           if (!grouped[tagId]) grouped[tagId] = [];
@@ -503,6 +581,15 @@ class App {
                (d.current_ip || '').toLowerCase().includes(this.searchQuery);
       });
 
+      // V4.0: Tag-level Extend Access button
+      const tagExtended = t.effective_status?.active_extension?.reason_tag === 'extend_access';
+      let tagActionHtml = '';
+      if (tagExtended) {
+          tagActionHtml = `<button class="btn btn-secondary btn-cancel-extend-tag" data-tag-id="${t.id}" data-tag-name="${t.name}" style="padding: 6px 10px; font-size: 12px;">✕ Cancel Extension (${t.effective_status.active_extension.minutes_left}m)</button>`;
+      } else if (t.effective_status?.action === 'block' && t.effective_status?.extend_available) {
+          tagActionHtml = `<button class="btn btn-success btn-extend-tag" data-tag-id="${t.id}" data-tag-name="${t.name}" style="padding: 6px 10px; font-size: 12px;">⏱ Extend All</button>`;
+      }
+
       html += `
         <div class="group-card" data-tag-id="${t.id}">
           <div class="group-header">
@@ -511,7 +598,10 @@ class App {
               ${t.id === 'infrastructure' ? '<span style="font-size:12px; font-weight:700; color:var(--text-secondary);">🔒 IMMUNE</span>' : ''}
               <span class="group-count">(${devs.length} devices)</span>
             </div>
-            <svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+            <div style="display:flex; align-items:center; gap:12px;">
+              ${tagActionHtml}
+              <svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+            </div>
           </div>
           <div class="group-content">
             <div class="device-grid">
@@ -526,8 +616,8 @@ class App {
 
     document.querySelectorAll('.group-header').forEach(hdr => {
       hdr.addEventListener('click', (e) => {
-        const card = e.currentTarget.closest('.group-card');
-        card.classList.toggle('collapsed');
+        if (e.target.closest('button')) return; // Don't collapse if clicking the action button
+        e.currentTarget.closest('.group-card').classList.toggle('collapsed');
       });
     });
 
@@ -537,6 +627,43 @@ class App {
     }
 
     this.bindDeviceTagDropdowns();
+    this.bindTagExtendButtons();
+  }
+
+  bindTagExtendButtons() {
+    document.querySelectorAll('.btn-extend-tag').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const tagId = e.currentTarget.dataset.tagId;
+        const tagName = e.currentTarget.dataset.tagName;
+        this.openMinutePickerModal(`Extend Access: ${tagName}`, async (mins) => {
+          try {
+            await API.extendTagAccess(tagId, mins);
+            this.showToast(`Access extended for ${tagName} (${mins}m)`);
+            this.loadData();
+          } catch (err) {
+            this.showToast(`Failed to extend: ${err.message}`, 'danger');
+          }
+        });
+      });
+    });
+
+    document.querySelectorAll('.btn-cancel-extend-tag').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const tagId = e.currentTarget.dataset.tagId;
+        const tagName = e.currentTarget.dataset.tagName;
+        this.openConfirmModal('Cancel Extension', `Revoke extended access for ${tagName}?`, 'Cancel Extension', async () => {
+          try {
+            await API.cancelTagExtension(tagId);
+            this.showToast(`Extension cancelled for ${tagName}`);
+            this.loadData();
+          } catch (err) {
+            this.showToast(`Failed to cancel: ${err.message}`, 'danger');
+          }
+        });
+      });
+    });
   }
 
   renderDeviceCard(d) {
@@ -544,10 +671,9 @@ class App {
     const tags = (d.tags && d.tags.length > 0) ? d.tags : ['generic'];
     const isInfra = tags.includes('infrastructure');
     
-    // Fix 1: Check if device is currently paused to render Unpause button
     const isPaused = this.policies.some(p => p.id === `pol_pause_${d.pdid}`);
+    const isExtended = d.effective_status?.active_extension?.reason_tag === 'extend_access';
 
-    // LIAS-TAG-01 Fix: Render multi-select for tags
     const tagCheckboxes = this.tags.map(t => `
       <label style="display:flex; align-items:center; gap:6px; font-size:12px; padding:4px 0;">
         <input type="checkbox" class="device-tag-checkbox" value="${t.id}" ${tags.includes(t.id) ? 'checked' : ''}>
@@ -555,17 +681,21 @@ class App {
       </label>
     `).join('');
 
-    // FIX: Hide Pause button for Infrastructure devices. Show Unpause if paused.
+    // V4.0: Action button state logic driven by effective_status
     let actionBtnHtml = '';
     if (!isInfra) {
-      if (isPaused) {
-        actionBtnHtml = `<button class="btn btn-success btn-unpause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px;">▶ Unpause</button>`;
+      if (isExtended) {
+          actionBtnHtml = `<button class="btn btn-secondary btn-cancel-extend-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px;">✕ Cancel (${d.effective_status.active_extension.minutes_left}m)</button>`;
+      } else if (isPaused) {
+          actionBtnHtml = `<button class="btn btn-success btn-unpause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px;">▶ Unpause</button>`;
       } else {
-        actionBtnHtml = `<button class="btn btn-danger btn-pause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px;">⏸ Pause</button>`;
+          if (d.effective_status?.action === 'block' && d.effective_status?.extend_available) {
+              actionBtnHtml += `<button class="btn btn-success btn-extend-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px; margin-right:4px;">⏱ Extend</button>`;
+          }
+          actionBtnHtml += `<button class="btn btn-danger btn-pause-device" data-pdid="${d.pdid}" data-name="${dispName}" style="flex:1; padding: 6px 10px; font-size: 12px;">⏸ Pause</button>`;
       }
     }
 
-    // V3.3 FIX: Added explicit text label next to the status dot
     return `
       <div class="device-item">
         <div>
@@ -605,14 +735,12 @@ class App {
   }
 
   bindDeviceTagDropdowns() {
-    // LIAS-TAG-01 Fix: Save tags on checkbox change
     document.querySelectorAll('.device-tag-checkbox').forEach(chk => {
       chk.addEventListener('change', async (e) => {
         const deviceItem = e.target.closest('.device-item');
         const pdid = deviceItem.querySelector('.btn-details-device').dataset.pdid;
         const selectedTags = Array.from(deviceItem.querySelectorAll('.device-tag-checkbox:checked')).map(c => c.value);
         
-        // If no tags selected, default to generic
         if (selectedTags.length === 0) selectedTags.push('generic');
         
         try {
@@ -625,7 +753,6 @@ class App {
       });
     });
 
-    // UI-FN-06: Bind Pause Internet (HIG Modal)
     document.querySelectorAll('.btn-pause-device').forEach(btn => {
       btn.addEventListener('click', (e) => {
         const pdid = e.currentTarget.dataset.pdid;
@@ -642,7 +769,6 @@ class App {
       });
     });
 
-    // Fix 1: Bind Unpause Internet (HIG Modal)
     document.querySelectorAll('.btn-unpause-device').forEach(btn => {
       btn.addEventListener('click', (e) => {
         const pdid = e.currentTarget.dataset.pdid;
@@ -659,7 +785,39 @@ class App {
       });
     });
 
-    // UI-FN-12: Bind Rename (HIG Modal)
+    // V4.0: Bind Extend Access and Cancel Extension
+    document.querySelectorAll('.btn-extend-device').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const pdid = e.currentTarget.dataset.pdid;
+        const name = e.currentTarget.dataset.name;
+        this.openMinutePickerModal(`Extend Access: ${name}`, async (mins) => {
+          try {
+            await API.extendDeviceAccess(pdid, mins);
+            this.showToast(`Access extended for ${name} (${mins}m)`);
+            this.loadData();
+          } catch (err) {
+            this.showToast(`Failed to extend: ${err.message}`, 'danger');
+          }
+        });
+      });
+    });
+
+    document.querySelectorAll('.btn-cancel-extend-device').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const pdid = e.currentTarget.dataset.pdid;
+        const name = e.currentTarget.dataset.name;
+        this.openConfirmModal('Cancel Extension', `Revoke extended access for ${name}?`, 'Cancel Extension', async () => {
+          try {
+            await API.cancelDeviceExtension(pdid);
+            this.showToast(`Extension cancelled for ${name}`);
+            this.loadData();
+          } catch (err) {
+            this.showToast(`Failed to cancel: ${err.message}`, 'danger');
+          }
+        });
+      });
+    });
+
     document.querySelectorAll('.btn-rename-device').forEach(btn => {
       btn.addEventListener('click', (e) => {
         const pdid = e.currentTarget.dataset.pdid;
@@ -678,7 +836,6 @@ class App {
       });
     });
 
-    // UI-FN-01: Bind Device Details Modal
     document.querySelectorAll('.btn-details-device').forEach(btn => {
       btn.addEventListener('click', (e) => {
         this.openDeviceModal(e.currentTarget.dataset.pdid);
@@ -686,7 +843,53 @@ class App {
     });
   }
 
-  // UI-FN-01 Fix: Device Details Modal with Activity History
+  // V4.0: HIG-flavored Minute Picker Modal
+  openMinutePickerModal(title, onConfirm) {
+    this.openModal(title, `
+      <div style="text-align: center; padding: 10px 0;">
+        <div class="minute-chip-group">
+          <div class="minute-chip" data-mins="15">15m</div>
+          <div class="minute-chip" data-mins="30">30m</div>
+          <div class="minute-chip" data-mins="60">60m</div>
+          <div class="minute-chip" data-mins="120">120m</div>
+        </div>
+        <div class="minute-slider-container">
+          <input type="range" id="minute-slider" min="1" max="120" step="1" value="15" class="minute-slider">
+          <div class="minute-readout"><span id="minute-val">15</span> minutes</div>
+        </div>
+      </div>
+    `, `
+      <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+      <button class="btn btn-success" id="modal-confirm">Allow Access</button>
+    `);
+
+    let selectedMins = 15;
+    const slider = document.getElementById('minute-slider');
+    const valSpan = document.getElementById('minute-val');
+    
+    slider.addEventListener('input', (e) => {
+      selectedMins = parseInt(e.target.value, 10);
+      valSpan.textContent = selectedMins;
+      document.querySelectorAll('.minute-chip').forEach(c => c.classList.remove('selected'));
+    });
+
+    document.querySelectorAll('.minute-chip').forEach(chip => {
+      chip.addEventListener('click', (e) => {
+        selectedMins = parseInt(e.target.dataset.mins, 10);
+        slider.value = selectedMins;
+        valSpan.textContent = selectedMins;
+        document.querySelectorAll('.minute-chip').forEach(c => c.classList.remove('selected'));
+        e.target.classList.add('selected');
+      });
+    });
+
+    document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
+    document.getElementById('modal-confirm').addEventListener('click', () => {
+      this.closeModal();
+      onConfirm(selectedMins);
+    });
+  }
+
   async openDeviceModal(pdid) {
     this.openModal('Device Details', `<div class="loader"><div class="spinner"></div></div>`, '');
     try {
@@ -838,7 +1041,6 @@ class App {
       });
     });
 
-    // Bind Enable/Disable Toggles
     document.querySelectorAll('.policy-enabled-toggle').forEach(toggle => {
       toggle.addEventListener('change', async (e) => {
         const id = e.currentTarget.dataset.id;
@@ -850,15 +1052,14 @@ class App {
         try {
           await API.savePolicy(p);
           this.showToast(`Policy ${enabled ? 'enabled' : 'disabled'}`);
-          this.loadData(); // Reload to reflect the "(Disabled)" tag instantly
+          this.loadData();
         } catch (err) {
           this.showToast(`Failed to update policy: ${err.message}`, 'danger');
-          e.currentTarget.checked = !enabled; // Revert UI on failure
+          e.currentTarget.checked = !enabled;
         }
       });
     });
 
-    // LIAS-POL-08 Fix: Import/Export Buttons
     document.getElementById('btn-export-pol').addEventListener('click', async () => {
       try {
         const blob = await API.exportPolicies();
@@ -886,7 +1087,7 @@ class App {
       } catch (err) {
         this.showToast(`Import failed: ${err.message}`, 'danger');
       }
-      e.target.value = ''; // Reset input
+      e.target.value = '';
     });
     
     document.getElementById('btn-import-pol').addEventListener('click', (e) => {
@@ -1013,7 +1214,6 @@ class App {
     });
   }
 
-  // HIG Time Formatter Helper
   formatTimeTo12hr(timeStr) {
     if (!timeStr) return '';
     const parts = timeStr.split(':');
@@ -1484,18 +1684,12 @@ class App {
     this.bindScheduleModalEvents(s);
   }
 
-  // LIAS-SCH-09 Fix: Added Calendar Date inputs to rule row
   renderScheduleRuleRow(rule, idx) {
     const isOvernight = rule.start_time && rule.end_time && rule.end_time <= rule.start_time;
     const daysArr = (rule.days || []).map(d => d.toLowerCase().substring(0, 3));
     const isAllDay = rule.start_time === '00:00' && rule.end_time === '23:59';
 
-    // ── Infer the original selection mode ──
-    // To prevent ambiguity where a contiguous "Specific Days" selection (e.g., Mon, Tue, Wed)
-    // is incorrectly reconstructed as a "Continuous Day Range", we default to "Specific Days"
-    // for all loaded weekly rules. This accurately represents the underlying data and allows
-    // full editability without unexpected mode switching.
-    let inferredMode = 'range'; // Default for new rules
+    let inferredMode = 'range';
     if (rule.start_date && rule.end_date) {
       inferredMode = 'calendar';
     } else if (daysArr.length > 0) {
@@ -1559,10 +1753,8 @@ class App {
   }
 
   bindScheduleModalEvents(s) {
-    // ── Cancel button: single binding ──
     document.getElementById('modal-cancel').addEventListener('click', () => this.closeModal());
 
-    // ── Save button: single binding, reads LIVE DOM state ──
     document.getElementById('modal-save-sched').addEventListener('click', async () => {
       const name = document.getElementById('sched-name').value.trim();
       if (!name) { this.showToast('Schedule name is required', 'danger'); return; }
@@ -1570,7 +1762,6 @@ class App {
       const timezone = document.getElementById('sched-tz').value;
       const rules = [];
 
-      // Read ONLY currently-existing rule rows from the DOM
       document.querySelectorAll('#sched-rules-container .rule-row').forEach(row => {
         const start = row.querySelector('.rule-start').value;
         const end = row.querySelector('.rule-end').value;
@@ -1591,13 +1782,11 @@ class App {
           days = Array.from(row.querySelectorAll('.day-chip.selected')).map(c => c.dataset.day);
         }
 
-        // Only persist rules with valid, confirmed data
         if (start && end && (days.length > 0 || (startDate && endDate))) {
           rules.push({ days, start_time: start, end_time: end, action, start_date: startDate, end_date: endDate });
         }
       });
 
-      // Preserve schedule ID for updates (prevents duplicate creation)
       const scheduleData = { id: s.id, name, mode, timezone, rules };
 
       try {
@@ -1610,7 +1799,6 @@ class App {
       }
     });
 
-    // ── Add Rule button: single binding, NO re-bind call ──
     document.getElementById('btn-add-rule').addEventListener('click', () => {
       const container = document.getElementById('sched-rules-container');
       const newIdx = container.children.length;
@@ -1621,15 +1809,11 @@ class App {
         action: 'block'
       }, newIdx);
       container.insertAdjacentHTML('beforeend', newRuleHtml);
-      // NOTE: No call to bindScheduleModalEvents — delegation handles new elements
     });
 
-    // ── Event Delegation on rules container (handles ALL rules, existing + future) ──
     const rulesContainer = document.getElementById('sched-rules-container');
 
-    // Delegated 'change' listener: day-mode, time inputs, all-day checkbox
     rulesContainer.addEventListener('change', (e) => {
-      // Day mode selector
       if (e.target.classList.contains('day-mode-select')) {
         const row = e.target.closest('.rule-row');
         const mode = e.target.value;
@@ -1638,7 +1822,6 @@ class App {
         row.querySelector('.calendar-picker').style.display = mode === 'calendar' ? 'flex' : 'none';
       }
 
-      // Time input changes → overnight indicator
       if (e.target.classList.contains('rule-start') || e.target.classList.contains('rule-end')) {
         const row = e.target.closest('.rule-row');
         const start = row.querySelector('.rule-start').value;
@@ -1653,7 +1836,6 @@ class App {
         }
       }
 
-      // All-day checkbox
       if (e.target.classList.contains('rule-all-day')) {
         const row = e.target.closest('.rule-row');
         const startInput = row.querySelector('.rule-start');
@@ -1669,13 +1851,10 @@ class App {
       }
     });
 
-    // Delegated 'click' listener: day chips, remove buttons
     rulesContainer.addEventListener('click', (e) => {
-      // Day chip toggle
       if (e.target.classList.contains('day-chip')) {
         e.target.classList.toggle('selected');
       }
-      // Remove rule button
       if (e.target.classList.contains('btn-remove-rule')) {
         e.target.closest('.rule-row').remove();
         this.updateRuleIndices();
@@ -1683,7 +1862,6 @@ class App {
     });
   }
 
-  // ── New method: renumber rule labels after add/remove ──
   updateRuleIndices() {
     document.querySelectorAll('#sched-rules-container .rule-row').forEach((row, idx) => {
       const label = row.querySelector('strong');
@@ -1692,7 +1870,6 @@ class App {
     });
   }
 
-  // UI-FN-08 Fix: Analytics Dashboard View
   async renderAnalyticsView(container) {
     container.innerHTML = `<div class="loader"><div class="spinner"></div></div>`;
     try {
@@ -1820,7 +1997,6 @@ class App {
     });
   }
 
-  // HIG Modal Helpers (No primitive popups allowed)
   openConfirmModal(title, messageHtml, confirmText, onConfirm) {
     this.openModal(title, `
       <div class="modal-warning-icon">⚠️</div>

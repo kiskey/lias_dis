@@ -1,7 +1,7 @@
 // Package storage provides CGO-free SQLite persistence for LIAS configuration state.
 //
 // File:    apps/lias/internal/storage/sqlite.go
-// Version: 2.4 (Added missing sync import)
+// Version: 2.5 (Added ExpiresAt round-trip + already-expired guard in LoadHydrate)
 package storage
 
 import (
@@ -142,7 +142,7 @@ func (s *Storage) initSchema() error {
         action TEXT NOT NULL,
         bytes INTEGER NOT NULL DEFAULT 0
     );
-    
+
     CREATE INDEX IF NOT EXISTS idx_flow_logs_pdid ON flow_logs(pdid);
     CREATE INDEX IF NOT EXISTS idx_flow_logs_ts ON flow_logs(timestamp);
     CREATE INDEX IF NOT EXISTS idx_device_tags_mac ON device_tags(mac);
@@ -211,6 +211,9 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
         }
     }
 
+    // Load policies — skip already-expired temporary policies instead of
+    // resurrecting them, and queue them for DB cleanup.
+    var expiredPolicyIDs []string
     pRows, err := s.db.Query("SELECT data, enabled FROM policies")
     if err == nil {
         defer pRows.Close()
@@ -224,10 +227,31 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
                         p.ScheduleIDs = []string{*p.ScheduleID}
                     }
                     p.Enabled = enabledInt == 1
+
+                    // NEW: Skip already-expired temporary policies instead of
+                    // resurrecting them. Also queue for DB cleanup to prevent
+                    // a brief incorrect-state window right after restart.
+                    if p.ExpiresAt != nil && time.Now().After(*p.ExpiresAt) {
+                        expiredPolicyIDs = append(expiredPolicyIDs, p.ID)
+                        slog.Info("Skipping already-expired temporary policy during hydration",
+                            "policy_id", p.ID, "expired_at", p.ExpiresAt)
+                        continue
+                    }
+
                     polEng.UpsertPolicy(p)
                 }
             }
         }
+    }
+
+    // Clean up expired policies from storage
+    for _, id := range expiredPolicyIDs {
+        // Also clean up any schedules they privately owned
+        _, _ = s.db.Exec("DELETE FROM schedules WHERE id LIKE 'sched_pause_%' OR id LIKE 'sched_extend_%'")
+        _, _ = s.db.Exec("DELETE FROM policies WHERE id = ?", id)
+    }
+    if len(expiredPolicyIDs) > 0 {
+        slog.Info("Cleaned up expired temporary policies during hydration", "count", len(expiredPolicyIDs))
     }
 
     sRows, err := s.db.Query("SELECT id, name, mode, timezone, rules FROM schedules")
@@ -258,7 +282,9 @@ func (s *Storage) LoadHydrate(tagMgr *tags.Manager, polEng *policy.Engine, sched
         }
     }
 
-    slog.Info("Successfully hydrated LIAS state from persistent storage", "device_tags", len(deviceTags), "mac_tags", len(macTags))
+    slog.Info("Successfully hydrated LIAS state from persistent storage",
+        "device_tags", len(deviceTags), "mac_tags", len(macTags),
+        "expired_policies_cleaned", len(expiredPolicyIDs))
     return deviceTags, macTags, nil
 }
 
@@ -322,7 +348,9 @@ func (s *Storage) MigrateDevicePolicies(oldPDID, newPDID string) error {
 }
 
 func (s *Storage) UpdateDeviceTagMAC(pdid, mac string) error {
-    if pdid == "" || mac == "" { return nil }
+    if pdid == "" || mac == "" {
+        return nil
+    }
     s.mu.Lock()
     defer s.mu.Unlock()
     _, err := s.db.Exec(`UPDATE device_tags SET mac = ? WHERE pdid = ? AND (mac = '' OR mac IS NULL)`, mac, pdid)
@@ -340,12 +368,16 @@ func (s *Storage) LoadDeviceOverrides() (map[string]string, error) {
     s.mu.RLock()
     defer s.mu.RUnlock()
     rows, err := s.db.Query("SELECT pdid, friendly_name FROM device_overrides")
-    if err != nil { return nil, err }
+    if err != nil {
+        return nil, err
+    }
     defer rows.Close()
     overrides := make(map[string]string)
     for rows.Next() {
         var pdid, name string
-        if rows.Scan(&pdid, &name) == nil { overrides[pdid] = name }
+        if rows.Scan(&pdid, &name) == nil {
+            overrides[pdid] = name
+        }
     }
     return overrides, nil
 }
@@ -375,12 +407,16 @@ func (s *Storage) LoadUserAssignments() (map[string]string, error) {
     s.mu.RLock()
     defer s.mu.RUnlock()
     rows, err := s.db.Query("SELECT pdid, user_id FROM device_users")
-    if err != nil { return nil, err }
+    if err != nil {
+        return nil, err
+    }
     defer rows.Close()
     mappings := make(map[string]string)
     for rows.Next() {
         var pdid, uid string
-        if rows.Scan(&pdid, &uid) == nil { mappings[pdid] = uid }
+        if rows.Scan(&pdid, &uid) == nil {
+            mappings[pdid] = uid
+        }
     }
     return mappings, nil
 }
@@ -389,7 +425,9 @@ func (s *Storage) SaveTag(t tags.Tag) error {
     s.mu.Lock()
     defer s.mu.Unlock()
     builtinInt := 0
-    if t.Builtin { builtinInt = 1 }
+    if t.Builtin {
+        builtinInt = 1
+    }
     _, err := s.db.Exec(`INSERT INTO tags (id, name, color, precedence, builtin) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, color=excluded.color, precedence=excluded.precedence`, t.ID, t.Name, t.Color, t.Precedence, builtinInt)
     return err
 }
@@ -401,16 +439,26 @@ func (s *Storage) DeleteTag(id string) error {
     return err
 }
 
+// SavePolicy serializes the entire Policy struct (including ExpiresAt and
+// ReasonTag) as JSON in the `data` column. Because the schema uses a JSON
+// blob column, adding new fields to Policy is a zero-migration change —
+// they are automatically round-tripped through json.Marshal/Unmarshal.
 func (s *Storage) SavePolicy(p models.Policy) error {
     s.mu.Lock()
     defer s.mu.Unlock()
     dataBytes, err := json.Marshal(p)
-    if err != nil { return err }
+    if err != nil {
+        return err
+    }
     schedID := ""
-    if p.ScheduleID != nil { schedID = *p.ScheduleID }
+    if p.ScheduleID != nil {
+        schedID = *p.ScheduleID
+    }
     schedIDsBytes, _ := json.Marshal(p.GetScheduleIDs())
     enabledInt := 0
-    if p.Enabled { enabledInt = 1 }
+    if p.Enabled {
+        enabledInt = 1
+    }
 
     _, err = s.db.Exec(`INSERT INTO policies (id, name, type, target_id, action, schedule_id, schedule_ids, priority, enabled, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, target_id=excluded.target_id, action=excluded.action, schedule_id=excluded.schedule_id, schedule_ids=excluded.schedule_ids, priority=excluded.priority, enabled=excluded.enabled, data=excluded.data`, p.ID, p.Name, p.Type, p.TargetID, p.Action, schedID, string(schedIDsBytes), p.Priority, enabledInt, string(dataBytes))
     return err
@@ -427,9 +475,11 @@ func (s *Storage) ExportPolicies() ([]byte, error) {
     s.mu.RLock()
     defer s.mu.RUnlock()
     rows, err := s.db.Query("SELECT data FROM policies")
-    if err != nil { return nil, err }
+    if err != nil {
+        return nil, err
+    }
     defer rows.Close()
-    
+
     var policies []json.RawMessage
     for rows.Next() {
         var dataStr string
@@ -450,17 +500,25 @@ func (s *Storage) ImportPolicies(jsonData []byte) error {
     defer s.mu.Unlock()
 
     tx, err := s.db.Begin()
-    if err != nil { return err }
+    if err != nil {
+        return err
+    }
     defer func() { _ = tx.Rollback() }()
 
     for _, p := range policies {
-        if p.ID == "" { continue }
+        if p.ID == "" {
+            continue
+        }
         dataBytes, _ := json.Marshal(p)
         schedID := ""
-        if p.ScheduleID != nil { schedID = *p.ScheduleID }
+        if p.ScheduleID != nil {
+            schedID = *p.ScheduleID
+        }
         schedIDsBytes, _ := json.Marshal(p.GetScheduleIDs())
         enabledInt := 0
-        if p.Enabled { enabledInt = 1 }
+        if p.Enabled {
+            enabledInt = 1
+        }
 
         _, err = tx.Exec(`INSERT INTO policies (id, name, type, target_id, action, schedule_id, schedule_ids, priority, enabled, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, target_id=excluded.target_id, action=excluded.action, schedule_id=excluded.schedule_id, schedule_ids=excluded.schedule_ids, priority=excluded.priority, enabled=excluded.enabled, data=excluded.data`, p.ID, p.Name, p.Type, p.TargetID, p.Action, schedID, string(schedIDsBytes), p.Priority, enabledInt, string(dataBytes))
         if err != nil {
@@ -474,7 +532,9 @@ func (s *Storage) SaveSchedule(sch models.Schedule) error {
     s.mu.Lock()
     defer s.mu.Unlock()
     rulesBytes, err := json.Marshal(sch.Rules)
-    if err != nil { return err }
+    if err != nil {
+        return err
+    }
     _, err = s.db.Exec(`INSERT INTO schedules (id, name, mode, timezone, rules) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, mode=excluded.mode, timezone=excluded.timezone, rules=excluded.rules`, sch.ID, sch.Name, sch.Mode, sch.Timezone, string(rulesBytes))
     return err
 }
@@ -496,11 +556,15 @@ func (s *Storage) SaveFlowLog(pdid string, action models.Action, bytes int64) er
 func (s *Storage) GetDeviceFlowLogs(pdid string, limit int) ([]models.FlowLog, error) {
     s.mu.RLock()
     defer s.mu.RUnlock()
-    
-    if limit <= 0 || limit > 1000 { limit = 100 }
-    
+
+    if limit <= 0 || limit > 1000 {
+        limit = 100
+    }
+
     rows, err := s.db.Query("SELECT timestamp, action, bytes FROM flow_logs WHERE pdid = ? ORDER BY timestamp DESC LIMIT ?", pdid, limit)
-    if err != nil { return nil, err }
+    if err != nil {
+        return nil, err
+    }
     defer rows.Close()
 
     var logs []models.FlowLog
@@ -519,10 +583,12 @@ func (s *Storage) GetNetworkStats() (models.NetworkStats, error) {
     defer s.mu.RUnlock()
 
     var stats models.NetworkStats
-    
+
     err := s.db.QueryRow("SELECT COUNT(*) FROM flow_logs WHERE action = 'block' AND timestamp > datetime('now', '-1 day')").Scan(&stats.BlockedEvents24h)
-    if err != nil { return stats, err }
-    
+    if err != nil {
+        return stats, err
+    }
+
     var topPDID string
     err = s.db.QueryRow("SELECT pdid FROM flow_logs WHERE action = 'block' AND timestamp > datetime('now', '-1 day') GROUP BY pdid ORDER BY COUNT(*) DESC LIMIT 1").Scan(&topPDID)
     if err == nil {
@@ -535,6 +601,8 @@ func (s *Storage) GetNetworkStats() (models.NetworkStats, error) {
 func (s *Storage) Close() error {
     s.mu.Lock()
     defer s.mu.Unlock()
-    if s.db != nil { return s.db.Close() }
+    if s.db != nil {
+        return s.db.Close()
+    }
     return nil
 }

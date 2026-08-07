@@ -1,7 +1,7 @@
 // Package api implements the HTTP server, REST handlers, and SSE broker for LIAS.
 //
 // File:    apps/lias/internal/api/broker.go
-// Version: 1.2 (Implemented SignalSSEConnected)
+// Version: 1.3 (Added BroadcastEffectiveStatusChanged for Extend Access)
 package api
 
 import (
@@ -109,7 +109,8 @@ func (b *Broker) Broadcast(event models.Event) {
         select {
         case client.Events <- event:
         default:
-            slog.Warn("LIAS SSE client buffer full, dropping real-time event", "client_id", client.ID, "event_type", event.Type)
+            slog.Warn("LIAS SSE client buffer full, dropping real-time event",
+                "client_id", client.ID, "event_type", event.Type)
         }
     }
 }
@@ -128,7 +129,8 @@ func (b *Broker) replayEventsLocked(client *Client, lastEventID int64) {
         }
     }
     if count > 0 {
-        slog.Info("Replayed missed SSE events for LIAS client", "client_id", client.ID, "count", count)
+        slog.Info("Replayed missed SSE events for LIAS client",
+            "client_id", client.ID, "count", count)
     }
 }
 
@@ -139,6 +141,25 @@ func (b *Broker) SignalSSEConnected() {
     case b.ResetBackoff <- struct{}{}:
     default:
     }
+}
+
+// BroadcastEffectiveStatusChanged notifies SSE clients that a device or tag's
+// effective policy status has changed (e.g. temporary extension activated
+// or expired, global switch toggled, schedule transition, tag assignment
+// changed). The frontend should re-fetch /effective-status for the
+// indicated target to get the authoritative server-computed status.
+//
+// targetType is "device" or "tag". targetID is the PDID or tag ID.
+func (b *Broker) BroadcastEffectiveStatusChanged(targetType, targetID string) {
+    if b == nil {
+        return
+    }
+    b.Broadcast(models.NewEvent(models.EventEffectiveStatusChanged, targetID,
+        models.EffectiveStatusChangedPayload{
+            TargetType: targetType,
+            TargetID:   targetID,
+            Timestamp:  time.Now(),
+        }))
 }
 
 func (b *Broker) Stop() {
