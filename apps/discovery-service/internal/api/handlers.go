@@ -8,6 +8,7 @@ import (
     "crypto/rand"
     "encoding/hex"
     "encoding/json"
+	"io"
     "log/slog"
     "net/http"
     "strconv"
@@ -23,12 +24,25 @@ type EnrichmentTrigger interface {
     TriggerEnrichment(pdid string, force bool)
 }
 
+type IdentityManager interface {
+	ResolvePDID(string) string
+	GetIdentityProfile(string) (*models.IdentityProfile, error)
+	BindIdentityAlias(string, models.IdentityBindingRequest) (models.IdentityAlias, error)
+	RevokeIdentityAlias(string, int64) error
+	ConfirmIdentityCandidate(int64) (*models.Device, error)
+	RejectIdentityCandidate(int64) error
+	SplitIdentity(string, models.IdentitySplitRequest) (*models.Device, error)
+}
+
 // Handlers contains the HTTP handlers for the DIS REST API.
 type Handlers struct {
     cache  *inventory.Cache
     broker *Broker
     orch   EnrichmentTrigger
+	identity IdentityManager
 }
+
+func (h *Handlers) SetIdentityManager(manager IdentityManager) { h.identity = manager }
 
 // NewHandlers creates a new Handlers instance.
 func NewHandlers(cache *inventory.Cache, broker *Broker, orch EnrichmentTrigger) *Handlers {
@@ -48,6 +62,12 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux, authToken string) {
     handler.HandleFunc("GET /api/v1/devices/{pdid}", h.GetDevice)
     handler.HandleFunc("POST /api/v1/devices/{pdid}/refresh", h.RefreshDevice)
     handler.HandleFunc("GET /api/v1/events", h.StreamEvents)
+	handler.HandleFunc("GET /api/v1/devices/{pdid}/identity", h.GetIdentity)
+	handler.HandleFunc("POST /api/v1/devices/{pdid}/identity/bindings", h.BindIdentity)
+	handler.HandleFunc("DELETE /api/v1/devices/{pdid}/identity/bindings/{aliasID}", h.RevokeIdentity)
+	handler.HandleFunc("POST /api/v1/identity/candidates/{candidateID}/confirm", h.ConfirmIdentityCandidate)
+	handler.HandleFunc("POST /api/v1/identity/candidates/{candidateID}/reject", h.RejectIdentityCandidate)
+	handler.HandleFunc("POST /api/v1/devices/{pdid}/identity/split", h.SplitIdentity)
 
     // Wrap the internal handler with the Auth middleware
     mux.Handle("/", AuthMiddleware(authToken, handler))
@@ -87,6 +107,9 @@ func (h *Handlers) ListDevices(w http.ResponseWriter, r *http.Request) {
 // GetDevice returns a single device by PDID.
 func (h *Handlers) GetDevice(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
+	if h.identity != nil {
+		pdid = h.identity.ResolvePDID(pdid)
+	}
     d := h.cache.Get(pdid)
     if d == nil {
         http.Error(w, `{"error":"device not found"}`, http.StatusNotFound)
@@ -99,6 +122,9 @@ func (h *Handlers) GetDevice(w http.ResponseWriter, r *http.Request) {
 // RefreshDevice triggers an asynchronous, forced enrichment run for a device.
 func (h *Handlers) RefreshDevice(w http.ResponseWriter, r *http.Request) {
     pdid := r.PathValue("pdid")
+	if h.identity != nil {
+		pdid = h.identity.ResolvePDID(pdid)
+	}
     d := h.cache.Get(pdid)
     if d == nil {
         http.Error(w, `{"error":"device not found"}`, http.StatusNotFound)
@@ -115,6 +141,93 @@ func (h *Handlers) RefreshDevice(w http.ResponseWriter, r *http.Request) {
         Message: "Refresh triggered",
         TaskID:  generateID(),
     })
+}
+
+func (h *Handlers) GetIdentity(w http.ResponseWriter, r *http.Request) {
+	if h.identity == nil {
+		http.Error(w, `{"error":"identity persistence unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
+	profile, err := h.identity.GetIdentityProfile(r.PathValue("pdid"))
+	writeIdentityResult(w, profile, err, http.StatusOK)
+}
+
+func (h *Handlers) BindIdentity(w http.ResponseWriter, r *http.Request) {
+	if h.identity == nil {
+		http.Error(w, `{"error":"identity persistence unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
+	var req models.IdentityBindingRequest
+	if err := decodeIdentityJSON(r, &req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+	alias, err := h.identity.BindIdentityAlias(r.PathValue("pdid"), req)
+	writeIdentityResult(w, alias, err, http.StatusCreated)
+}
+
+func (h *Handlers) RevokeIdentity(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("aliasID"), 10, 64)
+	if err == nil && h.identity != nil {
+		err = h.identity.RevokeIdentityAlias(r.PathValue("pdid"), id)
+	}
+	if err != nil || h.identity == nil {
+		http.Error(w, `{"error":"identity alias not found"}`, http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) ConfirmIdentityCandidate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("candidateID"), 10, 64)
+	if err != nil || h.identity == nil {
+		http.Error(w, `{"error":"candidate not found"}`, http.StatusNotFound)
+		return
+	}
+	device, err := h.identity.ConfirmIdentityCandidate(id)
+	writeIdentityResult(w, device, err, http.StatusOK)
+}
+
+func (h *Handlers) RejectIdentityCandidate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("candidateID"), 10, 64)
+	if err == nil && h.identity != nil {
+		err = h.identity.RejectIdentityCandidate(id)
+	}
+	if err != nil || h.identity == nil {
+		http.Error(w, `{"error":"candidate not found"}`, http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) SplitIdentity(w http.ResponseWriter, r *http.Request) {
+	if h.identity == nil {
+		http.Error(w, `{"error":"identity persistence unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
+	var req models.IdentitySplitRequest
+	if err := decodeIdentityJSON(r, &req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+	device, err := h.identity.SplitIdentity(r.PathValue("pdid"), req)
+	writeIdentityResult(w, device, err, http.StatusCreated)
+}
+
+func decodeIdentityJSON(r *http.Request, value interface{}) error {
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(value)
+}
+
+func writeIdentityResult(w http.ResponseWriter, value interface{}, err error, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		http.Error(w, `{"error":"`+strings.ReplaceAll(err.Error(), `"`, `'`)+`"}`, http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 // StreamEvents handles SSE connections, parsing Last-Event-ID headers for replay support.

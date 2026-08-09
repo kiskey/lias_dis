@@ -5,6 +5,7 @@
 package inventory
 
 import (
+	"crypto/rand"
     "crypto/sha256"
     "encoding/hex"
     "net"
@@ -12,9 +13,24 @@ import (
     "strings"
     "time"
 
-    "github.com/user/lias-dis/pkg/oui"
     "github.com/user/lias-dis/shared/models"
 )
+
+// NewPermanentIdentity returns an opaque 128-bit internal DeviceID and public
+// PDID. Both values are generated once; later evidence changes never rewrite
+// either identifier.
+func NewPermanentIdentity() (deviceID, pdid string, err error) {
+	var raw [16]byte
+	if _, err = rand.Read(raw[:]); err != nil {
+		return "", "", err
+	}
+	// UUID-v4 variant bits make the randomness/version explicit while the
+	// compact hexadecimal representation remains URL-safe.
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	value := hex.EncodeToString(raw[:])
+	return "dev_" + value, "pdid_" + value, nil
+}
 
 // TierPrefix returns the string prefix corresponding to an IdentityTier.
 func TierPrefix(tier models.IdentityTier) string {
@@ -53,7 +69,7 @@ func DeriveTierAndAnchor(mac, hostname, vendor string) (models.IdentityTier, str
     cleanHost := strings.ToLower(strings.TrimSpace(hostname))
 
     // 1. Burned-In Address (BIA) Anchor
-    if cleanMAC != "" && !oui.IsRandomizedMAC(cleanMAC) {
+	if cleanMAC != "" && !IsLocallyAdministeredMAC(cleanMAC) {
         return models.TierBIA, cleanMAC
     }
 
@@ -72,6 +88,17 @@ func DeriveTierAndAnchor(mac, hostname, vendor string) (models.IdentityTier, str
         anchor = "tent_" + strconv.FormatInt(time.Now().UnixNano(), 10)
     }
     return models.TierTentative, anchor
+}
+
+// IsLocallyAdministeredMAC tests only the IEEE U/L bit. It deliberately does
+// not label the address as randomized: locally administered addresses also
+// include virtual interfaces and administrator-assigned MACs.
+func IsLocallyAdministeredMAC(mac string) bool {
+	hw, err := net.ParseMAC(mac)
+	if err != nil || len(hw) != 6 {
+		return false
+	}
+	return hw[0]&0x02 != 0
 }
 
 // CanPromote reports whether a transition from fromTier to toTier is permitted.

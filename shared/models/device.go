@@ -23,6 +23,9 @@ const (
 
 // Device is the canonical network device record exchanged between DIS and LIAS.
 type Device struct {
+	// DeviceID is an opaque internal identifier generated once and never
+	// changed. PDID remains the public compatibility key consumed by LIAS.
+	DeviceID            string                `json:"device_id"`
     PDID              string                `json:"pdid"`
     IdentityTier      IdentityTier          `json:"identity_tier"`
     IdentityAnchor    string                `json:"identity_anchor"`
@@ -47,6 +50,9 @@ type Device struct {
     Tags              []string              `json:"tags"`
     UserID            string                `json:"user_id,omitempty"`
     SourceInfo        map[string]SourceMeta `json:"source_info,omitempty"`
+	IdentityAssurance   IdentityAssurance     `json:"identity_assurance,omitempty"`
+	IdentityProbability float64               `json:"identity_probability,omitempty"`
+	IdentityAmbiguous   bool                  `json:"identity_ambiguous,omitempty"`
 
     // P1-FIX: Enrichment Tracking & Negative Cache State
     LastEnrichedAt    time.Time `json:"last_enriched_at,omitempty"`

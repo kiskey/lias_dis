@@ -164,6 +164,7 @@ func main() {
 
     mux := http.NewServeMux()
     handlers := disAPI.NewHandlers(cache, broker, orch)
+	handlers.SetIdentityManager(eng)
     handlers.RegisterRoutes(mux, cfg.HTTP.AuthToken)
 
     mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {

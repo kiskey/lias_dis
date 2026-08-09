@@ -5,11 +5,8 @@
 package correlation
 
 import (
-    "strings"
-    "time"
-
     "github.com/user/lias-dis/apps/discovery-service/internal/discovery"
-    "github.com/user/lias-dis/pkg/oui"
+	identitycore "github.com/user/lias-dis/apps/discovery-service/internal/identity"
     "github.com/user/lias-dis/shared/models"
 )
 
@@ -25,48 +22,18 @@ func ValidateIPClaim(obs discovery.Observation, existing *models.Device) IPClaim
     if existing == nil || obs.MAC == nil {
         return ClaimCreateNewSilent
     }
-
-    if !existing.Online && time.Since(existing.LastSeen) > 5*time.Minute {
+	decision := identitycore.ScorePassive(identitycore.PassiveInput{
+		SameIP: true, CanonicalHostname: CanonicalizeHostname(obs.Hostname),
+		ExistingHostname: existing.CanonicalHostname, Services: obs.Services,
+		ExistingServices: existing.Services, Vendor: obs.Vendor, ExistingVendor: existing.Vendor,
+		NewMAC: obs.MAC.String(), ExistingMAC: existing.CurrentMAC,
+		ExistingOnline: existing.Online, ExistingLastSeen: existing.LastSeen,
+		ObservedAt: normalizedObservationTime(obs.Timestamp),
+	})
+	// Compatibility wrapper: passive evidence is never allowed to return
+	// ClaimAttach. A high score is stored as a candidate by Engine.
+	if decision.Probability >= identitycore.PassiveCandidateThreshold {
         return ClaimCreateNewSilent
     }
-
-    macStr := obs.MAC.String()
-
-    if !oui.IsRandomizedMAC(macStr) {
-        return ClaimCreateNew
-    }
-
-    obsVendor := oui.Lookup(macStr)
-    existingVendor := oui.Lookup(existing.CurrentMAC)
-    if obsVendor != "" && existingVendor != "" && !strings.EqualFold(obsVendor, existingVendor) {
-        return ClaimCreateNew
-    }
-
-    hasL7Confirmation := false
-
-    if obs.Hostname != "" && existing.Hostname != "" {
-        if HostnamesAreEquivalent(obs.Hostname, existing.Hostname) {
-            hasL7Confirmation = true
-        }
-    }
-
-    if !hasL7Confirmation && existing.Hostname == "" && len(obs.Services) > 0 && len(existing.Services) > 0 {
-        for _, s1 := range obs.Services {
-            for _, s2 := range existing.Services {
-                if strings.EqualFold(s1, s2) {
-                    hasL7Confirmation = true
-                    break
-                }
-            }
-            if hasL7Confirmation {
-                break
-            }
-        }
-    }
-
-    if hasL7Confirmation && time.Since(existing.LastSeen) < 60*time.Second {
-        return ClaimAttach
-    }
-
     return ClaimCreateNew
 }

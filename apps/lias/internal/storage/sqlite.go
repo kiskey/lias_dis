@@ -320,8 +320,21 @@ func (s *Storage) SaveDeviceTag(pdid, tagID, mac string) error {
 func (s *Storage) MigrateDeviceTag(oldPDID, newPDID string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
-    _, err := s.db.Exec(`UPDATE device_tags SET pdid = ? WHERE pdid = ?`, newPDID, oldPDID)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err = tx.Exec(`
+        INSERT OR IGNORE INTO device_tags (pdid, tag_id, mac)
+        SELECT ?, tag_id, mac FROM device_tags WHERE pdid = ?
+    `, newPDID, oldPDID); err != nil {
     return err
+}
+	if _, err = tx.Exec(`DELETE FROM device_tags WHERE pdid = ?`, oldPDID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Storage) MigrateDevicePolicies(oldPDID, newPDID string) error {

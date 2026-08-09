@@ -78,8 +78,8 @@ func NewStorage(dbPath string) (*Storage, error) {
         slog.Warn("Failed to truncate WAL on startup", "error", err)
     }
 
-    if err := s.migrateV1PDIDs(); err != nil {
-        slog.Warn("v1 to v2 PDID migration encountered an error", "error", err)
+	if err := s.migrateLegacyIdentityMetadata(); err != nil {
+		slog.Warn("legacy identity metadata migration encountered an error", "error", err)
     }
 
     go s.pendingEventsRetentionLoop()
@@ -99,10 +99,18 @@ func (s *Storage) pendingEventsRetentionLoop() {
 		case <-ticker.C:
         s.mu.Lock()
         _, err := s.db.Exec("DELETE FROM pending_events WHERE last_seen < datetime('now', '-1 hour')")
+			_, evidenceErr := s.db.Exec(`DELETE FROM identity_evidence
+				WHERE (expires_at IS NOT NULL AND expires_at < datetime('now'))
+				   OR observed_at < datetime('now', '-30 days')`)
+			_, candidateErr := s.db.Exec(`DELETE FROM identity_candidates
+				WHERE status != 'pending' AND updated_at < datetime('now', '-30 days')`)
         s.mu.Unlock()
         if err != nil {
             slog.Warn("Failed to clean up old pending events", "error", err)
         }
+			if evidenceErr != nil || candidateErr != nil {
+				slog.Warn("Failed to clean up identity audit records", "evidence_error", evidenceErr, "candidate_error", candidateErr)
+			}
 		}
     }
 }
@@ -114,6 +122,7 @@ func (s *Storage) initSchema() error {
     query := `
     CREATE TABLE IF NOT EXISTS devices (
         pdid TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL DEFAULT '',
         identity_tier TEXT NOT NULL DEFAULT 'tentative',
         identity_anchor TEXT NOT NULL DEFAULT '',
         canonical_hostname TEXT NOT NULL DEFAULT '',
@@ -138,7 +147,10 @@ func (s *Storage) initSchema() error {
         user_id TEXT NOT NULL DEFAULT '',
         source_info_json TEXT NOT NULL DEFAULT '{}',
         pending_online_obs_json TEXT NOT NULL DEFAULT '[]',
-        is_tentative INTEGER NOT NULL DEFAULT 0
+        is_tentative INTEGER NOT NULL DEFAULT 0,
+        identity_assurance TEXT NOT NULL DEFAULT 'unverified',
+        identity_probability REAL NOT NULL DEFAULT 0.0,
+        identity_ambiguous INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS device_macs (
@@ -171,9 +183,60 @@ func (s *Storage) initSchema() error {
         sources TEXT NOT NULL DEFAULT ''
     );
 
+    CREATE TABLE IF NOT EXISTS identity_aliases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT NOT NULL,
+        alias_type TEXT NOT NULL,
+        value_hash TEXT NOT NULL,
+        source TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0.0,
+        verified INTEGER NOT NULL DEFAULT 0,
+        first_seen DATETIME NOT NULL,
+        last_seen DATETIME NOT NULL,
+        revoked_at DATETIME,
+        UNIQUE(device_id, alias_type, value_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS identity_evidence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT NOT NULL,
+        candidate_device_id TEXT NOT NULL DEFAULT '',
+        kind TEXT NOT NULL,
+        value_hash TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL,
+        log_likelihood REAL NOT NULL DEFAULT 0.0,
+        observed_at DATETIME NOT NULL,
+        expires_at DATETIME
+    );
+
+    CREATE TABLE IF NOT EXISTS identity_candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_pdid TEXT NOT NULL,
+        target_pdid TEXT NOT NULL,
+        probability REAL NOT NULL,
+        ambiguous INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'pending',
+        factors_json TEXT NOT NULL DEFAULT '[]',
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL,
+        decision_source TEXT NOT NULL DEFAULT '',
+        UNIQUE(source_pdid, target_pdid)
+    );
+
+    CREATE TABLE IF NOT EXISTS pdid_redirects (
+        old_pdid TEXT PRIMARY KEY,
+        new_pdid TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at DATETIME NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_mac_pdid ON device_macs(pdid);
     CREATE INDEX IF NOT EXISTS idx_ip_pdid ON device_ips(pdid);
     CREATE INDEX IF NOT EXISTS idx_pending_pdid ON pending_events(pdid, event_type);
+    CREATE INDEX IF NOT EXISTS idx_identity_alias_lookup ON identity_aliases(alias_type, value_hash, verified, revoked_at);
+    CREATE INDEX IF NOT EXISTS idx_identity_alias_device ON identity_aliases(device_id);
+    CREATE INDEX IF NOT EXISTS idx_identity_evidence_device ON identity_evidence(device_id, observed_at);
+    CREATE INDEX IF NOT EXISTS idx_identity_candidate_status ON identity_candidates(status, updated_at);
     `
 
     _, err := s.db.Exec(query)
@@ -199,6 +262,25 @@ func (s *Storage) initSchema() error {
 	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN source_info_json TEXT NOT NULL DEFAULT '{}'")
 	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN pending_online_obs_json TEXT NOT NULL DEFAULT '[]'")
 	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN is_tentative INTEGER NOT NULL DEFAULT 0")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN device_id TEXT NOT NULL DEFAULT ''")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_assurance TEXT NOT NULL DEFAULT 'unverified'")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_probability REAL NOT NULL DEFAULT 0.0")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_ambiguous INTEGER NOT NULL DEFAULT 0")
+
+	// Legacy deterministic PDIDs remain public compatibility keys. Each row
+	// receives a separate permanent internal identifier exactly once.
+	if _, err := s.db.Exec(`
+        UPDATE devices
+        SET device_id = 'dev_' || lower(hex(randomblob(16)))
+        WHERE device_id = '' OR device_id IS NULL
+    `); err != nil {
+		return fmt.Errorf("failed to assign permanent device IDs: %w", err)
+	}
+	if _, err := s.db.Exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_devices_device_id ON devices(device_id)
+    `); err != nil {
+		return fmt.Errorf("failed to enforce permanent device IDs: %w", err)
+	}
 
 	// Older releases created only a non-unique index while SavePendingEvent
 	// used ON CONFLICT(pdid,event_type). Collapse legacy duplicates first,
@@ -221,26 +303,16 @@ func (s *Storage) initSchema() error {
     return nil
 }
 
-func (s *Storage) migrateV1PDIDs() error {
+func (s *Storage) migrateLegacyIdentityMetadata() error {
     s.mu.Lock()
     defer s.mu.Unlock()
 
-    var needsMigration int
-    err := s.db.QueryRow(
-        "SELECT COUNT(*) FROM devices WHERE pdid NOT LIKE 'pdid_bia_%' AND pdid NOT LIKE 'pdid_l7_%' AND pdid NOT LIKE 'pdid_tent_%'",
-    ).Scan(&needsMigration)
-    if err != nil || needsMigration == 0 {
-        return nil
-    }
-
-    slog.Info("Starting v1→v2 PDID migration", "v1_devices", needsMigration)
-
-    rows, err := s.db.Query("SELECT pdid, current_mac, hostname, vendor FROM devices WHERE pdid NOT LIKE 'pdid_bia_%' AND pdid NOT LIKE 'pdid_l7_%' AND pdid NOT LIKE 'pdid_tent_%'")
+	rows, err := s.db.Query(`SELECT pdid, current_mac, hostname, vendor FROM devices`)
     if err != nil {
         return err
     }
     type migrationEntry struct {
-        OldPDID, NewPDID, Tier, Anchor, CanonicalHost string
+		PDID, Tier, Anchor, CanonicalHost string
     }
     var migrations []migrationEntry
 
@@ -252,10 +324,8 @@ func (s *Storage) migrateV1PDIDs() error {
 
         canonicalHost := inventory.CanonicalizeHostname(hostname)
         tier, anchor := inventory.DeriveTierAndAnchor(mac, canonicalHost, vendor)
-        newPDID := inventory.GeneratePDID(tier, anchor)
-
         migrations = append(migrations, migrationEntry{
-            OldPDID: oldPDID, NewPDID: newPDID,
+			PDID: oldPDID,
             Tier: string(tier), Anchor: anchor, CanonicalHost: canonicalHost,
         })
     }
@@ -268,43 +338,15 @@ func (s *Storage) migrateV1PDIDs() error {
 	}
 
     for _, m := range migrations {
-        tx, _ := s.db.Begin()
-        _, _ = tx.Exec(`INSERT INTO devices (pdid, identity_tier, identity_anchor, canonical_hostname, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online)
-                        SELECT ?, ?, ?, ?, current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, model, device_type, confidence, first_seen, last_seen, online FROM devices WHERE pdid = ?`,
-            m.NewPDID, m.Tier, m.Anchor, m.CanonicalHost, m.OldPDID)
-        _, _ = tx.Exec("UPDATE device_macs SET pdid = ? WHERE pdid = ?", m.NewPDID, m.OldPDID)
-        _, _ = tx.Exec("UPDATE device_ips SET pdid = ? WHERE pdid = ?", m.NewPDID, m.OldPDID)
-        _, _ = tx.Exec("DELETE FROM devices WHERE pdid = ?", m.OldPDID)
-        _ = tx.Commit()
-    }
-
-    _, _ = s.db.Exec("DELETE FROM hostname_owners")
-	ownerRows, err := s.db.Query("SELECT canonical_hostname, pdid FROM devices WHERE canonical_hostname != ''")
-	if err != nil {
-		return err
-	}
-	type hostnameOwner struct{ host, pdid string }
-	var rebuiltOwners []hostnameOwner
-    for ownerRows.Next() {
-        var host, pdid string
-        if err := ownerRows.Scan(&host, &pdid); err == nil && host != "" {
-			rebuiltOwners = append(rebuiltOwners, hostnameOwner{host: host, pdid: pdid})
-		}
-	}
-	if err := ownerRows.Err(); err != nil {
-		ownerRows.Close()
-		return err
-	}
-	if err := ownerRows.Close(); err != nil {
-		return err
-	}
-	for _, owner := range rebuiltOwners {
-		if _, err := s.db.Exec("INSERT OR REPLACE INTO hostname_owners (canonical_hostname, pdid, acquired_at) VALUES (?, ?, ?)", owner.host, owner.pdid, time.Now()); err != nil {
+		// The public PDID is immutable. Better metadata promotes only the
+		// assurance tier and anchor; policy consumers keep the same key.
+		if _, err := s.db.Exec(`
+            UPDATE devices SET identity_tier = ?, identity_anchor = ?, canonical_hostname = ?
+            WHERE pdid = ?
+        `, m.Tier, m.Anchor, m.CanonicalHost, m.PDID); err != nil {
 			return err
         }
     }
-
-    slog.Info("v1→v2 PDID migration complete", "migrated", len(migrations))
     return nil
 }
 
@@ -313,12 +355,13 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
     defer s.mu.Unlock()
 
     rows, err := s.db.Query(`
-        SELECT pdid, identity_tier, identity_anchor, canonical_hostname, 
+        SELECT device_id, pdid, identity_tier, identity_anchor, canonical_hostname,
                current_mac, current_ip, hostname, friendly_name, manufacturer, 
                vendor, model, device_type, confidence, first_seen, last_seen, online,
                last_enriched_at, last_nmap_scan_at, nmap_attempt_count, is_fully_identified,
                services_json, tags_json, user_id, source_info_json,
-               pending_online_obs_json, is_tentative
+               pending_online_obs_json, is_tentative, identity_assurance,
+               identity_probability, identity_ambiguous
         FROM devices
     `)
     if err != nil {
@@ -331,16 +374,17 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
         var onlineInt int
         var firstSeen, lastSeen time.Time
         var lastEnrichedAt, lastNmapScanAt sql.NullTime
-		var nmapAttemptCount, isFullyIdentified, isTentative int
+		var nmapAttemptCount, isFullyIdentified, isTentative, identityAmbiguous int
 		var servicesJSON, tagsJSON, sourceInfoJSON, pendingOnlineJSON string
 
         err := rows.Scan(
-            &d.PDID, &d.IdentityTier, &d.IdentityAnchor, &d.CanonicalHostname,
+			&d.DeviceID, &d.PDID, &d.IdentityTier, &d.IdentityAnchor, &d.CanonicalHostname,
             &d.CurrentMAC, &d.CurrentIP, &d.Hostname, &d.FriendlyName, &d.Manufacturer,
             &d.Vendor, &d.Model, &d.DeviceType, &d.Confidence, &firstSeen, &lastSeen, &onlineInt,
             &lastEnrichedAt, &lastNmapScanAt, &nmapAttemptCount, &isFullyIdentified,
 			&servicesJSON, &tagsJSON, &d.UserID, &sourceInfoJSON,
-			&pendingOnlineJSON, &isTentative,
+			&pendingOnlineJSON, &isTentative, &d.IdentityAssurance,
+			&d.IdentityProbability, &identityAmbiguous,
         )
         if err != nil {
             continue
@@ -358,6 +402,7 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
         d.NmapAttemptCount = nmapAttemptCount
         d.IsFullyIdentified = isFullyIdentified == 1
 		d.IsTentative = isTentative == 1
+		d.IdentityAmbiguous = identityAmbiguous == 1
         
         d.MACs = []string{}
         d.IPs = []string{}
@@ -504,6 +549,13 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
     if d == nil || d.PDID == "" {
         return nil
     }
+	if d.DeviceID == "" {
+		deviceID, _, err := inventory.NewPermanentIdentity()
+		if err != nil {
+			return fmt.Errorf("allocate device ID: %w", err)
+		}
+		d.DeviceID = deviceID
+	}
 
     onlineInt := 0
     if d.Online {
@@ -518,6 +570,10 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
 	isTentativeInt := 0
 	if d.IsTentative {
 		isTentativeInt = 1
+	}
+	identityAmbiguousInt := 0
+	if d.IdentityAmbiguous {
+		identityAmbiguousInt = 1
 	}
 
 	servicesJSON, err := json.Marshal(d.Services)
@@ -538,14 +594,16 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
 	}
 
 	_, err = tx.Exec(`
-        INSERT INTO devices (pdid, identity_tier, identity_anchor, canonical_hostname, 
+	        INSERT INTO devices (device_id, pdid, identity_tier, identity_anchor, canonical_hostname,
             current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, 
             model, device_type, confidence, first_seen, last_seen, online,
             last_enriched_at, last_nmap_scan_at, nmap_attempt_count, is_fully_identified,
             services_json, tags_json, user_id, source_info_json,
-            pending_online_obs_json, is_tentative)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	            pending_online_obs_json, is_tentative, identity_assurance,
+	            identity_probability, identity_ambiguous)
+	        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(pdid) DO UPDATE SET
+	            device_id=excluded.device_id,
             identity_tier=excluded.identity_tier,
             identity_anchor=excluded.identity_anchor,
             canonical_hostname=excluded.canonical_hostname,
@@ -569,8 +627,11 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
             user_id=excluded.user_id,
             source_info_json=excluded.source_info_json,
             pending_online_obs_json=excluded.pending_online_obs_json,
-            is_tentative=excluded.is_tentative
-    `, d.PDID, string(d.IdentityTier), d.IdentityAnchor, d.CanonicalHostname, d.CurrentMAC, d.CurrentIP, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt, d.LastEnrichedAt, d.LastNmapScanAt, d.NmapAttemptCount, isFullyIdentifiedInt, string(servicesJSON), string(tagsJSON), d.UserID, string(sourceInfoJSON), string(pendingOnlineJSON), isTentativeInt)
+	            is_tentative=excluded.is_tentative,
+	            identity_assurance=excluded.identity_assurance,
+	            identity_probability=excluded.identity_probability,
+	            identity_ambiguous=excluded.identity_ambiguous
+	    `, d.DeviceID, d.PDID, string(d.IdentityTier), d.IdentityAnchor, d.CanonicalHostname, d.CurrentMAC, d.CurrentIP, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt, d.LastEnrichedAt, d.LastNmapScanAt, d.NmapAttemptCount, isFullyIdentifiedInt, string(servicesJSON), string(tagsJSON), d.UserID, string(sourceInfoJSON), string(pendingOnlineJSON), isTentativeInt, string(d.IdentityAssurance), d.IdentityProbability, identityAmbiguousInt)
 
     if err != nil {
         return fmt.Errorf("failed to upsert device %s: %w", d.PDID, err)

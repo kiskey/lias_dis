@@ -17,6 +17,7 @@ import (
 
     "github.com/user/lias-dis/apps/discovery-service/internal/api"
     "github.com/user/lias-dis/apps/discovery-service/internal/discovery"
+	identitycore "github.com/user/lias-dis/apps/discovery-service/internal/identity"
     "github.com/user/lias-dis/apps/discovery-service/internal/inventory"
     "github.com/user/lias-dis/apps/discovery-service/internal/storage"
     "github.com/user/lias-dis/shared/models"
@@ -43,6 +44,8 @@ type Engine struct {
 	deferredOnline map[string]struct{}
 
     promoteMu sync.Mutex
+	identityMu        sync.Mutex
+	identityLastWrite map[string]time.Time
 }
 
 func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
@@ -55,6 +58,7 @@ func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
         dirtyDevices: make(map[string]struct{}),
 		persistedSeen:  make(map[string]time.Time),
 		deferredOnline: make(map[string]struct{}),
+		identityLastWrite: make(map[string]time.Time),
     }
 }
 
@@ -183,6 +187,13 @@ func (e *Engine) runDedupSweep(ctx context.Context) {
                 }
             }
             e.dedupMu.Unlock()
+			e.identityMu.Lock()
+			for key, last := range e.identityLastWrite {
+				if now.Sub(last) > 24*time.Hour {
+					delete(e.identityLastWrite, key)
+				}
+			}
+			e.identityMu.Unlock()
         }
     }
 }
@@ -329,7 +340,35 @@ func (e *Engine) processObservation(obs discovery.Observation) {
         return
     }
 
-    d := e.cache.GetByMACOrIP(macStr, ipStr)
+	signals := identitycore.ObservationSignals(obs, macStr, canonicalHost)
+	d := e.resolveVerifiedObservation(signals)
+	verifiedResolution := d != nil
+	if d == nil {
+		d = e.cache.GetByMAC(macStr)
+	}
+	if d == nil && macStr == "" {
+		d = e.cache.GetByIP(ipStr)
+	}
+	var candidateTarget *models.Device
+	var candidateDecision identitycore.Decision
+	if d == nil && macStr != "" && ipStr != "" {
+		if existing := e.cache.GetByIP(ipStr); existing != nil && !existing.HasMAC(macStr) {
+			candidateTarget = existing
+			candidateDecision = identitycore.ScorePassive(identitycore.PassiveInput{
+				SameIP: true, CanonicalHostname: canonicalHost,
+				ExistingHostname: existing.CanonicalHostname,
+				Services:         obs.Services, ExistingServices: existing.Services,
+				Vendor: obs.Vendor, ExistingVendor: existing.Vendor,
+				NewMAC: macStr, ExistingMAC: existing.CurrentMAC,
+				ExistingOnline: existing.Online, ExistingLastSeen: existing.LastSeen,
+				ObservedAt: normalizedObservationTime(obs.Timestamp),
+			})
+			// IP reuse is not identity proof. Remove the stale index mapping
+			// while retaining a reviewable scored relationship.
+			e.cache.RemoveIPIndex(ipStr)
+			e.markDirty(existing.PDID)
+		}
+	}
     dirty := false
 
     if macStr != "" && d != nil && d.HasMAC(macStr) && d.CurrentMAC != macStr {
@@ -338,66 +377,28 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     }
 
     if macStr != "" && d != nil && !d.HasMAC(macStr) {
-        if d.CurrentIP == ipStr {
-            claimRes := ValidateIPClaim(obs, d)
-            if claimRes == ClaimAttach {
+		if verifiedResolution {
                 oldMAC := d.CurrentMAC
                 d.AddMAC(macStr)
                 d.CurrentMAC = macStr
+			d.IdentityAssurance = models.IdentityVerified
+			d.IdentityProbability = 1
+			d.IdentityAmbiguous = false
                 e.debouncer.Submit(d.PDID, models.EventMACChanged, obs.Source, obs.Group, models.DeviceEventPayload{
-                    PDID:      d.PDID,
-                    MAC:       macStr,
-                    OldMAC:    oldMAC,
-                    Timestamp: time.Now(),
+				PDID: d.PDID, MAC: macStr, OldMAC: oldMAC, Timestamp: time.Now(),
                 })
                 dirty = true
-            } else if claimRes == ClaimCreateNewSilent {
-                d = nil
             } else {
-                e.broker.Broadcast(models.NewEvent(models.EventSecurityAlert, d.PDID, models.SecurityAlertPayload{
-                    AlertType: "mac_spoof_detected",
-                    PDID:      d.PDID,
-                    Details:   fmt.Sprintf("MAC %s claimed IP %s currently held by %s (MAC %s)", macStr, ipStr, d.PDID, d.CurrentMAC),
-                    Timestamp: time.Now(),
-                }))
-                slog.Warn("Potential MAC spoofing detected", "pdid", d.PDID, "mac", d.CurrentMAC, "ip", ipStr, "conflict_mac", macStr)
-                
-                e.cache.RemoveIPIndex(ipStr)
-                e.markDirty(d.PDID)
-                d = nil
-            }
-        } else if ipStr != "" {
-            if existingOnIP := e.cache.GetByIP(ipStr); existingOnIP != nil && existingOnIP.PDID != d.PDID {
-                claimRes := ValidateIPClaim(obs, existingOnIP)
-                if claimRes == ClaimAttach {
-                    oldMAC := existingOnIP.CurrentMAC
-                    existingOnIP.AddMAC(macStr)
-                    existingOnIP.CurrentMAC = macStr
-                    e.debouncer.Submit(existingOnIP.PDID, models.EventMACChanged, obs.Source, obs.Group, models.DeviceEventPayload{
-                        PDID:      existingOnIP.PDID,
-                        MAC:       macStr,
-                        OldMAC:    oldMAC,
-                        Timestamp: time.Now(),
+			candidateTarget = d
+			candidateDecision = identitycore.ScorePassive(identitycore.PassiveInput{
+				SameIP: d.CurrentIP == ipStr, CanonicalHostname: canonicalHost,
+				ExistingHostname: d.CanonicalHostname, Services: obs.Services,
+				ExistingServices: d.Services, Vendor: obs.Vendor, ExistingVendor: d.Vendor,
+				NewMAC: macStr, ExistingMAC: d.CurrentMAC, ExistingOnline: d.Online,
+				ExistingLastSeen: d.LastSeen, ObservedAt: normalizedObservationTime(obs.Timestamp),
                     })
-                    d = existingOnIP 
-                    dirty = true
-                } else if claimRes == ClaimCreateNewSilent {
-                    d = nil
-                } else {
-                    e.broker.Broadcast(models.NewEvent(models.EventSecurityAlert, existingOnIP.PDID, models.SecurityAlertPayload{
-                        AlertType: "mac_spoof_detected",
-                        PDID:      existingOnIP.PDID,
-                        Details:   fmt.Sprintf("MAC %s claimed IP %s held by %s", macStr, ipStr, existingOnIP.PDID),
-                        Timestamp: time.Now(),
-                    }))
-                    slog.Warn("Potential cross-device MAC spoofing detected", "pdid", existingOnIP.PDID, "ip", ipStr, "conflict_mac", macStr)
-                    
-                    e.cache.RemoveIPIndex(ipStr)
-                    e.markDirty(existingOnIP.PDID)
                     d = nil
                 }
-            }
-        }
     }
 
     if canonicalHost != "" {
@@ -422,9 +423,27 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
     if d == nil {
         tier, anchor := inventory.DeriveTierAndAnchor(macStr, canonicalHost, obs.Vendor)
-        pdid := inventory.GeneratePDID(tier, anchor)
+		deviceID, pdid, err := inventory.NewPermanentIdentity()
+		if err != nil {
+			slog.Error("Failed to allocate permanent identity", "error", err)
+			return
+		}
+
+		assurance := models.IdentityUnverified
+		probability := 0.0
+		if macStr != "" && !inventory.IsLocallyAdministeredMAC(macStr) {
+			assurance = models.IdentityStrong
+			probability = 0.999
+		}
+		ambiguous := false
+		if candidateTarget != nil && candidateDecision.Probability >= identitycore.PassiveCandidateThreshold {
+			assurance = models.IdentityCandidate
+			probability = candidateDecision.Probability
+			ambiguous = true
+		}
 
         d = &models.Device{
+			DeviceID:            deviceID,
             PDID:              pdid,
             IdentityTier:      tier,
             IdentityAnchor:    anchor,
@@ -435,6 +454,9 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             Online:            false,
             Confidence:        obs.Confidence,
             SourceInfo:        make(map[string]models.SourceMeta),
+			IdentityAssurance:   assurance,
+			IdentityProbability: probability,
+			IdentityAmbiguous:   ambiguous,
         }
         d.AddMAC(macStr)
         if obs.Source != "pihole" {
@@ -463,7 +485,14 @@ func (e *Engine) processObservation(obs discovery.Observation) {
             _ = e.cache.AcquireHostname(canonicalHost, d.PDID)
         }
 
-        e.markDirty(d.PDID)
+		if e.store != nil {
+			if err := e.store.SaveDevice(d); err != nil {
+				e.cache.Delete(d.PDID)
+				slog.Error("Failed to persist new permanent identity", "pdid", d.PDID, "error", err)
+				return
+			}
+		}
+		e.recordIdentitySignals(d, signals, candidateTarget, candidateDecision, seenAt)
 
         slog.Info("New tiered device correlated", "pdid", d.PDID, "tier", tier, "mac", macStr, "ip", ipStr)
         e.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
@@ -477,6 +506,8 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		}
         return
     }
+
+	e.recordIdentitySignals(d, signals, nil, identitycore.Decision{}, normalizedObservationTime(obs.Timestamp))
 
     newTier, newAnchor := inventory.DeriveTierAndAnchor(macStr, canonicalHost, obs.Vendor)
     if inventory.CanPromote(d.IdentityTier, newTier) {
@@ -588,41 +619,14 @@ func (e *Engine) promoteDevice(d *models.Device, newTier models.IdentityTier, ne
     e.promoteMu.Lock()
     defer e.promoteMu.Unlock()
 
-    oldPDID := d.PDID
-    newPDID := inventory.GeneratePDID(newTier, newAnchor)
-
-    slog.Info("Promoting device identity tier", "old_pdid", oldPDID, "new_pdid", newPDID, "from", d.IdentityTier, "to", newTier)
-
-    d.PDID = newPDID
+	slog.Info("Promoting device identity metadata", "pdid", d.PDID, "from", d.IdentityTier, "to", newTier, "reason", reasonSuffix)
     d.IdentityTier = newTier
     d.IdentityAnchor = newAnchor
     d.CanonicalHostname = canonicalHost
 
-    if e.store != nil {
-        if err := e.store.ReplaceDevicePDID(oldPDID, newPDID, d); err != nil {
-            slog.Error("Atomic PDID replacement failed", "old_pdid", oldPDID, "new_pdid", newPDID, "error", err)
-            d.PDID = oldPDID
-            d.IdentityTier = models.TierL7
-            return
-        }
-    }
-
-    e.debouncer.MigratePDID(oldPDID, newPDID)
-
-    e.cache.Delete(oldPDID)
     e.cache.Upsert(d)
     e.markDirty(d.PDID)
-
-    migratedMACs := make([]string, len(d.MACs))
-    copy(migratedMACs, d.MACs)
-
-    e.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, d.PDID, models.DeviceReidentifiedPayload{
-        OldPDID:      oldPDID,
-        NewPDID:      newPDID,
-        Reason:       string(newTier) + "_" + reasonSuffix,
-        MigratedMACs: migratedMACs,
-        Timestamp:    time.Now(),
-    }))
+	e.broker.Broadcast(models.NewEvent(models.EventFingerprintUpdated, d.PDID, d))
 }
 
 func (e *Engine) PromoteDeviceIdentity(pdid string) *models.Device {
