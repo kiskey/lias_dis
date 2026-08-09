@@ -6,6 +6,7 @@ package storage
 
 import (
     "database/sql"
+	"encoding/json"
     "fmt"
     "log/slog"
     "os"
@@ -32,6 +33,8 @@ type Storage struct {
     mu     sync.Mutex
     dbPath string
     db     *sql.DB
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 func NewStorage(dbPath string) (*Storage, error) {
@@ -43,15 +46,27 @@ func NewStorage(dbPath string) (*Storage, error) {
         return nil, fmt.Errorf("failed to create database directory: %w", err)
     }
 
-    dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=journal_mode(WAL)", dbPath)
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=journal_mode(WAL)", dbPath)
     db, err := sql.Open("sqlite", dsn)
     if err != nil {
         return nil, fmt.Errorf("failed to open sqlite database: %w", err)
     }
 
+	// DIS is deliberately a low-write service. A single SQLite connection
+	// prevents database/sql from creating competing writers and also makes
+	// per-connection PRAGMA behavior deterministic.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to initialize sqlite database: %w", err)
+	}
+
     s := &Storage{
         dbPath: dbPath,
         db:     db,
+		stopCh: make(chan struct{}),
     }
 
     if err := s.initSchema(); err != nil {
@@ -78,15 +93,17 @@ func (s *Storage) pendingEventsRetentionLoop() {
     defer ticker.Stop()
 
     for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
         s.mu.Lock()
         _, err := s.db.Exec("DELETE FROM pending_events WHERE last_seen < datetime('now', '-1 hour')")
         s.mu.Unlock()
-
         if err != nil {
             slog.Warn("Failed to clean up old pending events", "error", err)
         }
-
-        <-ticker.C
+		}
     }
 }
 
@@ -115,7 +132,13 @@ func (s *Storage) initSchema() error {
         last_enriched_at DATETIME,
         last_nmap_scan_at DATETIME,
         nmap_attempt_count INTEGER NOT NULL DEFAULT 0,
-        is_fully_identified INTEGER NOT NULL DEFAULT 0
+        is_fully_identified INTEGER NOT NULL DEFAULT 0,
+        services_json TEXT NOT NULL DEFAULT '[]',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        user_id TEXT NOT NULL DEFAULT '',
+        source_info_json TEXT NOT NULL DEFAULT '{}',
+        pending_online_obs_json TEXT NOT NULL DEFAULT '[]',
+        is_tentative INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS device_macs (
@@ -170,6 +193,31 @@ func (s *Storage) initSchema() error {
     _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN nmap_attempt_count INTEGER NOT NULL DEFAULT 0")
     _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN is_fully_identified INTEGER NOT NULL DEFAULT 0")
 
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN services_json TEXT NOT NULL DEFAULT '[]'")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN source_info_json TEXT NOT NULL DEFAULT '{}'")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN pending_online_obs_json TEXT NOT NULL DEFAULT '[]'")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN is_tentative INTEGER NOT NULL DEFAULT 0")
+
+	// Older releases created only a non-unique index while SavePendingEvent
+	// used ON CONFLICT(pdid,event_type). Collapse legacy duplicates first,
+	// then install the unique constraint required by that upsert.
+	if _, err := s.db.Exec(`
+        DELETE FROM pending_events
+        WHERE id NOT IN (
+            SELECT MAX(id) FROM pending_events GROUP BY pdid, event_type
+        )
+    `); err != nil {
+		return fmt.Errorf("failed to deduplicate pending events: %w", err)
+	}
+	if _, err := s.db.Exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_pdid_event_type
+        ON pending_events(pdid, event_type)
+    `); err != nil {
+		return fmt.Errorf("failed to create pending-event uniqueness constraint: %w", err)
+	}
+
     return nil
 }
 
@@ -191,8 +239,6 @@ func (s *Storage) migrateV1PDIDs() error {
     if err != nil {
         return err
     }
-    defer rows.Close()
-
     type migrationEntry struct {
         OldPDID, NewPDID, Tier, Anchor, CanonicalHost string
     }
@@ -213,6 +259,13 @@ func (s *Storage) migrateV1PDIDs() error {
             Tier: string(tier), Anchor: anchor, CanonicalHost: canonicalHost,
         })
     }
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 
     for _, m := range migrations {
         tx, _ := s.db.Begin()
@@ -226,12 +279,28 @@ func (s *Storage) migrateV1PDIDs() error {
     }
 
     _, _ = s.db.Exec("DELETE FROM hostname_owners")
-    ownerRows, _ := s.db.Query("SELECT canonical_hostname, pdid FROM devices WHERE canonical_hostname != ''")
-    defer ownerRows.Close()
+	ownerRows, err := s.db.Query("SELECT canonical_hostname, pdid FROM devices WHERE canonical_hostname != ''")
+	if err != nil {
+		return err
+	}
+	type hostnameOwner struct{ host, pdid string }
+	var rebuiltOwners []hostnameOwner
     for ownerRows.Next() {
         var host, pdid string
         if err := ownerRows.Scan(&host, &pdid); err == nil && host != "" {
-            _, _ = s.db.Exec("INSERT OR REPLACE INTO hostname_owners (canonical_hostname, pdid, acquired_at) VALUES (?, ?, ?)", host, pdid, time.Now())
+			rebuiltOwners = append(rebuiltOwners, hostnameOwner{host: host, pdid: pdid})
+		}
+	}
+	if err := ownerRows.Err(); err != nil {
+		ownerRows.Close()
+		return err
+	}
+	if err := ownerRows.Close(); err != nil {
+		return err
+	}
+	for _, owner := range rebuiltOwners {
+		if _, err := s.db.Exec("INSERT OR REPLACE INTO hostname_owners (canonical_hostname, pdid, acquired_at) VALUES (?, ?, ?)", owner.host, owner.pdid, time.Now()); err != nil {
+			return err
         }
     }
 
@@ -247,14 +316,14 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
         SELECT pdid, identity_tier, identity_anchor, canonical_hostname, 
                current_mac, current_ip, hostname, friendly_name, manufacturer, 
                vendor, model, device_type, confidence, first_seen, last_seen, online,
-               last_enriched_at, last_nmap_scan_at, nmap_attempt_count, is_fully_identified
+               last_enriched_at, last_nmap_scan_at, nmap_attempt_count, is_fully_identified,
+               services_json, tags_json, user_id, source_info_json,
+               pending_online_obs_json, is_tentative
         FROM devices
     `)
     if err != nil {
         return nil, fmt.Errorf("failed to query devices from DB: %w", err)
     }
-    defer rows.Close()
-
     deviceMap := make(map[string]*models.Device)
 
     for rows.Next() {
@@ -262,13 +331,16 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
         var onlineInt int
         var firstSeen, lastSeen time.Time
         var lastEnrichedAt, lastNmapScanAt sql.NullTime
-        var nmapAttemptCount, isFullyIdentified int
+		var nmapAttemptCount, isFullyIdentified, isTentative int
+		var servicesJSON, tagsJSON, sourceInfoJSON, pendingOnlineJSON string
 
         err := rows.Scan(
             &d.PDID, &d.IdentityTier, &d.IdentityAnchor, &d.CanonicalHostname,
             &d.CurrentMAC, &d.CurrentIP, &d.Hostname, &d.FriendlyName, &d.Manufacturer,
             &d.Vendor, &d.Model, &d.DeviceType, &d.Confidence, &firstSeen, &lastSeen, &onlineInt,
             &lastEnrichedAt, &lastNmapScanAt, &nmapAttemptCount, &isFullyIdentified,
+			&servicesJSON, &tagsJSON, &d.UserID, &sourceInfoJSON,
+			&pendingOnlineJSON, &isTentative,
         )
         if err != nil {
             continue
@@ -285,18 +357,29 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
         }
         d.NmapAttemptCount = nmapAttemptCount
         d.IsFullyIdentified = isFullyIdentified == 1
+		d.IsTentative = isTentative == 1
         
         d.MACs = []string{}
         d.IPs = []string{}
         d.SourceInfo = make(map[string]models.SourceMeta)
+		_ = json.Unmarshal([]byte(servicesJSON), &d.Services)
+		_ = json.Unmarshal([]byte(tagsJSON), &d.Tags)
+		_ = json.Unmarshal([]byte(sourceInfoJSON), &d.SourceInfo)
+		_ = json.Unmarshal([]byte(pendingOnlineJSON), &d.PendingOnlineObs)
 
         devCopy := d
         deviceMap[d.PDID] = &devCopy
     }
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("failed while reading devices from DB: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 
     macRows, err := s.db.Query("SELECT pdid, mac FROM device_macs")
     if err == nil {
-        defer macRows.Close()
         for macRows.Next() {
             var pdid, mac string
             if macRows.Scan(&pdid, &mac) == nil {
@@ -305,11 +388,11 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
                 }
             }
         }
+		macRows.Close()
     }
 
     ipRows, err := s.db.Query("SELECT pdid, ip FROM device_ips")
     if err == nil {
-        defer ipRows.Close()
         for ipRows.Next() {
             var pdid, ip string
             if ipRows.Scan(&pdid, &ip) == nil {
@@ -318,6 +401,7 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
                 }
             }
         }
+		ipRows.Close()
     }
 
     devices := make([]models.Device, 0, len(deviceMap))
@@ -407,20 +491,10 @@ func (s *Storage) SaveDevicesBatch(devs []*models.Device) error {
     }
     defer func() { _ = tx.Rollback() }()
 
-    for i, d := range devs {
-        spName := fmt.Sprintf("sp_%d", i)
-        if _, err := tx.Exec("SAVEPOINT " + spName); err != nil {
-            slog.Error("Failed to create savepoint, aborting batch", "error", err)
-            return err
-        }
-
+	for _, d := range devs {
         if err := s.saveDeviceTx(tx, d); err != nil {
-            slog.Error("Failed to save device in batch, rolling back savepoint", "pdid", d.PDID, "error", err)
-            _, _ = tx.Exec("ROLLBACK TO " + spName)
-            _, _ = tx.Exec("RELEASE " + spName)
-            continue
+			return err
         }
-        _, _ = tx.Exec("RELEASE " + spName)
     }
 
     return tx.Commit()
@@ -441,12 +515,36 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
         isFullyIdentifiedInt = 1
     }
 
-    _, err := tx.Exec(`
+	isTentativeInt := 0
+	if d.IsTentative {
+		isTentativeInt = 1
+	}
+
+	servicesJSON, err := json.Marshal(d.Services)
+	if err != nil {
+		return fmt.Errorf("failed to encode services for %s: %w", d.PDID, err)
+	}
+	tagsJSON, err := json.Marshal(d.Tags)
+	if err != nil {
+		return fmt.Errorf("failed to encode tags for %s: %w", d.PDID, err)
+	}
+	sourceInfoJSON, err := json.Marshal(d.SourceInfo)
+	if err != nil {
+		return fmt.Errorf("failed to encode source metadata for %s: %w", d.PDID, err)
+	}
+	pendingOnlineJSON, err := json.Marshal(d.PendingOnlineObs)
+	if err != nil {
+		return fmt.Errorf("failed to encode pending observations for %s: %w", d.PDID, err)
+	}
+
+	_, err = tx.Exec(`
         INSERT INTO devices (pdid, identity_tier, identity_anchor, canonical_hostname, 
             current_mac, current_ip, hostname, friendly_name, manufacturer, vendor, 
             model, device_type, confidence, first_seen, last_seen, online,
-            last_enriched_at, last_nmap_scan_at, nmap_attempt_count, is_fully_identified)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            last_enriched_at, last_nmap_scan_at, nmap_attempt_count, is_fully_identified,
+            services_json, tags_json, user_id, source_info_json,
+            pending_online_obs_json, is_tentative)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(pdid) DO UPDATE SET
             identity_tier=excluded.identity_tier,
             identity_anchor=excluded.identity_anchor,
@@ -465,8 +563,14 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
             last_enriched_at=excluded.last_enriched_at,
             last_nmap_scan_at=excluded.last_nmap_scan_at,
             nmap_attempt_count=excluded.nmap_attempt_count,
-            is_fully_identified=excluded.is_fully_identified
-    `, d.PDID, string(d.IdentityTier), d.IdentityAnchor, d.CanonicalHostname, d.CurrentMAC, d.CurrentIP, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt, d.LastEnrichedAt, d.LastNmapScanAt, d.NmapAttemptCount, isFullyIdentifiedInt)
+            is_fully_identified=excluded.is_fully_identified,
+            services_json=excluded.services_json,
+            tags_json=excluded.tags_json,
+            user_id=excluded.user_id,
+            source_info_json=excluded.source_info_json,
+            pending_online_obs_json=excluded.pending_online_obs_json,
+            is_tentative=excluded.is_tentative
+    `, d.PDID, string(d.IdentityTier), d.IdentityAnchor, d.CanonicalHostname, d.CurrentMAC, d.CurrentIP, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt, d.LastEnrichedAt, d.LastNmapScanAt, d.NmapAttemptCount, isFullyIdentifiedInt, string(servicesJSON), string(tagsJSON), d.UserID, string(sourceInfoJSON), string(pendingOnlineJSON), isTentativeInt)
 
     if err != nil {
         return fmt.Errorf("failed to upsert device %s: %w", d.PDID, err)
@@ -648,6 +752,7 @@ func (s *Storage) LoadPendingEvents() ([]PendingEventRecord, error) {
 }
 
 func (s *Storage) Close() error {
+	s.stopOnce.Do(func() { close(s.stopCh) })
     s.mu.Lock()
     defer s.mu.Unlock()
     if s.db != nil {

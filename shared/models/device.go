@@ -63,6 +63,60 @@ type SourceMeta struct {
     Raw        map[string]interface{} `json:"raw,omitempty"`
 }
 
+// Clone returns a fully independent copy suitable for crossing cache lock
+// boundaries. Device contains slices and maps, so a struct assignment alone
+// would leave callers sharing mutable backing storage with the cache.
+func (d *Device) Clone() *Device {
+	if d == nil {
+		return nil
+	}
+
+	clone := *d
+	clone.MACs = append([]string(nil), d.MACs...)
+	clone.IPs = append([]string(nil), d.IPs...)
+	clone.Services = append([]string(nil), d.Services...)
+	clone.PendingOnlineObs = append([]string(nil), d.PendingOnlineObs...)
+	clone.Tags = append([]string(nil), d.Tags...)
+
+	if d.SourceInfo != nil {
+		clone.SourceInfo = make(map[string]SourceMeta, len(d.SourceInfo))
+		for key, meta := range d.SourceInfo {
+			meta.Raw = cloneRawMap(meta.Raw)
+			clone.SourceInfo[key] = meta
+		}
+	}
+
+	return &clone
+}
+
+func cloneRawMap(src map[string]interface{}) map[string]interface{} {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]interface{}, len(src))
+	for key, value := range src {
+		dst[key] = cloneRawValue(value)
+	}
+	return dst
+}
+
+func cloneRawValue(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		return cloneRawMap(v)
+	case []interface{}:
+		result := make([]interface{}, len(v))
+		for i := range v {
+			result[i] = cloneRawValue(v[i])
+		}
+		return result
+	case []string:
+		return append([]string(nil), v...)
+	default:
+		return value
+	}
+}
+
 // Enrichment represents the structured output of an Enricher invocation.
 type Enrichment struct {
     Hostname     string                 `json:"hostname,omitempty"`

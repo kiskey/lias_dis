@@ -131,13 +131,14 @@ func (p *PiholeProvider) poll() error {
     }
 
     targetEndpoints := []string{
-        "/api/stats/top_clients?count=100",
         "/api/network/devices",
+		"/api/stats/top_clients?count=100",
         "/api/stats/clients",
     }
 
-    var resp *http.Response
     var fetchErr error
+	var clientList []piholeClient
+	var selectedEndpoint string
 
     for _, ep := range targetEndpoints {
         req, err := http.NewRequestWithContext(p.ctx, "GET", baseURL+ep, nil)
@@ -152,74 +153,44 @@ func (p *PiholeProvider) poll() error {
         }
 
         res, err := p.client.Do(req)
-        if err == nil && res.StatusCode == http.StatusOK {
-            resp = res
-            break
+		if err != nil {
+			fetchErr = err
+			continue
         }
-        if res != nil {
-            // Low 2 Fix: If 401, return errUnauthorized to trigger re-auth
             if res.StatusCode == http.StatusUnauthorized {
                 p.sidValid = false
                 res.Body.Close()
                 return errUnauthorized
             }
+		if res.StatusCode != http.StatusOK {
             res.Body.Close()
-        }
-        fetchErr = err
+			continue
     }
 
-    if resp == nil {
-        if fetchErr != nil {
-            slog.Debug("Failed to fetch Pi-hole v6 clients", "error", fetchErr)
-        }
-        return nil
+		bodyBytes, readErr := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		res.Body.Close()
+		if readErr != nil {
+			fetchErr = readErr
+			continue
     }
-    defer resp.Body.Close()
-
-    bodyBytes, err := io.ReadAll(resp.Body)
-    if err != nil {
-        slog.Error("Failed to read Pi-hole response body", "error", err)
-        return nil
+		parsed, parseErr := parsePiholeClients(ep, bodyBytes)
+		if parseErr != nil {
+			fetchErr = parseErr
+			continue
     }
-
-    type clientItem struct {
-        IP   string `json:"ip"`
-        Name string `json:"name"`
-        Mac  string `json:"hwaddr"`
+		if len(parsed) == 0 {
+			continue
     }
-
-    var clientList []clientItem
-
-    var topClientsWrapper struct {
-        TopClients []struct {
-            IP   string `json:"ip"`
-            Name string `json:"name"`
-            Mac  string `json:"hwaddr"`
-        } `json:"top_clients"`
+		clientList = parsed
+		selectedEndpoint = ep
+		break
     }
 
-    if err := json.Unmarshal(bodyBytes, &topClientsWrapper); err == nil && len(topClientsWrapper.TopClients) > 0 {
-        for _, tc := range topClientsWrapper.TopClients {
-            clientList = append(clientList, clientItem{
-                IP:   tc.IP,
-                Name: tc.Name,
-                Mac:  tc.Mac,
-            })
+	if len(clientList) == 0 {
+		if fetchErr != nil {
+			slog.Debug("Failed to fetch usable Pi-hole v6 clients", "error", fetchErr)
         }
-    } else {
-        var devWrapper struct {
-            Devices []clientItem `json:"devices"`
-        }
-        if err := json.Unmarshal(bodyBytes, &devWrapper); err == nil && len(devWrapper.Devices) > 0 {
-            clientList = devWrapper.Devices
-        } else {
-            var rawWrapper struct {
-                Clients json.RawMessage `json:"clients"`
-            }
-            if err := json.Unmarshal(bodyBytes, &rawWrapper); err == nil {
-                _ = json.Unmarshal(rawWrapper.Clients, &clientList)
-            }
-        }
+		return nil
     }
 
     for _, c := range clientList {
@@ -243,9 +214,11 @@ func (p *PiholeProvider) poll() error {
             IP:         ipObj,
             MAC:        macObj,
             Hostname:   UnescapeHostname(c.Name),
-            Online:     true,
+			Vendor:     c.Vendor,
+			Online:     false,
             Confidence: 0.30,
             Timestamp:  time.Now(),
+			Raw:        map[string]interface{}{"endpoint": selectedEndpoint},
         }
 
         select {
@@ -256,6 +229,58 @@ func (p *PiholeProvider) poll() error {
     }
 
     return nil
+}
+
+type piholeClient struct {
+	IP     string
+	Name   string
+	Mac    string
+	Vendor string
+}
+
+func parsePiholeClients(endpoint string, body []byte) ([]piholeClient, error) {
+	if strings.HasPrefix(endpoint, "/api/network/devices") {
+		var wrapper struct {
+			Devices []struct {
+				HWAddr    string `json:"hwaddr"`
+				MacVendor string `json:"macVendor"`
+				IPs       []struct {
+					IP   string `json:"ip"`
+					Name string `json:"name"`
+				} `json:"ips"`
+			} `json:"devices"`
+		}
+		if err := json.Unmarshal(body, &wrapper); err != nil {
+			return nil, err
+		}
+		clients := make([]piholeClient, 0)
+		for _, device := range wrapper.Devices {
+			for _, address := range device.IPs {
+				clients = append(clients, piholeClient{
+					IP:     address.IP,
+					Name:   address.Name,
+					Mac:    device.HWAddr,
+					Vendor: device.MacVendor,
+				})
+			}
+		}
+		return clients, nil
+	}
+
+	var wrapper struct {
+		Clients []struct {
+			IP   string `json:"ip"`
+			Name string `json:"name"`
+		} `json:"clients"`
+	}
+	if err := json.Unmarshal(body, &wrapper); err != nil {
+		return nil, err
+	}
+	clients := make([]piholeClient, 0, len(wrapper.Clients))
+	for _, client := range wrapper.Clients {
+		clients = append(clients, piholeClient{IP: client.IP, Name: client.Name})
+	}
+	return clients, nil
 }
 
 func (p *PiholeProvider) authenticate() error {

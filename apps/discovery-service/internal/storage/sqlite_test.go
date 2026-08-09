@@ -5,6 +5,7 @@
 package storage
 
 import (
+	"encoding/json"
     "path/filepath"
     "testing"
     "time"
@@ -63,4 +64,75 @@ func TestSaveDevicesBatchSavepoint(t *testing.T) {
     if err != nil {
         t.Errorf("Pending events purge query failed: %v", err)
     }
+}
+
+func TestPendingEventUpsertUsesUniqueConstraint(t *testing.T) {
+	s, err := NewStorage(filepath.Join(t.TempDir(), "pending.db"))
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	if err := s.SavePendingEvent("pdid_test", "device.hostname_changed", []byte(`{"hostname":"one"}`), now, now, 1, "dhcp"); err != nil {
+		t.Fatalf("first pending-event upsert: %v", err)
+	}
+	if err := s.SavePendingEvent("pdid_test", "device.hostname_changed", []byte(`{"hostname":"two"}`), now, now.Add(time.Second), 2, "dhcp,avahi"); err != nil {
+		t.Fatalf("second pending-event upsert: %v", err)
+	}
+
+	records, err := s.LoadPendingEvents()
+	if err != nil {
+		t.Fatalf("LoadPendingEvents: %v", err)
+	}
+	if len(records) != 1 || records[0].Confirmations != 2 || string(records[0].Payload) != `{"hostname":"two"}` {
+		t.Fatalf("unexpected upsert result: %+v", records)
+	}
+}
+
+func TestHydratePreservesCompleteDeviceState(t *testing.T) {
+	s, err := NewStorage(filepath.Join(t.TempDir(), "hydrate.db"))
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	dev := &models.Device{
+		PDID:             "pdid_test_complete",
+		IdentityTier:     models.TierTentative,
+		CurrentMAC:       "02:00:00:00:00:01",
+		MACs:             []string{"02:00:00:00:00:01"},
+		CurrentIP:        "192.168.1.25",
+		IPs:              []string{"192.168.1.25"},
+		Services:         []string{"_airplay._tcp"},
+		Tags:             []string{"kids"},
+		UserID:           "user-1",
+		PendingOnlineObs: []string{"netlink"},
+		IsTentative:      true,
+		FirstSeen:        now,
+		LastSeen:         now,
+		SourceInfo: map[string]models.SourceMeta{
+			"netlink": {Source: "netlink", Confidence: 0.9, Timestamp: now, Raw: map[string]interface{}{"state": "reachable"}},
+		},
+	}
+	if err := s.SaveDevice(dev); err != nil {
+		t.Fatalf("SaveDevice: %v", err)
+	}
+
+	hydrated, err := s.LoadHydrate()
+	if err != nil {
+		t.Fatalf("LoadHydrate: %v", err)
+	}
+	if len(hydrated) != 1 {
+		t.Fatalf("expected one device, got %d", len(hydrated))
+	}
+	got := hydrated[0]
+	if got.UserID != dev.UserID || !got.IsTentative || len(got.Services) != 1 || len(got.Tags) != 1 || len(got.PendingOnlineObs) != 1 {
+		encoded, _ := json.Marshal(got)
+		t.Fatalf("hydrated state incomplete: %s", encoded)
+	}
+	if meta, ok := got.SourceInfo["netlink"]; !ok || meta.Raw["state"] != "reachable" {
+		t.Fatalf("source evidence was not preserved: %+v", got.SourceInfo)
+	}
 }
