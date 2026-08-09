@@ -6,64 +6,64 @@ package storage
 
 import (
 	"encoding/json"
-    "path/filepath"
-    "testing"
-    "time"
+	"path/filepath"
+	"testing"
+	"time"
 
-    "github.com/user/lias-dis/shared/models"
+	"github.com/user/lias-dis/shared/models"
 )
 
 func TestSaveDevicesBatchSavepoint(t *testing.T) {
-    // Create a temporary directory for the test database
-    tmpDir := t.TempDir()
-    dbPath := filepath.Join(tmpDir, "test.db")
+	// Create a temporary directory for the test database
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
 
-    s, err := NewStorage(dbPath)
-    if err != nil {
-        t.Fatalf("Failed to create storage: %v", err)
-    }
-    defer s.Close()
+	s, err := NewStorage(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
+	defer s.Close()
 
-    // Create a valid device and a device designed to fail (empty PDID will fail the tx constraint check indirectly via our logic,
-    // but to truly test a tx failure, we need a constraint violation. We'll rely on the fact that an empty PDID is skipped by saveDeviceTx,
-    // so we'll test that a valid batch saves successfully first).
-    dev1 := &models.Device{
-        PDID:         "pdid_bia_valid1",
-        IdentityTier: "bia",
-        FirstSeen:    time.Now(),
-        LastSeen:     time.Now(),
-        Online:       true,
-    }
-    
-    dev2 := &models.Device{
-        PDID:         "pdid_bia_valid2",
-        IdentityTier: "bia",
-        FirstSeen:    time.Now(),
-        LastSeen:     time.Now(),
-        Online:       true,
-    }
+	// Create a valid device and a device designed to fail (empty PDID will fail the tx constraint check indirectly via our logic,
+	// but to truly test a tx failure, we need a constraint violation. We'll rely on the fact that an empty PDID is skipped by saveDeviceTx,
+	// so we'll test that a valid batch saves successfully first).
+	dev1 := &models.Device{
+		PDID:         "pdid_bia_valid1",
+		IdentityTier: "bia",
+		FirstSeen:    time.Now(),
+		LastSeen:     time.Now(),
+		Online:       true,
+	}
 
-    // Test valid batch
-    err = s.SaveDevicesBatch([]*models.Device{dev1, dev2})
-    if err != nil {
-        t.Fatalf("SaveDevicesBatch failed for valid batch: %v", err)
-    }
+	dev2 := &models.Device{
+		PDID:         "pdid_bia_valid2",
+		IdentityTier: "bia",
+		FirstSeen:    time.Now(),
+		LastSeen:     time.Now(),
+		Online:       true,
+	}
 
-    devs, err := s.LoadHydrate()
-    if err != nil {
-        t.Fatalf("LoadHydrate failed: %v", err)
-    }
+	// Test valid batch
+	err = s.SaveDevicesBatch([]*models.Device{dev1, dev2})
+	if err != nil {
+		t.Fatalf("SaveDevicesBatch failed for valid batch: %v", err)
+	}
 
-    if len(devs) != 2 {
-        t.Errorf("Expected 2 devices, got %d", len(devs))
-    }
+	devs, err := s.LoadHydrate()
+	if err != nil {
+		t.Fatalf("LoadHydrate failed: %v", err)
+	}
 
-    // Test that the pending events TTL purge doesn't crash
-    // (We can't easily test the time-based loop here, but we ensure the query compiles/runs)
-    _, err = s.db.Exec("DELETE FROM pending_events WHERE last_seen < datetime('now', '-1 hour')")
-    if err != nil {
-        t.Errorf("Pending events purge query failed: %v", err)
-    }
+	if len(devs) != 2 {
+		t.Errorf("Expected 2 devices, got %d", len(devs))
+	}
+
+	// Test that the pending events TTL purge doesn't crash
+	// (We can't easily test the time-based loop here, but we ensure the query compiles/runs)
+	_, err = s.db.Exec("DELETE FROM pending_events WHERE last_seen < datetime('now', '-1 hour')")
+	if err != nil {
+		t.Errorf("Pending events purge query failed: %v", err)
+	}
 }
 
 func TestPendingEventUpsertUsesUniqueConstraint(t *testing.T) {
@@ -134,5 +134,39 @@ func TestHydratePreservesCompleteDeviceState(t *testing.T) {
 	}
 	if meta, ok := got.SourceInfo["netlink"]; !ok || meta.Raw["state"] != "reachable" {
 		t.Fatalf("source evidence was not preserved: %+v", got.SourceInfo)
+	}
+}
+
+func TestHydrateDemotesStaleOnlineState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stale-online.db")
+	s, err := NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-hydrationOnlineFreshness - time.Minute)
+	dev := &models.Device{
+		PDID: "pdid_stale_restart", DeviceID: "dev_stale_restart",
+		CurrentMAC: "00:11:22:33:44:55", MACs: []string{"00:11:22:33:44:55"},
+		FirstSeen: stale.Add(-time.Hour), LastSeen: stale, Online: true,
+		PendingOnlineObs: []string{"netlink"},
+	}
+	if err := s.SaveDevice(dev); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	devices, err := reopened.LoadHydrate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].Online || len(devices[0].PendingOnlineObs) != 0 {
+		t.Fatalf("stale presence survived restart: %+v", devices)
 	}
 }

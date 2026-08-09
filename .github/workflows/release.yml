@@ -1,5 +1,5 @@
 # LIAS & DIS CI/CD Pipeline
-# Version: 1.4 - Added Testing Gate
+# Version: 2.0 - Audit Gates and Complete Architecture Matrix
 name: Release
 
 on:
@@ -17,10 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: '1.23'
 
@@ -33,20 +33,41 @@ jobs:
       - name: Run Shared Models Tests
         run: cd shared && go test -v ./...
 
+      - name: Vet All Modules
+        run: go vet ./shared/... ./apps/discovery-service/... ./apps/lias/...
+
+      - name: Run Race Tests
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go test -race -count=1 \
+            ./apps/discovery-service/internal/api \
+            ./apps/discovery-service/internal/config \
+            ./apps/discovery-service/internal/correlation \
+            ./apps/discovery-service/internal/discovery \
+            ./apps/discovery-service/internal/identity \
+            ./apps/discovery-service/internal/inventory \
+            ./apps/discovery-service/internal/storage
+
+      - name: Run Parser Fuzz Smoke
+        env:
+          DIS_FUZZ_TIME: 3s
+        run: bash .github/scripts/run-dis-fuzz-smoke.sh
+
   build:
     name: Build Binaries
     needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        arch: [amd64]
+        arch: [amd64, arm64]
         app: [discovery-service, lias]
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: '1.23'
 
@@ -61,7 +82,7 @@ jobs:
           go build -ldflags="-s -w -X main.version=${SHORT_SHA}" -o ../../bin/${{ matrix.app }}-${{ matrix.arch }} ./cmd/${{ matrix.app }}
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.app }}-${{ matrix.arch }}
           path: bin/${{ matrix.app }}-${{ matrix.arch }}
@@ -72,10 +93,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download All Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: bin
           merge-multiple: true

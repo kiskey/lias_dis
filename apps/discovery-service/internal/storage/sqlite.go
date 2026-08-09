@@ -5,52 +5,54 @@
 package storage
 
 import (
-    "database/sql"
+	"database/sql"
 	"encoding/json"
-    "fmt"
-    "log/slog"
-    "os"
-    "path/filepath"
-    "sync"
-    "time"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
 
-    "github.com/user/lias-dis/apps/discovery-service/internal/inventory"
-    "github.com/user/lias-dis/shared/models"
-    _ "modernc.org/sqlite"
+	"github.com/user/lias-dis/apps/discovery-service/internal/inventory"
+	"github.com/user/lias-dis/shared/models"
+	_ "modernc.org/sqlite"
 )
 
 type PendingEventRecord struct {
-    PDID          string
-    EventType     string
-    Payload       []byte
-    FirstSeen     time.Time
-    LastSeen      time.Time
-    Confirmations int
-    Sources       string
+	PDID          string
+	EventType     string
+	Payload       []byte
+	FirstSeen     time.Time
+	LastSeen      time.Time
+	Confirmations int
+	Sources       string
 }
 
+const hydrationOnlineFreshness = 3 * time.Minute
+
 type Storage struct {
-    mu     sync.Mutex
-    dbPath string
-    db     *sql.DB
+	mu       sync.Mutex
+	dbPath   string
+	db       *sql.DB
 	stopCh   chan struct{}
 	stopOnce sync.Once
 }
 
 func NewStorage(dbPath string) (*Storage, error) {
-    if dbPath == "" {
-        dbPath = "/var/lib/dis/state.db"
-    }
+	if dbPath == "" {
+		dbPath = "/var/lib/dis/state.db"
+	}
 
-    if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-        return nil, fmt.Errorf("failed to create database directory: %w", err)
-    }
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create database directory: %w", err)
+	}
 
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=journal_mode(WAL)", dbPath)
-    db, err := sql.Open("sqlite", dsn)
-    if err != nil {
-        return nil, fmt.Errorf("failed to open sqlite database: %w", err)
-    }
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
+	}
 
 	// DIS is deliberately a low-write service. A single SQLite connection
 	// prevents database/sql from creating competing writers and also makes
@@ -63,63 +65,63 @@ func NewStorage(dbPath string) (*Storage, error) {
 		return nil, fmt.Errorf("failed to initialize sqlite database: %w", err)
 	}
 
-    s := &Storage{
-        dbPath: dbPath,
-        db:     db,
+	s := &Storage{
+		dbPath: dbPath,
+		db:     db,
 		stopCh: make(chan struct{}),
-    }
+	}
 
-    if err := s.initSchema(); err != nil {
-        db.Close()
-        return nil, err
-    }
+	if err := s.initSchema(); err != nil {
+		db.Close()
+		return nil, err
+	}
 
-    if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
-        slog.Warn("Failed to truncate WAL on startup", "error", err)
-    }
+	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+		slog.Warn("Failed to truncate WAL on startup", "error", err)
+	}
 
 	if err := s.migrateLegacyIdentityMetadata(); err != nil {
 		slog.Warn("legacy identity metadata migration encountered an error", "error", err)
-    }
+	}
 
-    go s.pendingEventsRetentionLoop()
+	go s.pendingEventsRetentionLoop()
 
-    slog.Info("DIS SQLite storage engine initialized", "path", dbPath)
-    return s, nil
+	slog.Info("DIS SQLite storage engine initialized", "path", dbPath)
+	return s, nil
 }
 
 func (s *Storage) pendingEventsRetentionLoop() {
-    ticker := time.NewTicker(1 * time.Hour)
-    defer ticker.Stop()
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
 
-    for {
+	for {
 		select {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
-        s.mu.Lock()
-        _, err := s.db.Exec("DELETE FROM pending_events WHERE last_seen < datetime('now', '-1 hour')")
+			s.mu.Lock()
+			_, err := s.db.Exec("DELETE FROM pending_events WHERE last_seen < datetime('now', '-1 hour')")
 			_, evidenceErr := s.db.Exec(`DELETE FROM identity_evidence
 				WHERE (expires_at IS NOT NULL AND expires_at < datetime('now'))
 				   OR observed_at < datetime('now', '-30 days')`)
 			_, candidateErr := s.db.Exec(`DELETE FROM identity_candidates
 				WHERE status != 'pending' AND updated_at < datetime('now', '-30 days')`)
-        s.mu.Unlock()
-        if err != nil {
-            slog.Warn("Failed to clean up old pending events", "error", err)
-        }
+			s.mu.Unlock()
+			if err != nil {
+				slog.Warn("Failed to clean up old pending events", "error", err)
+			}
 			if evidenceErr != nil || candidateErr != nil {
 				slog.Warn("Failed to clean up identity audit records", "evidence_error", evidenceErr, "candidate_error", candidateErr)
 			}
 		}
-    }
+	}
 }
 
 func (s *Storage) initSchema() error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    query := `
+	query := `
     CREATE TABLE IF NOT EXISTS devices (
         pdid TEXT PRIMARY KEY,
         device_id TEXT NOT NULL DEFAULT '',
@@ -239,22 +241,22 @@ func (s *Storage) initSchema() error {
     CREATE INDEX IF NOT EXISTS idx_identity_candidate_status ON identity_candidates(status, updated_at);
     `
 
-    _, err := s.db.Exec(query)
-    if err != nil {
-        return fmt.Errorf("failed to execute DIS schema initialization: %w", err)
-    }
+	_, err := s.db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to execute DIS schema initialization: %w", err)
+	}
 
-    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_tier TEXT NOT NULL DEFAULT 'tentative'")
-    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_anchor TEXT NOT NULL DEFAULT ''")
-    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN canonical_hostname TEXT NOT NULL DEFAULT ''")
-    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN current_mac TEXT NOT NULL DEFAULT ''")
-    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN current_ip TEXT NOT NULL DEFAULT ''")
-    
-    // P1-FIX: Add enrichment tracking columns
-    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN last_enriched_at DATETIME")
-    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN last_nmap_scan_at DATETIME")
-    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN nmap_attempt_count INTEGER NOT NULL DEFAULT 0")
-    _, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN is_fully_identified INTEGER NOT NULL DEFAULT 0")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_tier TEXT NOT NULL DEFAULT 'tentative'")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_anchor TEXT NOT NULL DEFAULT ''")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN canonical_hostname TEXT NOT NULL DEFAULT ''")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN current_mac TEXT NOT NULL DEFAULT ''")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN current_ip TEXT NOT NULL DEFAULT ''")
+
+	// P1-FIX: Add enrichment tracking columns
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN last_enriched_at DATETIME")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN last_nmap_scan_at DATETIME")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN nmap_attempt_count INTEGER NOT NULL DEFAULT 0")
+	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN is_fully_identified INTEGER NOT NULL DEFAULT 0")
 
 	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN services_json TEXT NOT NULL DEFAULT '[]'")
 	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'")
@@ -300,35 +302,35 @@ func (s *Storage) initSchema() error {
 		return fmt.Errorf("failed to create pending-event uniqueness constraint: %w", err)
 	}
 
-    return nil
+	return nil
 }
 
 func (s *Storage) migrateLegacyIdentityMetadata() error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	rows, err := s.db.Query(`SELECT pdid, current_mac, hostname, vendor FROM devices`)
-    if err != nil {
-        return err
-    }
-    type migrationEntry struct {
+	if err != nil {
+		return err
+	}
+	type migrationEntry struct {
 		PDID, Tier, Anchor, CanonicalHost string
-    }
-    var migrations []migrationEntry
+	}
+	var migrations []migrationEntry
 
-    for rows.Next() {
-        var oldPDID, mac, hostname, vendor string
-        if err := rows.Scan(&oldPDID, &mac, &hostname, &vendor); err != nil {
-            continue
-        }
+	for rows.Next() {
+		var oldPDID, mac, hostname, vendor string
+		if err := rows.Scan(&oldPDID, &mac, &hostname, &vendor); err != nil {
+			continue
+		}
 
-        canonicalHost := inventory.CanonicalizeHostname(hostname)
-        tier, anchor := inventory.DeriveTierAndAnchor(mac, canonicalHost, vendor)
-        migrations = append(migrations, migrationEntry{
+		canonicalHost := inventory.CanonicalizeHostname(hostname)
+		tier, anchor := inventory.DeriveTierAndAnchor(mac, canonicalHost, vendor)
+		migrations = append(migrations, migrationEntry{
 			PDID: oldPDID,
-            Tier: string(tier), Anchor: anchor, CanonicalHost: canonicalHost,
-        })
-    }
+			Tier: string(tier), Anchor: anchor, CanonicalHost: canonicalHost,
+		})
+	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return err
@@ -337,7 +339,7 @@ func (s *Storage) migrateLegacyIdentityMetadata() error {
 		return err
 	}
 
-    for _, m := range migrations {
+	for _, m := range migrations {
 		// The public PDID is immutable. Better metadata promotes only the
 		// assurance tier and anchor; policy consumers keep the same key.
 		if _, err := s.db.Exec(`
@@ -345,16 +347,16 @@ func (s *Storage) migrateLegacyIdentityMetadata() error {
             WHERE pdid = ?
         `, m.Tier, m.Anchor, m.CanonicalHost, m.PDID); err != nil {
 			return err
-        }
-    }
-    return nil
+		}
+	}
+	return nil
 }
 
 func (s *Storage) LoadHydrate() ([]models.Device, error) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    rows, err := s.db.Query(`
+	rows, err := s.db.Query(`
         SELECT device_id, pdid, identity_tier, identity_anchor, canonical_hostname,
                current_mac, current_ip, hostname, friendly_name, manufacturer, 
                vendor, model, device_type, confidence, first_seen, last_seen, online,
@@ -364,57 +366,66 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
                identity_probability, identity_ambiguous
         FROM devices
     `)
-    if err != nil {
-        return nil, fmt.Errorf("failed to query devices from DB: %w", err)
-    }
-    deviceMap := make(map[string]*models.Device)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query devices from DB: %w", err)
+	}
+	deviceMap := make(map[string]*models.Device)
+	loadedAt := time.Now()
 
-    for rows.Next() {
-        var d models.Device
-        var onlineInt int
-        var firstSeen, lastSeen time.Time
-        var lastEnrichedAt, lastNmapScanAt sql.NullTime
+	for rows.Next() {
+		var d models.Device
+		var onlineInt int
+		var firstSeen, lastSeen time.Time
+		var lastEnrichedAt, lastNmapScanAt sql.NullTime
 		var nmapAttemptCount, isFullyIdentified, isTentative, identityAmbiguous int
 		var servicesJSON, tagsJSON, sourceInfoJSON, pendingOnlineJSON string
 
-        err := rows.Scan(
+		err := rows.Scan(
 			&d.DeviceID, &d.PDID, &d.IdentityTier, &d.IdentityAnchor, &d.CanonicalHostname,
-            &d.CurrentMAC, &d.CurrentIP, &d.Hostname, &d.FriendlyName, &d.Manufacturer,
-            &d.Vendor, &d.Model, &d.DeviceType, &d.Confidence, &firstSeen, &lastSeen, &onlineInt,
-            &lastEnrichedAt, &lastNmapScanAt, &nmapAttemptCount, &isFullyIdentified,
+			&d.CurrentMAC, &d.CurrentIP, &d.Hostname, &d.FriendlyName, &d.Manufacturer,
+			&d.Vendor, &d.Model, &d.DeviceType, &d.Confidence, &firstSeen, &lastSeen, &onlineInt,
+			&lastEnrichedAt, &lastNmapScanAt, &nmapAttemptCount, &isFullyIdentified,
 			&servicesJSON, &tagsJSON, &d.UserID, &sourceInfoJSON,
 			&pendingOnlineJSON, &isTentative, &d.IdentityAssurance,
 			&d.IdentityProbability, &identityAmbiguous,
-        )
-        if err != nil {
-            continue
-        }
+		)
+		if err != nil {
+			continue
+		}
 
-        d.FirstSeen = firstSeen
-        d.LastSeen = lastSeen
-        d.Online = onlineInt == 1
-        if lastEnrichedAt.Valid {
-            d.LastEnrichedAt = lastEnrichedAt.Time
-        }
-        if lastNmapScanAt.Valid {
-            d.LastNmapScanAt = lastNmapScanAt.Time
-        }
-        d.NmapAttemptCount = nmapAttemptCount
-        d.IsFullyIdentified = isFullyIdentified == 1
+		d.FirstSeen = firstSeen
+		d.LastSeen = lastSeen
+		age := loadedAt.Sub(lastSeen)
+		storedOnline := onlineInt == 1
+		freshOnline := !lastSeen.IsZero() && age >= 0 && age <= hydrationOnlineFreshness
+		d.Online = storedOnline && freshOnline
+		if lastEnrichedAt.Valid {
+			d.LastEnrichedAt = lastEnrichedAt.Time
+		}
+		if lastNmapScanAt.Valid {
+			d.LastNmapScanAt = lastNmapScanAt.Time
+		}
+		d.NmapAttemptCount = nmapAttemptCount
+		d.IsFullyIdentified = isFullyIdentified == 1
 		d.IsTentative = isTentative == 1
 		d.IdentityAmbiguous = identityAmbiguous == 1
-        
-        d.MACs = []string{}
-        d.IPs = []string{}
-        d.SourceInfo = make(map[string]models.SourceMeta)
+
+		d.MACs = []string{}
+		d.IPs = []string{}
+		d.SourceInfo = make(map[string]models.SourceMeta)
 		_ = json.Unmarshal([]byte(servicesJSON), &d.Services)
 		_ = json.Unmarshal([]byte(tagsJSON), &d.Tags)
 		_ = json.Unmarshal([]byte(sourceInfoJSON), &d.SourceInfo)
 		_ = json.Unmarshal([]byte(pendingOnlineJSON), &d.PendingOnlineObs)
+		if storedOnline && !freshOnline {
+			// Pre-restart presence confirmations are stale session state. A fresh
+			// positive observation must re-establish online status.
+			d.PendingOnlineObs = nil
+		}
 
-        devCopy := d
-        deviceMap[d.PDID] = &devCopy
-    }
+		devCopy := d
+		deviceMap[d.PDID] = &devCopy
+	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return nil, fmt.Errorf("failed while reading devices from DB: %w", err)
@@ -423,70 +434,70 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
 		return nil, err
 	}
 
-    macRows, err := s.db.Query("SELECT pdid, mac FROM device_macs")
-    if err == nil {
-        for macRows.Next() {
-            var pdid, mac string
-            if macRows.Scan(&pdid, &mac) == nil {
-                if dev, ok := deviceMap[pdid]; ok {
-                    dev.MACs = append(dev.MACs, mac)
-                }
-            }
-        }
+	macRows, err := s.db.Query("SELECT pdid, mac FROM device_macs")
+	if err == nil {
+		for macRows.Next() {
+			var pdid, mac string
+			if macRows.Scan(&pdid, &mac) == nil {
+				if dev, ok := deviceMap[pdid]; ok {
+					dev.MACs = append(dev.MACs, mac)
+				}
+			}
+		}
 		macRows.Close()
-    }
+	}
 
-    ipRows, err := s.db.Query("SELECT pdid, ip FROM device_ips")
-    if err == nil {
-        for ipRows.Next() {
-            var pdid, ip string
-            if ipRows.Scan(&pdid, &ip) == nil {
-                if dev, ok := deviceMap[pdid]; ok {
-                    dev.IPs = append(dev.IPs, ip)
-                }
-            }
-        }
+	ipRows, err := s.db.Query("SELECT pdid, ip FROM device_ips")
+	if err == nil {
+		for ipRows.Next() {
+			var pdid, ip string
+			if ipRows.Scan(&pdid, &ip) == nil {
+				if dev, ok := deviceMap[pdid]; ok {
+					dev.IPs = append(dev.IPs, ip)
+				}
+			}
+		}
 		ipRows.Close()
-    }
+	}
 
-    devices := make([]models.Device, 0, len(deviceMap))
-    for _, dev := range deviceMap {
-        devices = append(devices, *dev)
-    }
+	devices := make([]models.Device, 0, len(deviceMap))
+	for _, dev := range deviceMap {
+		devices = append(devices, *dev)
+	}
 
-    slog.Info("Successfully hydrated DIS device inventory from SQLite", "count", len(devices))
-    return devices, nil
+	slog.Info("Successfully hydrated DIS device inventory from SQLite", "count", len(devices))
+	return devices, nil
 }
 
 func (s *Storage) LoadHostnameOwners() (map[string]string, error) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    rows, err := s.db.Query("SELECT canonical_hostname, pdid FROM hostname_owners")
-    if err != nil {
-        return nil, fmt.Errorf("failed to query hostname owners from DB: %w", err)
-    }
-    defer rows.Close()
+	rows, err := s.db.Query("SELECT canonical_hostname, pdid FROM hostname_owners")
+	if err != nil {
+		return nil, fmt.Errorf("failed to query hostname owners from DB: %w", err)
+	}
+	defer rows.Close()
 
-    owners := make(map[string]string)
-    for rows.Next() {
-        var host, pdid string
-        if err := rows.Scan(&host, &pdid); err == nil && host != "" {
-            owners[host] = pdid
-        }
-    }
-    return owners, nil
+	owners := make(map[string]string)
+	for rows.Next() {
+		var host, pdid string
+		if err := rows.Scan(&host, &pdid); err == nil && host != "" {
+			owners[host] = pdid
+		}
+	}
+	return owners, nil
 }
 
 func (s *Storage) SaveHostnameOwner(canonicalHost, pdid string) error {
-    if canonicalHost == "" || pdid == "" {
-        return nil
-    }
+	if canonicalHost == "" || pdid == "" {
+		return nil
+	}
 
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    _, err := s.db.Exec(`
+	_, err := s.db.Exec(`
         INSERT INTO hostname_owners (canonical_hostname, pdid, acquired_at)
         VALUES (?, ?, ?)
         ON CONFLICT(canonical_hostname) DO UPDATE SET
@@ -494,61 +505,61 @@ func (s *Storage) SaveHostnameOwner(canonicalHost, pdid string) error {
             acquired_at=excluded.acquired_at
     `, canonicalHost, pdid, time.Now())
 
-    return err
+	return err
 }
 
 func (s *Storage) DeleteHostnameOwner(canonicalHost string) error {
-    if canonicalHost == "" {
-        return nil
-    }
+	if canonicalHost == "" {
+		return nil
+	}
 
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    _, err := s.db.Exec("DELETE FROM hostname_owners WHERE canonical_hostname = ?", canonicalHost)
-    return err
+	_, err := s.db.Exec("DELETE FROM hostname_owners WHERE canonical_hostname = ?", canonicalHost)
+	return err
 }
 
 func (s *Storage) SaveDevice(d *models.Device) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    tx, err := s.db.Begin()
-    if err != nil {
-        return err
-    }
-    defer func() { _ = tx.Rollback() }()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 
-    if err := s.saveDeviceTx(tx, d); err != nil {
-        return err
-    }
+	if err := s.saveDeviceTx(tx, d); err != nil {
+		return err
+	}
 
-    return tx.Commit()
+	return tx.Commit()
 }
 
 func (s *Storage) SaveDevicesBatch(devs []*models.Device) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    tx, err := s.db.Begin()
-    if err != nil {
-        return err
-    }
-    defer func() { _ = tx.Rollback() }()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 
 	for _, d := range devs {
-        if err := s.saveDeviceTx(tx, d); err != nil {
+		if err := s.saveDeviceTx(tx, d); err != nil {
 			return err
-        }
-    }
+		}
+	}
 
-    return tx.Commit()
+	return tx.Commit()
 }
 
 func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
-    if d == nil || d.PDID == "" {
-        return nil
-    }
+	if d == nil || d.PDID == "" {
+		return nil
+	}
 	if d.DeviceID == "" {
 		deviceID, _, err := inventory.NewPermanentIdentity()
 		if err != nil {
@@ -557,15 +568,15 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
 		d.DeviceID = deviceID
 	}
 
-    onlineInt := 0
-    if d.Online {
-        onlineInt = 1
-    }
+	onlineInt := 0
+	if d.Online {
+		onlineInt = 1
+	}
 
-    isFullyIdentifiedInt := 0
-    if d.IsFullyIdentified {
-        isFullyIdentifiedInt = 1
-    }
+	isFullyIdentifiedInt := 0
+	if d.IsFullyIdentified {
+		isFullyIdentifiedInt = 1
+	}
 
 	isTentativeInt := 0
 	if d.IsTentative {
@@ -633,126 +644,126 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
 	            identity_ambiguous=excluded.identity_ambiguous
 	    `, d.DeviceID, d.PDID, string(d.IdentityTier), d.IdentityAnchor, d.CanonicalHostname, d.CurrentMAC, d.CurrentIP, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt, d.LastEnrichedAt, d.LastNmapScanAt, d.NmapAttemptCount, isFullyIdentifiedInt, string(servicesJSON), string(tagsJSON), d.UserID, string(sourceInfoJSON), string(pendingOnlineJSON), isTentativeInt, string(d.IdentityAssurance), d.IdentityProbability, identityAmbiguousInt)
 
-    if err != nil {
-        return fmt.Errorf("failed to upsert device %s: %w", d.PDID, err)
-    }
+	if err != nil {
+		return fmt.Errorf("failed to upsert device %s: %w", d.PDID, err)
+	}
 
-    existingMACs := make(map[string]bool)
-    macRows, err := tx.Query("SELECT mac FROM device_macs WHERE pdid = ?", d.PDID)
-    if err == nil {
-        for macRows.Next() {
-            var mac string
-            macRows.Scan(&mac)
-            existingMACs[mac] = true
-        }
-        macRows.Close()
-    }
+	existingMACs := make(map[string]bool)
+	macRows, err := tx.Query("SELECT mac FROM device_macs WHERE pdid = ?", d.PDID)
+	if err == nil {
+		for macRows.Next() {
+			var mac string
+			macRows.Scan(&mac)
+			existingMACs[mac] = true
+		}
+		macRows.Close()
+	}
 
-    desiredMACs := make(map[string]bool)
-    for _, mac := range d.MACs {
-        if mac != "" {
-            desiredMACs[mac] = true
-        }
-    }
+	desiredMACs := make(map[string]bool)
+	for _, mac := range d.MACs {
+		if mac != "" {
+			desiredMACs[mac] = true
+		}
+	}
 
-    for mac := range desiredMACs {
-        if !existingMACs[mac] {
-            _, _ = tx.Exec("INSERT OR IGNORE INTO device_macs (pdid, mac) VALUES (?, ?)", d.PDID, mac)
-        }
-    }
-    for mac := range existingMACs {
-        if !desiredMACs[mac] {
-            _, _ = tx.Exec("DELETE FROM device_macs WHERE pdid = ? AND mac = ?", d.PDID, mac)
-        }
-    }
+	for mac := range desiredMACs {
+		if !existingMACs[mac] {
+			_, _ = tx.Exec("INSERT OR IGNORE INTO device_macs (pdid, mac) VALUES (?, ?)", d.PDID, mac)
+		}
+	}
+	for mac := range existingMACs {
+		if !desiredMACs[mac] {
+			_, _ = tx.Exec("DELETE FROM device_macs WHERE pdid = ? AND mac = ?", d.PDID, mac)
+		}
+	}
 
-    existingIPs := make(map[string]bool)
-    ipRows, err := tx.Query("SELECT ip FROM device_ips WHERE pdid = ?", d.PDID)
-    if err == nil {
-        for ipRows.Next() {
-            var ip string
-            ipRows.Scan(&ip)
-            existingIPs[ip] = true
-        }
-        ipRows.Close()
-    }
+	existingIPs := make(map[string]bool)
+	ipRows, err := tx.Query("SELECT ip FROM device_ips WHERE pdid = ?", d.PDID)
+	if err == nil {
+		for ipRows.Next() {
+			var ip string
+			ipRows.Scan(&ip)
+			existingIPs[ip] = true
+		}
+		ipRows.Close()
+	}
 
-    desiredIPs := make(map[string]bool)
-    for _, ip := range d.IPs {
-        if ip != "" {
-            desiredIPs[ip] = true
-        }
-    }
+	desiredIPs := make(map[string]bool)
+	for _, ip := range d.IPs {
+		if ip != "" {
+			desiredIPs[ip] = true
+		}
+	}
 
-    for ip := range desiredIPs {
-        if !existingIPs[ip] {
-            _, _ = tx.Exec("INSERT OR IGNORE INTO device_ips (pdid, ip) VALUES (?, ?)", d.PDID, ip)
-        }
-    }
-    for ip := range existingIPs {
-        if !desiredIPs[ip] {
-            _, _ = tx.Exec("DELETE FROM device_ips WHERE pdid = ? AND ip = ?", d.PDID, ip)
-        }
-    }
+	for ip := range desiredIPs {
+		if !existingIPs[ip] {
+			_, _ = tx.Exec("INSERT OR IGNORE INTO device_ips (pdid, ip) VALUES (?, ?)", d.PDID, ip)
+		}
+	}
+	for ip := range existingIPs {
+		if !desiredIPs[ip] {
+			_, _ = tx.Exec("DELETE FROM device_ips WHERE pdid = ? AND ip = ?", d.PDID, ip)
+		}
+	}
 
-    return nil
+	return nil
 }
 
 func (s *Storage) ReplaceDevicePDID(oldPDID, newPDID string, d *models.Device) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    tx, err := s.db.Begin()
-    if err != nil {
-        return err
-    }
-    defer func() { _ = tx.Rollback() }()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 
-    if err := s.saveDeviceTx(tx, d); err != nil {
-        return err
-    }
+	if err := s.saveDeviceTx(tx, d); err != nil {
+		return err
+	}
 
-    _, _ = tx.Exec("UPDATE device_macs SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
-    _, _ = tx.Exec("UPDATE device_ips SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
-    _, _ = tx.Exec("UPDATE hostname_owners SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
-    _, _ = tx.Exec("UPDATE pending_events SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
-    
-    _, err = tx.Exec("DELETE FROM devices WHERE pdid = ?", oldPDID)
-    if err != nil {
-        return err
-    }
+	_, _ = tx.Exec("UPDATE device_macs SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
+	_, _ = tx.Exec("UPDATE device_ips SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
+	_, _ = tx.Exec("UPDATE hostname_owners SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
+	_, _ = tx.Exec("UPDATE pending_events SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
 
-    return tx.Commit()
+	_, err = tx.Exec("DELETE FROM devices WHERE pdid = ?", oldPDID)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (s *Storage) DeleteDevice(pdid string) error {
-    if pdid == "" {
-        return nil
-    }
+	if pdid == "" {
+		return nil
+	}
 
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    tx, err := s.db.Begin()
-    if err != nil {
-        return err
-    }
-    defer func() { _ = tx.Rollback() }()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 
-    _, _ = tx.Exec("DELETE FROM device_macs WHERE pdid = ?", pdid)
-    _, _ = tx.Exec("DELETE FROM device_ips WHERE pdid = ?", pdid)
-    _, _ = tx.Exec("DELETE FROM hostname_owners WHERE pdid = ?", pdid)
-    _, _ = tx.Exec("DELETE FROM devices WHERE pdid = ?", pdid)
+	_, _ = tx.Exec("DELETE FROM device_macs WHERE pdid = ?", pdid)
+	_, _ = tx.Exec("DELETE FROM device_ips WHERE pdid = ?", pdid)
+	_, _ = tx.Exec("DELETE FROM hostname_owners WHERE pdid = ?", pdid)
+	_, _ = tx.Exec("DELETE FROM devices WHERE pdid = ?", pdid)
 
-    return tx.Commit()
+	return tx.Commit()
 }
 
 func (s *Storage) SavePendingEvent(pdid, eventType string, payload []byte, firstSeen, lastSeen time.Time, confirmations int, sources string) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    payloadStr := string(payload)
-    _, err := s.db.Exec(`
+	payloadStr := string(payload)
+	_, err := s.db.Exec(`
         INSERT INTO pending_events (pdid, event_type, payload, first_seen, last_seen, confirmations, sources)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(pdid, event_type) DO UPDATE SET
@@ -762,62 +773,62 @@ func (s *Storage) SavePendingEvent(pdid, eventType string, payload []byte, first
             sources=excluded.sources
     `, pdid, eventType, payloadStr, firstSeen, lastSeen, confirmations, sources)
 
-    return err
+	return err
 }
 
 func (s *Storage) DeletePendingEventsBatch(records []PendingEventRecord) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    tx, err := s.db.Begin()
-    if err != nil {
-        return err
-    }
-    defer func() { _ = tx.Rollback() }()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 
-    for _, r := range records {
-        if _, err := tx.Exec("DELETE FROM pending_events WHERE pdid = ? AND event_type = ?", r.PDID, r.EventType); err != nil {
-            return err
-        }
-    }
+	for _, r := range records {
+		if _, err := tx.Exec("DELETE FROM pending_events WHERE pdid = ? AND event_type = ?", r.PDID, r.EventType); err != nil {
+			return err
+		}
+	}
 
-    return tx.Commit()
+	return tx.Commit()
 }
 
 func (s *Storage) DeletePendingEvent(pdid, eventType string) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    _, err := s.db.Exec("DELETE FROM pending_events WHERE pdid = ? AND event_type = ?", pdid, eventType)
-    return err
+	_, err := s.db.Exec("DELETE FROM pending_events WHERE pdid = ? AND event_type = ?", pdid, eventType)
+	return err
 }
 
 func (s *Storage) LoadPendingEvents() ([]PendingEventRecord, error) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    rows, err := s.db.Query("SELECT pdid, event_type, payload, first_seen, last_seen, confirmations, sources FROM pending_events")
-    if err != nil {
-        return nil, err
-    }
-    defer rows.Close()
+	rows, err := s.db.Query("SELECT pdid, event_type, payload, first_seen, last_seen, confirmations, sources FROM pending_events")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 
-    var records []PendingEventRecord
-    for rows.Next() {
-        var r PendingEventRecord
-        if err := rows.Scan(&r.PDID, &r.EventType, &r.Payload, &r.FirstSeen, &r.LastSeen, &r.Confirmations, &r.Sources); err == nil {
-            records = append(records, r)
-        }
-    }
-    return records, nil
+	var records []PendingEventRecord
+	for rows.Next() {
+		var r PendingEventRecord
+		if err := rows.Scan(&r.PDID, &r.EventType, &r.Payload, &r.FirstSeen, &r.LastSeen, &r.Confirmations, &r.Sources); err == nil {
+			records = append(records, r)
+		}
+	}
+	return records, nil
 }
 
 func (s *Storage) Close() error {
 	s.stopOnce.Do(func() { close(s.stopCh) })
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    if s.db != nil {
-        return s.db.Close()
-    }
-    return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
 }

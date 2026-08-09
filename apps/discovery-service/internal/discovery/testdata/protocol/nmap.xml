@@ -1,0 +1,1 @@
+<nmaprun><host><status state="up"/><hostnames><hostname name="fixture.local" type="PTR"/></hostnames><ports><port portid="631"><state state="open"/><service name="ipp" product="Printer"/></port></ports></host></nmaprun>

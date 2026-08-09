@@ -69,6 +69,10 @@ a reversible correlation score, but cannot mathematically prove that two private
 MAC addresses are the same physical device. DIS does not use TLS certificate or
 negotiated-cipher metadata as automatic PDID merge evidence.
 
+The parser-fuzz, identity-matrix, event-storm, restart-recovery, benchmark, and
+72-hour soak procedures are documented in
+[`docs/DIS_VALIDATION_AND_RESOURCE_BUDGETS.md`](docs/DIS_VALIDATION_AND_RESOURCE_BUDGETS.md).
+
 ---
 
 ## Embedded IEEE OUI Database

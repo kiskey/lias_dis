@@ -1,26 +1,26 @@
 package discovery
 
 import (
-    "bufio"
-    "context"
-    "fmt"
-    "log/slog"
+	"bufio"
+	"context"
+	"fmt"
+	"log/slog"
 	"net"
-    "os/exec"
+	"os/exec"
 	"sort"
 	"strconv"
-    "strings"
-    "sync"
-    "time"
+	"strings"
+	"sync"
+	"time"
 
-    "github.com/user/lias-dis/shared/models"
+	"github.com/user/lias-dis/shared/models"
 )
 
 type AvahiEnricher struct {
-    ctx     context.Context
-    cancel  context.CancelFunc
+	ctx     context.Context
+	cancel  context.CancelFunc
 	done    chan struct{}
-    mu      sync.RWMutex
+	mu      sync.RWMutex
 	records map[string]avahiRecord
 }
 
@@ -29,14 +29,14 @@ const maxAvahiRecords = 4096
 type avahiRecord struct {
 	Interface    string
 	Protocol     string
-    FriendlyName string
-    Hostname     string
-    ServiceType  string
+	FriendlyName string
+	Hostname     string
+	ServiceType  string
 	Domain       string
-    IP           string
+	IP           string
 	Port         uint16
 	TXT          map[string]string
-    Timestamp    time.Time
+	Timestamp    time.Time
 }
 
 func NewAvahiEnricher() *AvahiEnricher {
@@ -49,76 +49,76 @@ func (e *AvahiEnricher) Start(ctx context.Context) error {
 	if _, err := exec.LookPath("avahi-browse"); err != nil {
 		return fmt.Errorf("avahi-browse unavailable: %w", err)
 	}
-    e.ctx, e.cancel = context.WithCancel(ctx)
-    go e.runPersistentListener()
-    return nil
+	e.ctx, e.cancel = context.WithCancel(ctx)
+	go e.runPersistentListener()
+	return nil
 }
 
 func (e *AvahiEnricher) Stop() error {
-    if e.cancel != nil {
-        e.cancel()
+	if e.cancel != nil {
+		e.cancel()
 		<-e.done
-    }
-    return nil
+	}
+	return nil
 }
 
 func (e *AvahiEnricher) runPersistentListener() {
 	defer close(e.done)
-    for {
+	for {
 		if e.ctx.Err() != nil {
-            return
-        }
+			return
+		}
 		// Avahi owns RR TTL/cache-flush/goodbye processing and emits '-'
 		// lifecycle events. --no-fail keeps the watch attached across daemon
 		// restarts without spawning a polling process per device.
 		cmd := exec.CommandContext(e.ctx, "avahi-browse", "-a", "-r", "-p", "-k", "-f")
-        stdout, err := cmd.StdoutPipe()
-        if err != nil {
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
 			slog.Warn("Failed to create avahi-browse pipe", "error", err)
 			if !waitForContext(e.ctx, 30*time.Second) {
 				return
 			}
-            continue
-        }
-        if err := cmd.Start(); err != nil {
+			continue
+		}
+		if err := cmd.Start(); err != nil {
 			slog.Warn("Failed to start avahi-browse", "error", err)
 			if !waitForContext(e.ctx, 30*time.Second) {
 				return
 			}
-            continue
-        }
+			continue
+		}
 
-        scanner := bufio.NewScanner(stdout)
+		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 4096), 256<<10)
-        for scanner.Scan() {
+		for scanner.Scan() {
 			event, key, rec, ok := parseAvahiBrowseLine(scanner.Text(), time.Now())
 			if !ok {
-                continue
-            }
-            e.mu.Lock()
+				continue
+			}
+			e.mu.Lock()
 			switch event {
 			case "resolved":
 				e.upsertRecordLocked(key, rec)
 			case "removed":
 				delete(e.records, key)
-            }
+			}
 			e.mu.Unlock()
-                }
+		}
 		if err := scanner.Err(); err != nil && e.ctx.Err() == nil {
 			slog.Warn("avahi-browse output error", "error", err)
-            }
+		}
 		_ = cmd.Wait()
 		// Once the watch is lost, its cache can no longer receive mDNS goodbye
 		// or removal events. Clear it and let the restarted browser replay the
 		// daemon's current cache instead of retaining unbounded stale records.
 		e.mu.Lock()
 		e.records = make(map[string]avahiRecord)
-            e.mu.Unlock()
+		e.mu.Unlock()
 		if !waitForContext(e.ctx, 5*time.Second) {
 			return
 		}
 	}
-        }
+}
 
 func (e *AvahiEnricher) upsertRecordLocked(key string, rec avahiRecord) {
 	if _, exists := e.records[key]; !exists && len(e.records) >= maxAvahiRecords {
@@ -128,9 +128,9 @@ func (e *AvahiEnricher) upsertRecordLocked(key string, rec avahiRecord) {
 			if oldestKey == "" || candidate.Timestamp.Before(oldest) {
 				oldestKey, oldest = candidateKey, candidate.Timestamp
 			}
-        }
+		}
 		delete(e.records, oldestKey)
-    }
+	}
 	e.records[key] = rec
 }
 
@@ -143,9 +143,12 @@ func waitForContext(ctx context.Context, duration time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
-    }
+}
 
 func parseAvahiBrowseLine(line string, now time.Time) (string, string, avahiRecord, bool) {
+	if len(line) > 4096 {
+		return "", "", avahiRecord{}, false
+	}
 	parts := strings.Split(line, ";")
 	if len(parts) < 6 {
 		return "", "", avahiRecord{}, false
@@ -219,27 +222,27 @@ func parseAvahiTXT(value string) map[string]string {
 	for _, token := range strings.Fields(value) {
 		if len(result) >= 16 {
 			break
-            }
+		}
 		token = strings.Trim(token, "\"")
 		token = unescapeAvahiField(token)
 		key, val, found := strings.Cut(token, "=")
 		key = strings.ToLower(strings.TrimSpace(key))
 		if key == "" || len(key) > 64 {
 			continue
-        }
+		}
 		if !found {
 			val = ""
-    }
+		}
 		if len(val) > 256 {
 			val = val[:256]
-            }
+		}
 		result[key] = val
-        }
+	}
 	if len(result) == 0 {
 		return nil
 	}
 	return result
-    }
+}
 
 func normalizeScopedIP(value string) string {
 	if host, _, err := net.SplitHostPort(value); err == nil {
@@ -253,7 +256,7 @@ func normalizeScopedIP(value string) string {
 		return ""
 	}
 	return ip.String()
-    }
+}
 
 func (e *AvahiEnricher) Enrich(ctx context.Context, d *models.Device) (*models.Enrichment, error) {
 	if d == nil || (d.CurrentIP == "" && d.Hostname == "") {
@@ -265,7 +268,7 @@ func (e *AvahiEnricher) Enrich(ctx context.Context, d *models.Device) (*models.E
 		if ip := normalizeScopedIP(value); ip != "" {
 			targetIPs[ip] = struct{}{}
 		}
-    }
+	}
 
 	e.mu.RLock()
 	found := make([]avahiRecord, 0)
@@ -286,17 +289,17 @@ func (e *AvahiEnricher) Enrich(ctx context.Context, d *models.Device) (*models.E
 	mergedTXT := make(map[string]string)
 	for _, rec := range found {
 		if enr.FriendlyName == "" {
-            enr.FriendlyName = rec.FriendlyName
-        }
+			enr.FriendlyName = rec.FriendlyName
+		}
 		if enr.Hostname == "" {
-            enr.Hostname = rec.Hostname
-        }
+			enr.Hostname = rec.Hostname
+		}
 		services[rec.ServiceType] = struct{}{}
 		interfaces[rec.Interface] = struct{}{}
 		for key, value := range rec.TXT {
 			if _, exists := mergedTXT[key]; !exists {
 				mergedTXT[key] = value
-    }
+			}
 		}
 	}
 	for service := range services {
@@ -313,34 +316,34 @@ func (e *AvahiEnricher) Enrich(ctx context.Context, d *models.Device) (*models.E
 		enr.Raw["mdns_txt"] = mergedTXT
 	}
 	enr.DeviceType = ClassifyDeviceFromMDNSServices(enr.Services)
-    return enr, nil
+	return enr, nil
 }
 
 func normalizeDomain(domain string) string {
-    d := strings.ToLower(strings.TrimSpace(domain))
-    d = strings.TrimSuffix(d, ".")
-    d = strings.TrimSuffix(d, ".local")
-    return d
+	d := strings.ToLower(strings.TrimSpace(domain))
+	d = strings.TrimSuffix(d, ".")
+	d = strings.TrimSuffix(d, ".local")
+	return d
 }
 
 func ClassifyDeviceFromMDNSServices(services []string) string {
-    for _, s := range services {
-        svc := strings.ToLower(s)
-        if strings.Contains(svc, "_ipp") || strings.Contains(svc, "_printer") || strings.Contains(svc, "_pdl-datastream") {
-            return "printer"
-        }
-        if strings.Contains(svc, "_airplay") || strings.Contains(svc, "_googlecast") || strings.Contains(svc, "_raop") {
-            return "tv"
-        }
-        if strings.Contains(svc, "_hap") || strings.Contains(svc, "_homekit") || strings.Contains(svc, "_matter") {
-            return "iot"
-        }
-        if strings.Contains(svc, "_sonos") || strings.Contains(svc, "_spotify-connect") || strings.Contains(svc, "_soundtouch") {
-            return "audio"
-        }
-        if strings.Contains(svc, "_smb") || strings.Contains(svc, "_afpovertcp") || strings.Contains(svc, "_nfs") {
-            return "server"
-        }
-    }
-    return ""
+	for _, s := range services {
+		svc := strings.ToLower(s)
+		if strings.Contains(svc, "_ipp") || strings.Contains(svc, "_printer") || strings.Contains(svc, "_pdl-datastream") {
+			return "printer"
+		}
+		if strings.Contains(svc, "_airplay") || strings.Contains(svc, "_googlecast") || strings.Contains(svc, "_raop") {
+			return "tv"
+		}
+		if strings.Contains(svc, "_hap") || strings.Contains(svc, "_homekit") || strings.Contains(svc, "_matter") {
+			return "iot"
+		}
+		if strings.Contains(svc, "_sonos") || strings.Contains(svc, "_spotify-connect") || strings.Contains(svc, "_soundtouch") {
+			return "audio"
+		}
+		if strings.Contains(svc, "_smb") || strings.Contains(svc, "_afpovertcp") || strings.Contains(svc, "_nfs") {
+			return "server"
+		}
+	}
+	return ""
 }

@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main, enhancement2.0]
+  pull_request:
+    branches: [main, enhancement2.0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Tests, vet, race, fuzz seeds
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: |
+            go.work.sum
+            apps/discovery-service/go.sum
+
+      - name: Verify module downloads
+        run: |
+          (cd shared && go mod verify)
+          (cd apps/discovery-service && go mod verify)
+          (cd apps/lias && go mod verify)
+
+      - name: Unit and integration tests
+        run: go test -count=1 ./shared/... ./apps/discovery-service/... ./apps/lias/...
+
+      - name: Vet
+        run: go vet ./shared/... ./apps/discovery-service/... ./apps/lias/...
+
+      - name: Race tests
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go test -race -count=1 \
+            ./apps/discovery-service/internal/api \
+            ./apps/discovery-service/internal/config \
+            ./apps/discovery-service/internal/correlation \
+            ./apps/discovery-service/internal/discovery \
+            ./apps/discovery-service/internal/identity \
+            ./apps/discovery-service/internal/inventory \
+            ./apps/discovery-service/internal/storage
+
+      - name: Parser fuzz smoke
+        env:
+          DIS_FUZZ_TIME: 3s
+        run: bash .github/scripts/run-dis-fuzz-smoke.sh
+
+      - name: Repository remains clean
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+
+  static-build:
+    name: Static ${{ matrix.app }} linux/${{ matrix.arch }}
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [discovery-service, lias]
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: |
+            go.work.sum
+            apps/discovery-service/go.sum
+
+      - name: Build
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p bin
+          go build -trimpath -ldflags='-s -w' \
+            -o bin/${{ matrix.app }}-${{ matrix.arch }} \
+            ./apps/${{ matrix.app }}/cmd/${{ matrix.app }}
+
+      - name: Upload build proof
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-${{ matrix.app }}-${{ matrix.arch }}
+          path: bin/${{ matrix.app }}-${{ matrix.arch }}
+          retention-days: 7
