@@ -2,7 +2,15 @@
 // by DIS and LIAS. These fields are additive to the existing device contract.
 package models
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+var (
+	ErrCandidateStaleOrConflicting = errors.New("candidate stale or conflicting")
+	ErrCandidateNotFound           = errors.New("candidate not found")
+)
 
 type IdentityAssurance string
 
@@ -47,6 +55,16 @@ type IdentityFactor struct {
 	Matched         bool    `json:"matched"`
 }
 
+// IdentityCandidateDevice is the bounded device summary returned with an
+// identity candidate. Full device and identity profiles remain lazy routes.
+type IdentityCandidateDevice struct {
+	PDID        string    `json:"pdid"`
+	DisplayName string    `json:"display_name"`
+	CurrentMAC  string    `json:"current_mac"`
+	Online      bool      `json:"online"`
+	LastSeen    time.Time `json:"last_seen"`
+}
+
 type IdentityCandidateLink struct {
 	ID             int64            `json:"id"`
 	SourcePDID     string           `json:"source_pdid"`
@@ -58,6 +76,40 @@ type IdentityCandidateLink struct {
 	CreatedAt      time.Time        `json:"created_at"`
 	UpdatedAt      time.Time        `json:"updated_at"`
 	DecisionSource string           `json:"decision_source,omitempty"`
+	DecisionNote   string           `json:"decision_note,omitempty"`
+}
+
+// IdentityCandidate decorates the persisted correlation record with the two
+// current device summaries required by administrator review clients.
+type IdentityCandidateDetail struct {
+	ID             int64                    `json:"id"`
+	SourcePDID     string                   `json:"source_pdid"`
+	TargetPDID     string                   `json:"target_pdid"`
+	Probability    float64                  `json:"probability"`
+	Ambiguous      bool                     `json:"ambiguous"`
+	Status         string                   `json:"status"`
+	Factors        []IdentityFactor         `json:"factors"`
+	Conflicts      []IdentityFactor         `json:"conflicts"`
+	SourceDevice   *IdentityCandidateDevice `json:"source_device,omitempty"`
+	TargetDevice   *IdentityCandidateDevice `json:"target_device,omitempty"`
+	CreatedAt      time.Time                `json:"created_at"`
+	UpdatedAt      time.Time                `json:"updated_at"`
+	DecisionSource string                   `json:"decision_source,omitempty"`
+	DecisionNote   string                   `json:"decision_note,omitempty"`
+}
+
+type IdentityCandidateListResponse struct {
+	Candidates []IdentityCandidateDetail `json:"candidates"`
+	NextCursor string                    `json:"next_cursor,omitempty"`
+}
+
+// IdentityCandidateDecisionRequest is optional on confirm/reject/reopen. The
+// expected fields protect a human decision from acting on a changed candidate.
+type IdentityCandidateDecisionRequest struct {
+	ExpectedSourcePDID string     `json:"expected_source_pdid,omitempty"`
+	ExpectedTargetPDID string     `json:"expected_target_pdid,omitempty"`
+	ExpectedUpdatedAt  *time.Time `json:"expected_updated_at,omitempty"`
+	DecisionNote       string     `json:"decision_note,omitempty"`
 }
 
 type IdentityEvidence struct {

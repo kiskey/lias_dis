@@ -11,16 +11,19 @@ import (
 type EventType string
 
 const (
-	EventDeviceAdded        EventType = "device.added"
-	EventDeviceRemoved      EventType = "device.removed"
-	EventDeviceOnline       EventType = "device.online"
-	EventDeviceOffline      EventType = "device.offline"
-	EventHostnameChanged    EventType = "device.hostname_changed"
-	EventFingerprintUpdated EventType = "device.fingerprint_updated"
-	EventIPChanged          EventType = "device.ip_changed"
-	EventMACChanged         EventType = "device.mac_changed"
-	EventDeviceReidentified EventType = "device.reidentified"
-	EventSecurityAlert      EventType = "security.alert"
+	EventDeviceAdded              EventType = "device.added"
+	EventDeviceRemoved            EventType = "device.removed"
+	EventDeviceOnline             EventType = "device.online"
+	EventDeviceOffline            EventType = "device.offline"
+	EventHostnameChanged          EventType = "device.hostname_changed"
+	EventFingerprintUpdated       EventType = "device.fingerprint_updated"
+	EventIPChanged                EventType = "device.ip_changed"
+	EventMACChanged               EventType = "device.mac_changed"
+	EventDeviceReidentified       EventType = "device.reidentified"
+	EventIdentityCandidateChanged EventType = "identity.candidate.changed"
+	EventIdentityBindingChanged   EventType = "identity.binding.changed"
+	EventIdentityCandidateDecided EventType = "identity.candidate.decided"
+	EventSecurityAlert            EventType = "security.alert"
 
 	// EventEffectiveStatusChanged is fired whenever a device or tag's
 	// effective policy status changes (e.g. temporary extension activated
@@ -133,6 +136,22 @@ type DeviceReidentifiedPayload struct {
 	Reason       string    `json:"reason"`
 	MigratedMACs []string  `json:"migrated_macs,omitempty"`
 	Timestamp    time.Time `json:"timestamp"`
+}
+
+type IdentityCandidateEventPayload struct {
+	CandidateID int64     `json:"candidate_id"`
+	SourcePDID  string    `json:"source_pdid"`
+	TargetPDID  string    `json:"target_pdid"`
+	Status      string    `json:"status"`
+	Timestamp   time.Time `json:"timestamp"`
+}
+
+type IdentityBindingEventPayload struct {
+	PDID      string            `json:"pdid"`
+	AliasID   int64             `json:"alias_id"`
+	AliasType IdentityAliasType `json:"alias_type,omitempty"`
+	Action    string            `json:"action"`
+	Timestamp time.Time         `json:"timestamp"`
 }
 
 // EffectiveStatusChangedPayload is the payload for EventEffectiveStatusChanged.

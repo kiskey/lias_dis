@@ -1,6 +1,6 @@
 {
   "api_version": "v1",
-  "schema_version": 1,
+  "schema_version": 2,
   "min_client_api_version": "v1",
   "public_device_key": "pdid",
   "response_compatibility": "additive",
@@ -8,6 +8,8 @@
     "authenticated_identity",
     "device_inventory",
     "identity_bindings",
+    "identity_candidate_queue",
+    "identity_candidate_reopen",
     "identity_candidates",
     "identity_split",
     "sse_events",

@@ -1,6 +1,8 @@
 package correlation
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -9,8 +11,19 @@ import (
 
 	identitycore "github.com/user/lias-dis/apps/discovery-service/internal/identity"
 	"github.com/user/lias-dis/apps/discovery-service/internal/inventory"
+	"github.com/user/lias-dis/apps/discovery-service/internal/storage"
 	"github.com/user/lias-dis/shared/models"
 )
+
+var (
+	ErrCandidateStaleOrConflicting = models.ErrCandidateStaleOrConflicting
+	ErrCandidateNotFound           = models.ErrCandidateNotFound
+)
+
+type identityCandidateCursor struct {
+	UpdatedAt time.Time `json:"updated_at"`
+	ID        int64     `json:"id"`
+}
 
 func (e *Engine) resolveVerifiedObservation(signals []identitycore.Signal) *models.Device {
 	if e.store == nil {
@@ -72,11 +85,17 @@ func (e *Engine) recordIdentitySignals(d *models.Device, signals []identitycore.
 	if candidate == nil || decision.Probability < identitycore.PassiveCandidateThreshold {
 		return
 	}
-	_, _ = e.store.UpsertIdentityCandidate(models.IdentityCandidateLink{
+	id, err := e.store.UpsertIdentityCandidate(models.IdentityCandidateLink{
 		SourcePDID: d.PDID, TargetPDID: candidate.PDID,
 		Probability: decision.Probability, Ambiguous: true, Status: "pending",
 		Factors: decision.Factors, CreatedAt: observedAt,
 	})
+	if err == nil {
+		e.broker.Broadcast(models.NewEvent(models.EventIdentityCandidateChanged, d.PDID, models.IdentityCandidateEventPayload{
+			CandidateID: id, SourcePDID: d.PDID, TargetPDID: candidate.PDID,
+			Status: "pending", Timestamp: time.Now(),
+		}))
+	}
 	for _, factor := range decision.Factors {
 		if !factor.Matched {
 			continue
@@ -136,6 +155,9 @@ func (e *Engine) BindIdentityAlias(pdid string, req models.IdentityBindingReques
 		d.IdentityAmbiguous = false
 		e.cache.Upsert(d)
 		e.markDirty(d.PDID)
+		e.broker.Broadcast(models.NewEvent(models.EventIdentityBindingChanged, d.PDID, models.IdentityBindingEventPayload{
+			PDID: d.PDID, AliasID: alias.ID, AliasType: alias.Type, Action: "bound", Timestamp: time.Now(),
+		}))
 	}
 	return alias, err
 }
@@ -146,44 +168,196 @@ func (e *Engine) RevokeIdentityAlias(pdid string, aliasID int64) error {
 	if e.store == nil {
 		return errors.New("identity persistence unavailable")
 	}
-	return e.store.RevokeIdentityAlias(e.ResolvePDID(pdid), aliasID)
-}
-
-func (e *Engine) RejectIdentityCandidate(id int64) error {
-	if e.store == nil {
-		return errors.New("identity persistence unavailable")
+	pdid = e.ResolvePDID(pdid)
+	err := e.store.RevokeIdentityAlias(pdid, aliasID)
+	if err == nil {
+		e.broker.Broadcast(models.NewEvent(models.EventIdentityBindingChanged, pdid, models.IdentityBindingEventPayload{
+			PDID: pdid, AliasID: aliasID, Action: "revoked", Timestamp: time.Now(),
+		}))
 	}
-	return e.store.DecideIdentityCandidate(id, "rejected", "manual_admin")
+	return err
 }
 
-func (e *Engine) ConfirmIdentityCandidate(id int64) (*models.Device, error) {
+func (e *Engine) ListIdentityCandidates(status string, limit int, cursor string) (models.IdentityCandidateListResponse, error) {
+	if e.store == nil {
+		return models.IdentityCandidateListResponse{}, errors.New("identity persistence unavailable")
+	}
+	var after identityCandidateCursor
+	if cursor != "" {
+		data, err := base64.RawURLEncoding.DecodeString(cursor)
+		if err != nil || json.Unmarshal(data, &after) != nil || after.ID < 1 || after.UpdatedAt.IsZero() {
+			return models.IdentityCandidateListResponse{}, fmt.Errorf("invalid cursor")
+		}
+	}
+	links, err := e.store.ListIdentityCandidatesPage(status, limit+1, after.UpdatedAt, after.ID)
+	if err != nil {
+		return models.IdentityCandidateListResponse{}, err
+	}
+	response := models.IdentityCandidateListResponse{Candidates: make([]models.IdentityCandidateDetail, 0, min(limit, len(links)))}
+	for _, link := range links[:min(limit, len(links))] {
+		response.Candidates = append(response.Candidates, e.decorateIdentityCandidate(link))
+	}
+	if len(links) > limit {
+		last := links[limit-1]
+		data, _ := json.Marshal(identityCandidateCursor{UpdatedAt: last.UpdatedAt, ID: last.ID})
+		response.NextCursor = base64.RawURLEncoding.EncodeToString(data)
+	}
+	return response, nil
+}
+
+func (e *Engine) GetIdentityCandidate(id int64) (*models.IdentityCandidateDetail, error) {
 	if e.store == nil {
 		return nil, errors.New("identity persistence unavailable")
 	}
 	candidate, err := e.store.GetIdentityCandidate(id)
 	if err != nil {
+		if storage.IsIdentityNotFound(err) {
+			return nil, ErrCandidateNotFound
+		}
 		return nil, err
 	}
-	if candidate.Status != "pending" {
-		return nil, fmt.Errorf("candidate already decided")
+	decorated := e.decorateIdentityCandidate(candidate)
+	return &decorated, nil
+}
+
+func (e *Engine) decorateIdentityCandidate(link models.IdentityCandidateLink) models.IdentityCandidateDetail {
+	item := models.IdentityCandidateDetail{ID: link.ID, SourcePDID: link.SourcePDID, TargetPDID: link.TargetPDID,
+		Probability: link.Probability, Ambiguous: link.Ambiguous, Status: link.Status,
+		Factors: []models.IdentityFactor{}, Conflicts: []models.IdentityFactor{}, CreatedAt: link.CreatedAt,
+		UpdatedAt: link.UpdatedAt, DecisionSource: link.DecisionSource, DecisionNote: link.DecisionNote}
+	for _, factor := range link.Factors {
+		if factor.Matched {
+			item.Factors = append(item.Factors, factor)
+		} else {
+			item.Conflicts = append(item.Conflicts, factor)
+		}
 	}
-	source := e.cache.Get(e.ResolvePDID(candidate.SourcePDID))
-	target := e.cache.Get(e.ResolvePDID(candidate.TargetPDID))
+	// Do not resolve the source through a post-merge redirect: after a confirmed
+	// merge the source record genuinely no longer exists and must not be shown
+	// as a duplicate copy of the surviving target.
+	item.SourceDevice = identityCandidateDevice(e.cache.Get(link.SourcePDID))
+	item.TargetDevice = identityCandidateDevice(e.cache.Get(link.TargetPDID))
+	return item
+}
+
+func identityCandidateDevice(device *models.Device) *models.IdentityCandidateDevice {
+	if device == nil {
+		return nil
+	}
+	return &models.IdentityCandidateDevice{PDID: device.PDID, DisplayName: device.DisplayName(),
+		CurrentMAC: device.CurrentMAC, Online: device.Online, LastSeen: device.LastSeen}
+}
+
+func validateCandidateDecision(candidate models.IdentityCandidateLink, req models.IdentityCandidateDecisionRequest) error {
+	if req.ExpectedSourcePDID != "" && req.ExpectedSourcePDID != candidate.SourcePDID {
+		return ErrCandidateStaleOrConflicting
+	}
+	if req.ExpectedTargetPDID != "" && req.ExpectedTargetPDID != candidate.TargetPDID {
+		return ErrCandidateStaleOrConflicting
+	}
+	if req.ExpectedUpdatedAt != nil && !req.ExpectedUpdatedAt.Equal(candidate.UpdatedAt) {
+		return ErrCandidateStaleOrConflicting
+	}
+	return nil
+}
+
+func (e *Engine) RejectIdentityCandidate(id int64, req models.IdentityCandidateDecisionRequest) (*models.IdentityCandidateDetail, error) {
+	e.identityMu.Lock()
+	defer e.identityMu.Unlock()
+	candidate, err := e.store.GetIdentityCandidate(id)
+	if err != nil {
+		return nil, ErrCandidateNotFound
+	}
+	if candidate.Status == "rejected" {
+		decorated := e.decorateIdentityCandidate(candidate)
+		return &decorated, nil
+	}
+	if candidate.Status != "pending" || validateCandidateDecision(candidate, req) != nil {
+		return nil, ErrCandidateStaleOrConflicting
+	}
+	if err := e.store.DecideIdentityCandidate(id, "rejected", "manual_admin", req.DecisionNote); err != nil {
+		return nil, ErrCandidateStaleOrConflicting
+	}
+	candidate, _ = e.store.GetIdentityCandidate(id)
+	e.broadcastCandidateDecision(candidate)
+	decorated := e.decorateIdentityCandidate(candidate)
+	return &decorated, nil
+}
+
+func (e *Engine) ReopenIdentityCandidate(id int64, req models.IdentityCandidateDecisionRequest) (*models.IdentityCandidateDetail, error) {
+	e.identityMu.Lock()
+	defer e.identityMu.Unlock()
+	candidate, err := e.store.GetIdentityCandidate(id)
+	if err != nil {
+		return nil, ErrCandidateNotFound
+	}
+	if candidate.Status == "confirmed" || validateCandidateDecision(candidate, req) != nil {
+		return nil, ErrCandidateStaleOrConflicting
+	}
+	if candidate.Status == "pending" {
+		decorated := e.decorateIdentityCandidate(candidate)
+		return &decorated, nil
+	}
+	if err := e.store.ReopenIdentityCandidate(id, "manual_admin", req.DecisionNote); err != nil {
+		return nil, ErrCandidateStaleOrConflicting
+	}
+	candidate, _ = e.store.GetIdentityCandidate(id)
+	e.broker.Broadcast(models.NewEvent(models.EventIdentityCandidateChanged, candidate.SourcePDID, models.IdentityCandidateEventPayload{
+		CandidateID: id, SourcePDID: candidate.SourcePDID, TargetPDID: candidate.TargetPDID,
+		Status: candidate.Status, Timestamp: time.Now(),
+	}))
+	decorated := e.decorateIdentityCandidate(candidate)
+	return &decorated, nil
+}
+
+func (e *Engine) ConfirmIdentityCandidate(id int64, req models.IdentityCandidateDecisionRequest) (*models.Device, error) {
+	e.identityMu.Lock()
+	defer e.identityMu.Unlock()
+	if e.store == nil {
+		return nil, errors.New("identity persistence unavailable")
+	}
+	candidate, err := e.store.GetIdentityCandidate(id)
+	if err != nil {
+		return nil, ErrCandidateNotFound
+	}
+	if candidate.Status == "confirmed" {
+		device := e.cache.Get(e.ResolvePDID(candidate.TargetPDID))
+		if device == nil {
+			return nil, ErrCandidateStaleOrConflicting
+		}
+		return device, nil
+	}
+	if candidate.Status != "pending" || validateCandidateDecision(candidate, req) != nil {
+		return nil, ErrCandidateStaleOrConflicting
+	}
+	source := e.cache.Get(candidate.SourcePDID)
+	target := e.cache.Get(candidate.TargetPDID)
 	if source == nil || target == nil {
-		return nil, storageIdentityNotFound()
+		return nil, ErrCandidateStaleOrConflicting
+	}
+	if source.Online && target.Online {
+		return nil, ErrCandidateStaleOrConflicting
 	}
 	merged := mergeDeviceData(source, target)
-	if err := e.store.MergeDevices(source, merged, "manual_candidate_confirmation"); err != nil {
+	decided, err := e.store.ConfirmIdentityCandidateMerge(id, source, merged, "manual_candidate_confirmation", req.DecisionNote)
+	if err != nil {
 		return nil, err
 	}
-	_ = e.store.DecideIdentityCandidate(id, "confirmed", "manual_admin")
 	e.cache.Delete(source.PDID)
 	e.cache.Upsert(merged)
+	e.broadcastCandidateDecision(decided)
 	e.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, merged.PDID, models.DeviceReidentifiedPayload{
 		PDID: merged.PDID, OldPDID: source.PDID, NewPDID: merged.PDID, Reason: "manual_candidate_confirmation",
 		MigratedMACs: source.MACs, Timestamp: time.Now(),
 	}))
 	return merged, nil
+}
+
+func (e *Engine) broadcastCandidateDecision(candidate models.IdentityCandidateLink) {
+	e.broker.Broadcast(models.NewEvent(models.EventIdentityCandidateDecided, candidate.SourcePDID, models.IdentityCandidateEventPayload{
+		CandidateID: candidate.ID, SourcePDID: candidate.SourcePDID, TargetPDID: candidate.TargetPDID,
+		Status: candidate.Status, Timestamp: time.Now(),
+	}))
 }
 
 func mergeDeviceData(source, target *models.Device) *models.Device {

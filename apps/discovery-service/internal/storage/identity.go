@@ -14,6 +14,7 @@ import (
 var (
 	ErrAliasConflict    = errors.New("verified identity alias belongs to another device")
 	ErrIdentityNotFound = errors.New("identity record not found")
+	ErrCandidateChanged = errors.New("identity candidate changed or was already decided")
 )
 
 func (s *Storage) UpsertIdentityAlias(alias models.IdentityAlias) (int64, error) {
@@ -246,17 +247,17 @@ func (s *Storage) UpsertIdentityCandidate(candidate models.IdentityCandidateLink
 	err = s.db.QueryRow(`
         INSERT INTO identity_candidates (
             source_pdid, target_pdid, probability, ambiguous, status,
-            factors_json, created_at, updated_at, decision_source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            factors_json, created_at, updated_at, decision_source, decision_note
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_pdid, target_pdid) DO UPDATE SET
             probability = excluded.probability,
             ambiguous = excluded.ambiguous,
             factors_json = excluded.factors_json,
             updated_at = excluded.updated_at
         RETURNING id
-    `, candidate.SourcePDID, candidate.TargetPDID, candidate.Probability,
+	`, candidate.SourcePDID, candidate.TargetPDID, candidate.Probability,
 		ambiguous, candidate.Status, string(factorsJSON), candidate.CreatedAt,
-		candidate.UpdatedAt, candidate.DecisionSource).Scan(&id)
+		candidate.UpdatedAt, candidate.DecisionSource, candidate.DecisionNote).Scan(&id)
 	return id, err
 }
 
@@ -265,7 +266,7 @@ func (s *Storage) ListIdentityCandidates(pdid string) ([]models.IdentityCandidat
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(`
         SELECT id, source_pdid, target_pdid, probability, ambiguous,
-               status, factors_json, created_at, updated_at, decision_source
+               status, factors_json, created_at, updated_at, decision_source, decision_note
         FROM identity_candidates
         WHERE source_pdid = ? OR target_pdid = ?
         ORDER BY status = 'pending' DESC, probability DESC, updated_at DESC
@@ -285,12 +286,51 @@ func (s *Storage) ListIdentityCandidates(pdid string) ([]models.IdentityCandidat
 	return candidates, rows.Err()
 }
 
+// ListIdentityCandidatesPage returns a stable newest-first page. The cursor is
+// the last row's (updated_at,id) tuple from the preceding page.
+func (s *Storage) ListIdentityCandidatesPage(status string, limit int, before time.Time, beforeID int64) ([]models.IdentityCandidateLink, error) {
+	// One extra row is allowed internally so callers can determine whether a
+	// next-page cursor is needed while keeping the public limit capped at 100.
+	if limit < 1 || limit > 101 {
+		return nil, fmt.Errorf("invalid candidate page limit")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	query := `
+        SELECT id, source_pdid, target_pdid, probability, ambiguous,
+               status, factors_json, created_at, updated_at, decision_source, decision_note
+        FROM identity_candidates
+        WHERE (? = '' OR status = ?)
+          AND (? = 0 OR updated_at < ? OR (updated_at = ? AND id < ?))
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?
+    `
+	hasCursor := 0
+	if !before.IsZero() {
+		hasCursor = 1
+	}
+	rows, err := s.db.Query(query, status, status, hasCursor, before, before, beforeID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	candidates := make([]models.IdentityCandidateLink, 0, limit)
+	for rows.Next() {
+		candidate, err := scanIdentityCandidate(rows)
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, rows.Err()
+}
+
 func (s *Storage) GetIdentityCandidate(id int64) (models.IdentityCandidateLink, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row := s.db.QueryRow(`
         SELECT id, source_pdid, target_pdid, probability, ambiguous,
-               status, factors_json, created_at, updated_at, decision_source
+               status, factors_json, created_at, updated_at, decision_source, decision_note
         FROM identity_candidates WHERE id = ?
     `, id)
 	candidate, err := scanIdentityCandidate(row)
@@ -310,7 +350,7 @@ func scanIdentityCandidate(scanner identityCandidateScanner) (models.IdentityCan
 	var factorsJSON string
 	err := scanner.Scan(&candidate.ID, &candidate.SourcePDID, &candidate.TargetPDID,
 		&candidate.Probability, &ambiguous, &candidate.Status, &factorsJSON,
-		&candidate.CreatedAt, &candidate.UpdatedAt, &candidate.DecisionSource)
+		&candidate.CreatedAt, &candidate.UpdatedAt, &candidate.DecisionSource, &candidate.DecisionNote)
 	if err != nil {
 		return candidate, err
 	}
@@ -319,23 +359,45 @@ func scanIdentityCandidate(scanner identityCandidateScanner) (models.IdentityCan
 	return candidate, nil
 }
 
-func (s *Storage) DecideIdentityCandidate(id int64, status, source string) error {
+func (s *Storage) DecideIdentityCandidate(id int64, status, source string, note ...string) error {
 	if status != "confirmed" && status != "rejected" {
 		return fmt.Errorf("invalid candidate decision")
+	}
+	decisionNote := ""
+	if len(note) > 0 {
+		decisionNote = strings.TrimSpace(note[0])
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result, err := s.db.Exec(`
         UPDATE identity_candidates
-        SET status = ?, decision_source = ?, ambiguous = 0, updated_at = ?
+        SET status = ?, decision_source = ?, decision_note = ?, ambiguous = 0, updated_at = ?
         WHERE id = ? AND status = 'pending'
-    `, status, source, time.Now(), id)
+    `, status, source, decisionNote, time.Now(), id)
 	if err != nil {
 		return err
 	}
 	changed, _ := result.RowsAffected()
 	if changed == 0 {
 		return ErrIdentityNotFound
+	}
+	return nil
+}
+
+func (s *Storage) ReopenIdentityCandidate(id int64, source, note string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`
+        UPDATE identity_candidates
+        SET status = 'pending', decision_source = ?, decision_note = ?, ambiguous = 1, updated_at = ?
+        WHERE id = ? AND status = 'rejected'
+    `, source, strings.TrimSpace(note), time.Now(), id)
+	if err != nil {
+		return err
+	}
+	changed, _ := result.RowsAffected()
+	if changed == 0 {
+		return ErrCandidateChanged
 	}
 	return nil
 }
@@ -374,7 +436,13 @@ func (s *Storage) MergeDevices(source, target *models.Device, reason string) err
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := s.mergeDevicesTx(tx, source, target, reason); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
+func (s *Storage) mergeDevicesTx(tx *sql.Tx, source, target *models.Device, reason string) error {
 	if _, err := tx.Exec("DELETE FROM device_macs WHERE pdid = ?", source.PDID); err != nil {
 		return err
 	}
@@ -430,7 +498,61 @@ func (s *Storage) MergeDevices(source, target *models.Device, reason string) err
 	if _, err := tx.Exec("DELETE FROM devices WHERE pdid = ?", source.PDID); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
+}
+
+// ConfirmIdentityCandidateMerge commits the candidate decision, device merge,
+// redirect, aliases, and evidence as one SQLite transaction.
+func (s *Storage) ConfirmIdentityCandidateMerge(id int64, source, target *models.Device, reason, note string) (models.IdentityCandidateLink, error) {
+	if source == nil || target == nil || source.PDID == target.PDID {
+		return models.IdentityCandidateLink{}, fmt.Errorf("invalid device merge")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return models.IdentityCandidateLink{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	candidate, err := scanIdentityCandidate(tx.QueryRow(`
+        SELECT id, source_pdid, target_pdid, probability, ambiguous,
+               status, factors_json, created_at, updated_at, decision_source, decision_note
+        FROM identity_candidates WHERE id = ?
+    `, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return candidate, ErrIdentityNotFound
+	}
+	if err != nil {
+		return candidate, err
+	}
+	if candidate.Status != "pending" || candidate.SourcePDID != source.PDID || candidate.TargetPDID != target.PDID {
+		return candidate, ErrCandidateChanged
+	}
+	now := time.Now()
+	result, err := tx.Exec(`
+        UPDATE identity_candidates
+        SET status = 'confirmed', decision_source = 'manual_admin', decision_note = ?, ambiguous = 0, updated_at = ?
+        WHERE id = ? AND status = 'pending'
+    `, strings.TrimSpace(note), now, id)
+	if err != nil {
+		return candidate, err
+	}
+	changed, _ := result.RowsAffected()
+	if changed != 1 {
+		return candidate, ErrCandidateChanged
+	}
+	if err := s.mergeDevicesTx(tx, source, target, reason); err != nil {
+		return candidate, err
+	}
+	if err := tx.Commit(); err != nil {
+		return candidate, err
+	}
+	candidate.Status = "confirmed"
+	candidate.Ambiguous = false
+	candidate.DecisionSource = "manual_admin"
+	candidate.DecisionNote = strings.TrimSpace(note)
+	candidate.UpdatedAt = now
+	return candidate, nil
 }
 
 func (s *Storage) SplitDevice(original, split *models.Device, macHash string) error {

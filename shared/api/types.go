@@ -8,6 +8,7 @@ package api
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/user/lias-dis/shared/models"
 )
@@ -18,17 +19,20 @@ const (
 
 	// APISchemaVersion increments only for additive v1 schema extensions.
 	// Breaking wire changes require a new URL namespace instead.
-	APISchemaVersion = 1
+	APISchemaVersion = 2
 )
 
 const (
-	FeatureDeviceInventory       = "device_inventory"
-	FeatureSSEEvents             = "sse_events"
-	FeatureSSEReplay             = "sse_replay"
-	FeatureIdentityBindings      = "identity_bindings"
-	FeatureIdentityCandidates    = "identity_candidates"
-	FeatureIdentitySplit         = "identity_split"
-	FeatureAuthenticatedIdentity = "authenticated_identity"
+	FeatureDeviceInventory         = "device_inventory"
+	FeatureSSEEvents               = "sse_events"
+	FeatureSSEReplay               = "sse_replay"
+	FeatureIdentityBindings        = "identity_bindings"
+	FeatureIdentityCandidates      = "identity_candidates"
+	FeatureIdentityCandidateQueue  = "identity_candidate_queue"
+	FeatureIdentityCandidateReopen = "identity_candidate_reopen"
+	FeatureIdentitySplit           = "identity_split"
+	FeatureAuthenticatedIdentity   = "authenticated_identity"
+	FeatureSnapshotV1              = "snapshot_v1"
 )
 
 // CapabilitiesResponse lets LIAS and other clients negotiate optional features
@@ -40,6 +44,28 @@ type CapabilitiesResponse struct {
 	PublicDeviceKey       string   `json:"public_device_key"`
 	ResponseCompatibility string   `json:"response_compatibility"`
 	Features              []string `json:"features"`
+}
+
+type UpstreamState struct {
+	Reachable           bool      `json:"reachable"`
+	LegacyMode          bool      `json:"legacy_mode"`
+	LastCapabilityCheck time.Time `json:"last_capability_check,omitempty"`
+	LastSuccessfulSync  time.Time `json:"last_successful_sync,omitempty"`
+	LastSSEEvent        time.Time `json:"last_sse_event,omitempty"`
+	LastError           string    `json:"last_error,omitempty"`
+}
+
+type LIASCapabilitiesResponse struct {
+	CapabilitiesResponse
+	DISCapabilities *CapabilitiesResponse `json:"dis_capabilities,omitempty"`
+	Upstream        UpstreamState         `json:"upstream"`
+}
+
+type SystemStatusResponse struct {
+	Status        string        `json:"status"`
+	APIVersion    string        `json:"api_version"`
+	SchemaVersion int           `json:"schema_version"`
+	Upstream      UpstreamState `json:"upstream"`
 }
 
 // DISCapabilities returns a fresh, immutable-by-convention capability
@@ -55,6 +81,8 @@ func DISCapabilities() CapabilitiesResponse {
 			FeatureAuthenticatedIdentity,
 			FeatureDeviceInventory,
 			FeatureIdentityBindings,
+			FeatureIdentityCandidateQueue,
+			FeatureIdentityCandidateReopen,
 			FeatureIdentityCandidates,
 			FeatureIdentitySplit,
 			FeatureSSEEvents,
@@ -78,8 +106,10 @@ type HealthResponse struct {
 // ErrorResponse is the standard JSON error payload returned for any
 // non-2xx HTTP response.
 type ErrorResponse struct {
-	Error   string `json:"error"`
-	Details string `json:"details,omitempty"`
+	Error     string `json:"error"`
+	Details   string `json:"details,omitempty"`
+	Code      string `json:"code,omitempty"`
+	Retryable bool   `json:"retryable,omitempty"`
 }
 
 // AcceptedResponse is used for endpoints that trigger background tasks,

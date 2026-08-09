@@ -1,0 +1,31 @@
+{
+  "devices": [
+    {
+      "device_id": "immutable-device-id",
+      "pdid": "pdid_target",
+      "identity_tier": "bia",
+      "identity_anchor": "anchor-fixture",
+      "current_mac": "00:11:22:33:44:55",
+      "macs": ["00:11:22:33:44:55"],
+      "current_ip": "192.168.1.20",
+      "ips": ["192.168.1.20"],
+      "hostname": "phone",
+      "friendly_name": "Family Phone",
+      "manufacturer": "Example",
+      "vendor": "Example",
+      "model": "Phone",
+      "device_type": "mobile",
+      "services": [],
+      "online": true,
+      "first_seen": "2026-08-09T19:00:00Z",
+      "last_seen": "2026-08-09T20:00:00Z",
+      "confidence": 0.9,
+      "tags": ["family"],
+      "identity_assurance": "verified",
+      "identity_probability": 1,
+      "identity_ambiguous": false,
+      "future_additive_field": "ignored"
+    }
+  ],
+  "total": 1
+}

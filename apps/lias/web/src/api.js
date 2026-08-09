@@ -5,13 +5,26 @@
  */
 
 export const API = {
+    csrfToken() {
+        const prefix = 'lias_csrf=';
+        const entry = document.cookie.split(';').map(value => value.trim()).find(value => value.startsWith(prefix));
+        return entry ? decodeURIComponent(entry.slice(prefix.length)) : '';
+    },
+
     async request(endpoint, options = {}) {
+        const method = (options.method || 'GET').toUpperCase();
+        const headers = {
+            'Content-Type': 'application/json',
+            ...options.headers
+        };
+        if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+            const csrf = this.csrfToken();
+            if (csrf) headers['X-CSRF-Token'] = csrf;
+        }
         const config = {
-            headers: {
-                'Content-Type': 'application/json',
-                ...options.headers
-            },
-            ...options
+            ...options,
+            credentials: 'same-origin',
+            headers
         };
 
         const response = await fetch(endpoint, config);
@@ -55,6 +68,45 @@ export const API = {
             return await response.json();
         }
         return await response.text();
+    },
+
+    async createSession(token) {
+        return await this.request('/api/v1/session', {
+            method: 'POST',
+            body: JSON.stringify({ token })
+        });
+    },
+
+    async deleteSession() {
+        return await this.request('/api/v1/session', { method: 'DELETE' });
+    },
+
+    async getCapabilities() {
+        return await this.request('/api/v1/capabilities');
+    },
+
+    async getSnapshot(etag = '') {
+        const headers = {};
+        if (etag) headers['If-None-Match'] = etag;
+        const response = await fetch('/api/v1/snapshot', { credentials: 'same-origin', headers });
+        if (response.status === 304) {
+            return { notModified: true, etag: response.headers.get('etag') || etag };
+        }
+        if (!response.ok) {
+            const error = new Error(`HTTP Error ${response.status}`);
+            error.status = response.status;
+            try {
+                const body = await response.json();
+                error.message = body.message || body.error || error.message;
+                error.error = body.error;
+            } catch (_) { /* keep status message */ }
+            throw error;
+        }
+        return {
+            notModified: false,
+            etag: response.headers.get('etag') || '',
+            snapshot: await response.json()
+        };
     },
 
     // --- DEVICE ENDPOINTS ---
@@ -212,7 +264,7 @@ export const API = {
     },
 
     async exportPolicies() {
-        const response = await fetch('/api/v1/policies/export');
+        const response = await fetch('/api/v1/policies/export', { credentials: 'same-origin' });
         if (!response.ok) throw new Error('Failed to export policies');
         return response.blob();
     },
@@ -270,6 +322,48 @@ export const API = {
         });
     },
 
+    // --- IDENTITY REVIEW ENDPOINTS ---
+    async getIdentityCandidates(status = 'pending', limit = 50, cursor = '') {
+        const query = new URLSearchParams({ status, limit: String(limit) });
+        if (cursor) query.set('cursor', cursor);
+        return await this.request(`/api/v1/identity/candidates?${query.toString()}`);
+    },
+
+    async getIdentityCandidate(id) {
+        return await this.request(`/api/v1/identity/candidates/${encodeURIComponent(id)}`);
+    },
+
+    async getIdentityProfile(pdid) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/identity`);
+    },
+
+    async decideIdentityCandidate(id, action, decision = {}) {
+        return await this.request(`/api/v1/identity/candidates/${encodeURIComponent(id)}/${action}`, {
+            method: 'POST',
+            body: JSON.stringify(decision)
+        });
+    },
+
+    async bindIdentity(pdid, binding) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/identity/bindings`, {
+            method: 'POST',
+            body: JSON.stringify(binding)
+        });
+    },
+
+    async revokeIdentity(pdid, aliasId) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/identity/bindings/${encodeURIComponent(aliasId)}`, {
+            method: 'DELETE'
+        });
+    },
+
+    async splitIdentity(pdid, split) {
+        return await this.request(`/api/v1/devices/${encodeURIComponent(pdid)}/identity/split`, {
+            method: 'POST',
+            body: JSON.stringify(split)
+        });
+    },
+
     // --- SYSTEM & REPORTING ENDPOINTS ---
     async getNetworkStats() {
         return await this.request('/api/v1/stats');
@@ -290,7 +384,7 @@ export const API = {
 
     // --- REAL-TIME SSE EVENT STREAM ---
     subscribeEvents(onEventCallback) {
-        const eventSource = new EventSource('/api/v1/events');
+        const eventSource = new EventSource('/api/v1/events', { withCredentials: true });
 
         eventSource.onmessage = (e) => {
             try {
@@ -312,7 +406,10 @@ export const API = {
             'device.mac_changed',
             'device.reidentified',
             'security.alert',
-            'effective.status_changed'
+            'effective.status_changed',
+            'identity.candidate.changed',
+            'identity.candidate.decided',
+            'identity.binding.changed'
         ];
 
         eventTypes.forEach(evtType => {

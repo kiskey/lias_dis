@@ -222,6 +222,7 @@ func (s *Storage) initSchema() error {
         created_at DATETIME NOT NULL,
         updated_at DATETIME NOT NULL,
         decision_source TEXT NOT NULL DEFAULT '',
+		decision_note TEXT NOT NULL DEFAULT '',
         UNIQUE(source_pdid, target_pdid)
     );
 
@@ -268,6 +269,7 @@ func (s *Storage) initSchema() error {
 	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_assurance TEXT NOT NULL DEFAULT 'unverified'")
 	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_probability REAL NOT NULL DEFAULT 0.0")
 	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_ambiguous INTEGER NOT NULL DEFAULT 0")
+	_, _ = s.db.Exec("ALTER TABLE identity_candidates ADD COLUMN decision_note TEXT NOT NULL DEFAULT ''")
 
 	// Legacy deterministic PDIDs remain public compatibility keys. Each row
 	// receives a separate permanent internal identifier exactly once.

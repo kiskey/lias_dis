@@ -292,6 +292,8 @@ logging:
 
 http:
   listen: ":8081"
+  auth_token: ""
+  secure_cookies: false  # Set true when the dashboard is served over HTTPS.
 
 dis:
   url: "http://127.0.0.1:8080"

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/user/lias-dis/apps/lias/internal/config"
@@ -29,26 +30,33 @@ type EventBroadcaster interface {
 	SignalSSEConnected()
 }
 
-type StorageMigrator interface {
-	MigrateDeviceTag(oldPDID, newPDID string) error
-	MigrateDevicePolicies(oldPDID, newPDID string) error
+type IdentityMigrator interface {
+	MigrateIdentity(oldPDID, newPDID string, migratedMACs []string) (MigrationResult, error)
+}
+
+type MigrationResult struct {
+	Conflicts int
+	Replayed  bool
 }
 
 type DISClient struct {
-	cfg           config.DISConfig
-	cache         *Cache
-	store         StorageMigrator
-	client        *http.Client
-	trigger       chan struct{}
-	broker        EventBroadcaster
-	lastSeenInDIS map[string]time.Time
+	cfg             config.DISConfig
+	cache           *Cache
+	migrator        IdentityMigrator
+	client          *http.Client
+	trigger         chan struct{}
+	broker          EventBroadcaster
+	lastSeenInDIS   map[string]time.Time
+	stateMu         sync.RWMutex
+	disCapabilities *api.CapabilitiesResponse
+	upstream        api.UpstreamState
 }
 
-func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, broker EventBroadcaster, store StorageMigrator) *DISClient {
+func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, broker EventBroadcaster, migrator IdentityMigrator) *DISClient {
 	return &DISClient{
 		cfg:           cfg,
 		cache:         cache,
-		store:         store,
+		migrator:      migrator,
 		client:        &http.Client{Timeout: 10 * time.Second},
 		trigger:       trigger,
 		broker:        broker,
@@ -57,11 +65,13 @@ func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, bro
 }
 
 func (c *DISClient) Run(ctx context.Context) {
+	c.refreshCapabilities(ctx)
 	c.pollDevices()
 	c.tryTrigger()
 
 	go c.pollerLoop(ctx)
 	go c.sseLoop(ctx)
+	go c.capabilityLoop(ctx)
 }
 
 func (c *DISClient) tryTrigger() {
@@ -106,7 +116,13 @@ func (c *DISClient) getEndpointURL(path string) string {
 		u.Host = u.Host + ":8080"
 	}
 
-	u.Path = strings.TrimRight(u.Path, "/") + path
+	escapedPath := strings.TrimRight(u.EscapedPath(), "/") + path
+	if decodedPath, decodeErr := url.PathUnescape(escapedPath); decodeErr == nil {
+		u.Path = decodedPath
+		u.RawPath = escapedPath
+	} else {
+		u.Path = strings.TrimRight(u.Path, "/") + path
+	}
 	return u.String()
 }
 
@@ -123,18 +139,21 @@ func (c *DISClient) pollDevices() {
 
 	resp, err := c.client.Do(req)
 	if err != nil {
+		c.recordUpstreamError(err)
 		slog.Error("Failed to poll DIS devices", "url", targetURL, "error", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		c.recordUpstreamError(fmt.Errorf("device inventory status %d", resp.StatusCode))
 		slog.Error("DIS poll returned non-200 status", "status", resp.StatusCode)
 		return
 	}
 
 	var listResp api.DeviceListResponse
 	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+		c.recordUpstreamError(err)
 		slog.Error("Failed to decode DIS device list", "error", err)
 		return
 	}
@@ -185,6 +204,11 @@ func (c *DISClient) pollDevices() {
 		}
 	}
 	slog.Info("Synced device inventory from DIS", "count", len(listResp.Devices))
+	c.stateMu.Lock()
+	c.upstream.Reachable = true
+	c.upstream.LastSuccessfulSync = time.Now()
+	c.upstream.LastError = ""
+	c.stateMu.Unlock()
 }
 
 func (c *DISClient) sseLoop(ctx context.Context) {
@@ -239,6 +263,7 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
 	}
 
 	slog.Info("Successfully connected to DIS SSE event stream", "url", targetURL)
+	c.refreshCapabilities(ctx)
 
 	// CPU-05 Fix: Signal successful connection to reset backoff
 	if c.broker != nil {
@@ -312,6 +337,11 @@ func resolveEventPDID(eventType models.EventType, payload json.RawMessage) strin
 }
 
 func (c *DISClient) handleEvent(e models.Event) {
+	c.stateMu.Lock()
+	c.upstream.Reachable = true
+	c.upstream.LastSSEEvent = time.Now()
+	c.upstream.LastError = ""
+	c.stateMu.Unlock()
 	pdid := e.TargetPDID()
 	if pdid != "" {
 		e.SetTargetPDID(pdid)
@@ -341,13 +371,16 @@ func (c *DISClient) handleEvent(e models.Event) {
 
 		if payload.OldPDID != "" && payload.NewPDID != "" {
 			e.SetTargetPDID(payload.NewPDID)
-			c.cache.MigrateDeviceIdentity(payload.OldPDID, payload.NewPDID, payload.MigratedMACs)
-
-			if c.store != nil {
-				_ = c.store.MigrateDeviceTag(payload.OldPDID, payload.NewPDID)
-				if err := c.store.MigrateDevicePolicies(payload.OldPDID, payload.NewPDID); err != nil {
-					slog.Error("Failed to migrate device policies during reidentification", "old_pdid", payload.OldPDID, "new_pdid", payload.NewPDID, "error", err)
+			if c.migrator != nil {
+				migration, err := c.migrator.MigrateIdentity(payload.OldPDID, payload.NewPDID, payload.MigratedMACs)
+				if err != nil {
+					slog.Error("Failed to migrate LIAS identity state; event will be retried safely", "old_pdid", payload.OldPDID, "new_pdid", payload.NewPDID, "error", err)
+					return
 				}
+				slog.Info("Reconciled LIAS identity state", "old_pdid", payload.OldPDID, "new_pdid", payload.NewPDID,
+					"conflicts", migration.Conflicts, "replayed", migration.Replayed)
+			} else {
+				c.cache.MigrateDeviceIdentity(payload.OldPDID, payload.NewPDID, payload.MigratedMACs)
 			}
 
 			if c.fetchSingleDevice(payload.NewPDID) {

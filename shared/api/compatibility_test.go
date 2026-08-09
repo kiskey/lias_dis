@@ -84,3 +84,76 @@ func TestCurrentClientIgnoresFutureResponseFields(t *testing.T) {
 		t.Fatalf("known fields were not preserved: %+v", current)
 	}
 }
+
+func TestAndroidIdentityGoldenContractsRemainAdditive(t *testing.T) {
+	candidateWire, err := os.ReadFile("testdata/identity_candidates_v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var candidates models.IdentityCandidateListResponse
+	if err := json.Unmarshal(candidateWire, &candidates); err != nil || len(candidates.Candidates) != 1 {
+		t.Fatalf("candidate fixture decode failed: candidates=%+v err=%v", candidates, err)
+	}
+	candidate := candidates.Candidates[0]
+	if candidate.SourcePDID != "pdid_source" || candidate.TargetPDID != "pdid_target" || len(candidate.Conflicts) != 1 {
+		t.Fatalf("candidate identity fields changed: %+v", candidate)
+	}
+
+	profileWire, err := os.ReadFile("testdata/identity_profile_v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile models.IdentityProfile
+	if err := json.Unmarshal(profileWire, &profile); err != nil || profile.PDID != "pdid_target" || profile.Assurance != models.IdentityVerified {
+		t.Fatalf("profile fixture decode failed: profile=%+v err=%v", profile, err)
+	}
+
+	// This deliberately mirrors an additive Android decoder: known identity
+	// fields are retained and unknown server fields remain harmless.
+	type androidDeviceContract struct {
+		PDID                string                   `json:"pdid"`
+		IdentityTier        models.IdentityTier      `json:"identity_tier"`
+		IdentityAssurance   models.IdentityAssurance `json:"identity_assurance"`
+		IdentityProbability float64                  `json:"identity_probability"`
+		IdentityAmbiguous   bool                     `json:"identity_ambiguous"`
+	}
+	type androidDeviceListContract struct {
+		Devices []androidDeviceContract `json:"devices"`
+		Total   int                     `json:"total"`
+	}
+	deviceWire, err := os.ReadFile("testdata/device_identity_v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var devices androidDeviceListContract
+	if err := json.Unmarshal(deviceWire, &devices); err != nil {
+		t.Fatalf("Android-compatible identity decode rejected additive fields: %v", err)
+	}
+	if devices.Total != 1 || len(devices.Devices) != 1 || devices.Devices[0].PDID != "pdid_target" ||
+		devices.Devices[0].IdentityTier != models.TierBIA || devices.Devices[0].IdentityAssurance != models.IdentityVerified ||
+		devices.Devices[0].IdentityProbability != 1 || devices.Devices[0].IdentityAmbiguous {
+		t.Fatalf("Android identity contract values changed: %+v", devices)
+	}
+}
+
+func TestLIASSnapshotGoldenSupportsLowResourceClients(t *testing.T) {
+	type snapshotContract struct {
+		Revision                uint64                     `json:"revision"`
+		Devices                 []models.Device            `json:"devices"`
+		Users                   []models.User              `json:"users"`
+		DeviceEffectiveStatuses map[string]json.RawMessage `json:"device_effective_statuses"`
+		TagEffectiveStatuses    map[string]json.RawMessage `json:"tag_effective_statuses"`
+	}
+	wire, err := os.ReadFile("testdata/lias_snapshot_v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot snapshotContract
+	if err := json.Unmarshal(wire, &snapshot); err != nil {
+		t.Fatalf("snapshot fixture decode failed: %v", err)
+	}
+	if snapshot.Revision != 7 || snapshot.Devices == nil || snapshot.Users == nil ||
+		snapshot.DeviceEffectiveStatuses == nil || snapshot.TagEffectiveStatuses == nil {
+		t.Fatalf("snapshot synchronization fields changed: %+v", snapshot)
+	}
+}

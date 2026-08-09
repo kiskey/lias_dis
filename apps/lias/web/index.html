@@ -3,10 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>LIAS Control Center</title>
-    <link rel="stylesheet" href="src/styles.css">
+    <link rel="stylesheet" href="src/styles.css?v=7d">
 </head>
 <body>
     <div id="app-shell">
@@ -26,6 +27,10 @@
                 <button class="nav-item" data-view="devices">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
                     <span>Tag Groups</span>
+                </button>
+                <button class="nav-item" data-view="identity">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><polyline points="16 11 18 13 22 9"></polyline></svg>
+                    <span>Identity Review</span><span class="identity-review-badge" hidden aria-label="pending identity matches">0</span>
                 </button>
                 <button class="nav-item" data-view="schedules">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 16 14"></polyline></svg>
@@ -69,6 +74,10 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
                 <span>Tags</span>
             </button>
+            <button class="mob-nav-item" data-view="identity" aria-label="Identity Review">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="7" r="4"></circle><polyline points="14 12 17 15 22 9"></polyline></svg>
+                <span>Identity</span><span class="identity-review-badge" hidden>0</span>
+            </button>
             <button class="mob-nav-item" data-view="schedules" aria-label="Schedules">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
                 <span>Schedules</span>
@@ -86,7 +95,7 @@
 
     <!-- Modal Container -->
     <div id="modal-root" class="modal-backdrop hidden">
-        <div class="modal-window" role="dialog" aria-modal="true">
+        <div class="modal-window" role="dialog" aria-modal="true" aria-labelledby="modal-title">
             <div class="modal-header">
                 <h3 id="modal-title">Title</h3>
                 <button class="modal-close-btn" id="modal-close-x" aria-label="Close">&times;</button>
@@ -98,6 +107,6 @@
 
     <div id="toast-root" aria-live="polite"></div>
 
-    <script type="module" src="src/main.js"></script>
+    <script type="module" src="src/main.js?v=7d"></script>
 </body>
 </html>

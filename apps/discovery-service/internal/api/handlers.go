@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -29,8 +30,11 @@ type IdentityManager interface {
 	GetIdentityProfile(string) (*models.IdentityProfile, error)
 	BindIdentityAlias(string, models.IdentityBindingRequest) (models.IdentityAlias, error)
 	RevokeIdentityAlias(string, int64) error
-	ConfirmIdentityCandidate(int64) (*models.Device, error)
-	RejectIdentityCandidate(int64) error
+	ListIdentityCandidates(string, int, string) (models.IdentityCandidateListResponse, error)
+	GetIdentityCandidate(int64) (*models.IdentityCandidateDetail, error)
+	ConfirmIdentityCandidate(int64, models.IdentityCandidateDecisionRequest) (*models.Device, error)
+	RejectIdentityCandidate(int64, models.IdentityCandidateDecisionRequest) (*models.IdentityCandidateDetail, error)
+	ReopenIdentityCandidate(int64, models.IdentityCandidateDecisionRequest) (*models.IdentityCandidateDetail, error)
 	SplitIdentity(string, models.IdentitySplitRequest) (*models.Device, error)
 }
 
@@ -66,8 +70,11 @@ func (h *Handlers) RegisterRoutes(mux *http.ServeMux, authToken string) {
 	handler.HandleFunc("GET /api/v1/devices/{pdid}/identity", h.GetIdentity)
 	handler.HandleFunc("POST /api/v1/devices/{pdid}/identity/bindings", h.BindIdentity)
 	handler.HandleFunc("DELETE /api/v1/devices/{pdid}/identity/bindings/{aliasID}", h.RevokeIdentity)
+	handler.HandleFunc("GET /api/v1/identity/candidates", h.ListIdentityCandidates)
+	handler.HandleFunc("GET /api/v1/identity/candidates/{candidateID}", h.GetIdentityCandidate)
 	handler.HandleFunc("POST /api/v1/identity/candidates/{candidateID}/confirm", h.ConfirmIdentityCandidate)
 	handler.HandleFunc("POST /api/v1/identity/candidates/{candidateID}/reject", h.RejectIdentityCandidate)
+	handler.HandleFunc("POST /api/v1/identity/candidates/{candidateID}/reopen", h.ReopenIdentityCandidate)
 	handler.HandleFunc("POST /api/v1/devices/{pdid}/identity/split", h.SplitIdentity)
 
 	// Wrap the internal handler with the Auth middleware
@@ -167,7 +174,7 @@ func (h *Handlers) BindIdentity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req models.IdentityBindingRequest
-	if err := decodeIdentityJSON(r, &req); err != nil {
+	if err := decodeIdentityJSON(w, r, &req, false); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
 		return
 	}
@@ -193,20 +200,86 @@ func (h *Handlers) ConfirmIdentityCandidate(w http.ResponseWriter, r *http.Reque
 		http.Error(w, `{"error":"candidate not found"}`, http.StatusNotFound)
 		return
 	}
-	device, err := h.identity.ConfirmIdentityCandidate(id)
-	writeIdentityResult(w, device, err, http.StatusOK)
+	var req models.IdentityCandidateDecisionRequest
+	if err := decodeIdentityJSON(w, r, &req, true); err != nil || len(req.DecisionNote) > 1024 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "invalid candidate decision request", false)
+		return
+	}
+	device, err := h.identity.ConfirmIdentityCandidate(id, req)
+	writeCandidateResult(w, device, err, http.StatusOK)
 }
 
 func (h *Handlers) RejectIdentityCandidate(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("candidateID"), 10, 64)
-	if err == nil && h.identity != nil {
-		err = h.identity.RejectIdentityCandidate(id)
-	}
 	if err != nil || h.identity == nil {
-		http.Error(w, `{"error":"candidate not found"}`, http.StatusNotFound)
+		writeAPIError(w, http.StatusNotFound, "candidate_not_found", "candidate not found", false)
+		return
+	}
+	var req models.IdentityCandidateDecisionRequest
+	if err := decodeIdentityJSON(w, r, &req, true); err != nil || len(req.DecisionNote) > 1024 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "invalid candidate decision request", false)
+		return
+	}
+	_, err = h.identity.RejectIdentityCandidate(id, req)
+	if err != nil {
+		writeCandidateResult(w, nil, err, http.StatusOK)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) ListIdentityCandidates(w http.ResponseWriter, r *http.Request) {
+	if h.identity == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "identity_unavailable", "identity persistence unavailable", true)
+		return
+	}
+	for key := range r.URL.Query() {
+		if key != "status" && key != "limit" && key != "cursor" {
+			writeAPIError(w, http.StatusBadRequest, "invalid_query", "unsupported candidate query parameter", false)
+			return
+		}
+	}
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	if status != "" && status != "pending" && status != "rejected" && status != "confirmed" {
+		writeAPIError(w, http.StatusBadRequest, "invalid_status", "status must be pending, rejected, or confirmed", false)
+		return
+	}
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 100 {
+			writeAPIError(w, http.StatusBadRequest, "invalid_limit", "limit must be between 1 and 100", false)
+			return
+		}
+		limit = parsed
+	}
+	response, err := h.identity.ListIdentityCandidates(status, limit, r.URL.Query().Get("cursor"))
+	writeCandidateResult(w, response, err, http.StatusOK)
+}
+
+func (h *Handlers) GetIdentityCandidate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("candidateID"), 10, 64)
+	if err != nil || id < 1 || h.identity == nil {
+		writeAPIError(w, http.StatusNotFound, "candidate_not_found", "candidate not found", false)
+		return
+	}
+	candidate, err := h.identity.GetIdentityCandidate(id)
+	writeCandidateResult(w, candidate, err, http.StatusOK)
+}
+
+func (h *Handlers) ReopenIdentityCandidate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("candidateID"), 10, 64)
+	if err != nil || id < 1 || h.identity == nil {
+		writeAPIError(w, http.StatusNotFound, "candidate_not_found", "candidate not found", false)
+		return
+	}
+	var req models.IdentityCandidateDecisionRequest
+	if err := decodeIdentityJSON(w, r, &req, true); err != nil || len(req.DecisionNote) > 1024 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "invalid candidate decision request", false)
+		return
+	}
+	candidate, err := h.identity.ReopenIdentityCandidate(id, req)
+	writeCandidateResult(w, candidate, err, http.StatusOK)
 }
 
 func (h *Handlers) SplitIdentity(w http.ResponseWriter, r *http.Request) {
@@ -215,7 +288,7 @@ func (h *Handlers) SplitIdentity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req models.IdentitySplitRequest
-	if err := decodeIdentityJSON(r, &req); err != nil {
+	if err := decodeIdentityJSON(w, r, &req, false); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
 		return
 	}
@@ -223,10 +296,44 @@ func (h *Handlers) SplitIdentity(w http.ResponseWriter, r *http.Request) {
 	writeIdentityResult(w, device, err, http.StatusCreated)
 }
 
-func decodeIdentityJSON(r *http.Request, value interface{}) error {
-	decoder := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+func decodeIdentityJSON(w http.ResponseWriter, r *http.Request, value interface{}, optional bool) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(value)
+	if err := decoder.Decode(value); err != nil {
+		if optional && errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("request must contain one JSON object")
+	}
+	return nil
+}
+
+func writeCandidateResult(w http.ResponseWriter, value interface{}, err error, status int) {
+	if errors.Is(err, models.ErrCandidateNotFound) {
+		writeAPIError(w, http.StatusNotFound, "candidate_not_found", "candidate not found", false)
+		return
+	}
+	if errors.Is(err, models.ErrCandidateStaleOrConflicting) {
+		writeAPIError(w, http.StatusConflict, "candidate_stale_or_conflicting", "candidate changed, was decided, disappeared, or is simultaneously present", false)
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error(), false)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeAPIError(w http.ResponseWriter, status int, code, details string, retryable bool) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(api.ErrorResponse{Error: code, Code: code, Details: details, Retryable: retryable})
 }
 
 func writeIdentityResult(w http.ResponseWriter, value interface{}, err error, status int) {
