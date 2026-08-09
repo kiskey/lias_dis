@@ -499,7 +499,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 			e.scheduleDeferredOnline(d.PDID, 30*time.Second)
 		}
 		if e.orch != nil {
-			go e.orch.TriggerEnrichment(d.PDID, false)
+			e.orch.TriggerEnrichment(d.PDID, false)
 		}
         return
     }

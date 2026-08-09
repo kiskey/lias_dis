@@ -132,7 +132,7 @@ func (h *Handlers) RefreshDevice(w http.ResponseWriter, r *http.Request) {
     }
 
     if h.orch != nil {
-        go h.orch.TriggerEnrichment(pdid, true)
+		h.orch.TriggerEnrichment(pdid, true)
     }
 
     w.Header().Set("Content-Type", "application/json")

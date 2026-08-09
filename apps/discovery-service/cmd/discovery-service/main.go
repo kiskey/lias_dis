@@ -126,34 +126,58 @@ func main() {
     }
 	}
     if cfg.Discovery.Enrichment.SSDPEnabled {
-        ssdpEnricher = discovery.NewSSDPEnricher(cfg.Discovery.Interface)
-        _ = ssdpEnricher.Start(ctx)
-        primaries = append(primaries, ssdpEnricher)
-        defer ssdpEnricher.Stop()
+		e := discovery.NewSSDPEnricher(cfg.Discovery.Interface)
+		if err := e.Start(ctx); err != nil {
+			slog.Warn("SSDP enrichment disabled", "error", err)
+		} else {
+			ssdpEnricher = e
+			primaries = append(primaries, e)
+			defer e.Stop()
+		}
     }
     if cfg.Discovery.Enrichment.NetbiosEnabled {
         e := discovery.NewNetBIOSEnricher()
-        _ = e.Start(ctx)
+		if err := e.Start(ctx); err != nil {
+			slog.Warn("NetBIOS enrichment disabled", "error", err)
+		} else {
         primaries = append(primaries, e)
         defer e.Stop()
     }
+	}
     if cfg.Discovery.Enrichment.TLSEnabled {
-        e := discovery.NewTLSFingerprinter()
-        _ = e.Start(ctx)
+		e := discovery.NewTLSMetadataEnricher()
+		if err := e.Start(ctx); err != nil {
+			slog.Warn("TLS metadata enrichment disabled", "error", err)
+		} else {
         primaries = append(primaries, e)
         defer e.Stop()
     }
+	}
 
     var fallback discovery.Enricher
     if cfg.Discovery.Enrichment.NmapEnabled {
-        e := discovery.NewNmapEnricher()
-        _ = e.Start(ctx)
+		e := discovery.NewNmapEnricher(discovery.NmapOptions{
+			HostTimeout:       cfg.Discovery.Enrichment.NmapHostTimeout,
+			ProcessTimeout:    cfg.Discovery.Enrichment.NmapProcessTimeout,
+			MaxRate:           cfg.Discovery.Enrichment.NmapMaxRate,
+			MaxOutputBytes:    cfg.Discovery.Enrichment.NmapMaxOutputBytes,
+			EnableOSDetection: cfg.Discovery.Enrichment.NmapOSDetection,
+		})
+		if err := e.Start(ctx); err != nil {
+			slog.Warn("Nmap enrichment disabled", "error", err)
+		} else {
         fallback = e
         defer e.Stop()
     }
+	}
 
-    // P3-FIX: Pass ValidationInterval to Orchestrator
-    orch := discovery.NewOrchestrator(cache, broker, primaries, fallback, cfg.Discovery.Enrichment.ValidationInterval)
+	orch := discovery.NewOrchestratorWithOptions(cache, broker, primaries, fallback, cfg.Discovery.Enrichment.ValidationInterval, discovery.OrchestratorOptions{
+		WorkerCount:     cfg.Discovery.Enrichment.WorkerCount,
+		QueueSize:       cfg.Discovery.Enrichment.QueueSize,
+		PrimaryTimeout:  cfg.Discovery.Enrichment.PrimaryTimeout,
+		FallbackTimeout: cfg.Discovery.Enrichment.FallbackTimeout,
+	})
+	defer orch.Stop()
     eng.SetOrchestrator(orch)
     
     orch.SetDeviceManager(eng)

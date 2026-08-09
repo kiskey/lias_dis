@@ -6,6 +6,8 @@ package discovery
 
 import (
     "context"
+	"fmt"
+	"sync/atomic"
     "testing"
     "time"
 
@@ -17,16 +19,57 @@ import (
 // mockEnricher is a test double for the Enricher interface used to count nmap invocations.
 type mockEnricher struct {
     name        string
-    invocations int
+	invocations atomic.Int32
     enrichFunc  func(ctx context.Context, d *models.Device) (*models.Enrichment, error)
+}
+
+type concurrencyEnricher struct {
+	active  atomic.Int32
+	maximum atomic.Int32
+	release <-chan struct{}
+}
+
+func (e *concurrencyEnricher) Name() string                { return "bounded" }
+func (e *concurrencyEnricher) Start(context.Context) error { return nil }
+func (e *concurrencyEnricher) Stop() error                 { return nil }
+func (e *concurrencyEnricher) Enrich(ctx context.Context, _ *models.Device) (*models.Enrichment, error) {
+	active := e.active.Add(1)
+	defer e.active.Add(-1)
+	for {
+		maximum := e.maximum.Load()
+		if active <= maximum || e.maximum.CompareAndSwap(maximum, active) {
+			break
+		}
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-e.release:
+		return nil, nil
+	}
 }
 
 func (m *mockEnricher) Name() string { return m.name }
 func (m *mockEnricher) Start(ctx context.Context) error { return nil }
 func (m *mockEnricher) Stop() error { return nil }
 func (m *mockEnricher) Enrich(ctx context.Context, d *models.Device) (*models.Enrichment, error) {
-    m.invocations++
+	m.invocations.Add(1)
     return m.enrichFunc(ctx, d)
+}
+
+func waitForOrchestratorIdle(t *testing.T, orch *Orchestrator) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		orch.pendingMu.Lock()
+		pending := len(orch.pending)
+		orch.pendingMu.Unlock()
+		if pending == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("orchestrator did not become idle")
 }
 
 // TestNmapMaxRetries verifies that an incomplete device does NOT trigger nmap more than 3 times.
@@ -45,6 +88,7 @@ func TestNmapMaxRetries(t *testing.T) {
     }
 
     orch := NewOrchestrator(cache, broker, nil, fallback, 0)
+	defer orch.Stop()
     
     dev := &models.Device{
         PDID:       "pdid_test_max_retries",
@@ -68,10 +112,11 @@ func TestNmapMaxRetries(t *testing.T) {
         }
 
         orch.TriggerEnrichment(dev.PDID, false)
+		waitForOrchestratorIdle(t, orch)
     }
 
-    if fallback.invocations != 3 {
-        t.Fatalf("Expected nmap to be invoked exactly 3 times, got %d", fallback.invocations)
+	if got := fallback.invocations.Load(); got != 3 {
+		t.Fatalf("Expected nmap to be invoked exactly 3 times, got %d", got)
     }
 }
 
@@ -90,6 +135,7 @@ func TestNmapSkippedForFullyIdentified(t *testing.T) {
     }
 
     orch := NewOrchestrator(cache, broker, nil, fallback, 0)
+	defer orch.Stop()
     
     dev := &models.Device{
         PDID:               "pdid_test_fully_identified",
@@ -103,9 +149,10 @@ func TestNmapSkippedForFullyIdentified(t *testing.T) {
 
     // Force trigger to bypass time-based cooldowns and test ONLY the fully identified logic
     orch.TriggerEnrichment(dev.PDID, true)
+	waitForOrchestratorIdle(t, orch)
 
-    if fallback.invocations != 0 {
-        t.Fatalf("Expected nmap to NOT be invoked for fully identified device, got %d invocations", fallback.invocations)
+	if got := fallback.invocations.Load(); got != 0 {
+		t.Fatalf("Expected nmap to NOT be invoked for fully identified device, got %d invocations", got)
     }
 }
 
@@ -124,6 +171,7 @@ func TestForceBypassesCooldowns(t *testing.T) {
     }
 
     orch := NewOrchestrator(cache, broker, nil, fallback, 0)
+	defer orch.Stop()
     
     dev := &models.Device{
         PDID:             "pdid_test_force_bypass",
@@ -136,13 +184,52 @@ func TestForceBypassesCooldowns(t *testing.T) {
     // 1. Normal trigger should be blocked by 24h cooldown and max retries
     orch.lastAttemptMap.Store(dev.PDID, time.Now().Add(-2*time.Hour)) // Bypass 1h cooldown
     orch.TriggerEnrichment(dev.PDID, false)
-    if fallback.invocations != 0 {
-        t.Fatalf("Expected 0 invocations without force, got %d", fallback.invocations)
+	waitForOrchestratorIdle(t, orch)
+	if got := fallback.invocations.Load(); got != 0 {
+		t.Fatalf("Expected 0 invocations without force, got %d", got)
     }
 
     // 2. Force trigger should bypass cooldowns AND retry limits (e.g., manual UI refresh)
     orch.TriggerEnrichment(dev.PDID, true)
-    if fallback.invocations != 1 {
-        t.Fatalf("Expected 1 invocation with force=true, got %d", fallback.invocations)
+	waitForOrchestratorIdle(t, orch)
+	if got := fallback.invocations.Load(); got != 1 {
+		t.Fatalf("Expected 1 invocation with force=true, got %d", got)
+	}
     }
+
+func TestOrchestratorBoundsWorkersQueueAndCoalesces(t *testing.T) {
+	cache := inventory.NewCache()
+	defer cache.Stop()
+	broker := disAPI.NewBroker(cache)
+	release := make(chan struct{})
+	enricher := &concurrencyEnricher{release: release}
+	orch := NewOrchestratorWithOptions(cache, broker, []Enricher{enricher}, nil, 0, OrchestratorOptions{
+		WorkerCount:    2,
+		QueueSize:      2,
+		PrimaryTimeout: time.Second,
+	})
+	defer orch.Stop()
+
+	for i := 0; i < 10; i++ {
+		pdid := fmt.Sprintf("pdid-bounded-%d", i)
+		cache.Upsert(&models.Device{PDID: pdid, CurrentIP: fmt.Sprintf("192.168.1.%d", i+10)})
+		orch.TriggerEnrichment(pdid, true)
+		orch.TriggerEnrichment(pdid, true)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && enricher.active.Load() < 2 {
+		time.Sleep(time.Millisecond)
+	}
+	if got := enricher.maximum.Load(); got > 2 {
+		t.Fatalf("worker bound exceeded: %d", got)
+	}
+	orch.pendingMu.Lock()
+	pending := len(orch.pending)
+	orch.pendingMu.Unlock()
+	if pending > 4 {
+		t.Fatalf("active plus queued work exceeded bound: %d", pending)
+	}
+	close(release)
+	waitForOrchestratorIdle(t, orch)
 }
