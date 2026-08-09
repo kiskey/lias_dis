@@ -41,13 +41,16 @@ jobs:
           CGO_ENABLED: 1
         run: |
           go test -race -count=1 \
+            ./shared/api \
+            ./shared/models \
             ./apps/discovery-service/internal/api \
             ./apps/discovery-service/internal/config \
             ./apps/discovery-service/internal/correlation \
             ./apps/discovery-service/internal/discovery \
             ./apps/discovery-service/internal/identity \
             ./apps/discovery-service/internal/inventory \
-            ./apps/discovery-service/internal/storage
+            ./apps/discovery-service/internal/storage \
+            ./apps/lias/internal/sync
 
       - name: Run Parser Fuzz Smoke
         env:

@@ -180,7 +180,7 @@ func (e *Engine) ConfirmIdentityCandidate(id int64) (*models.Device, error) {
 	e.cache.Delete(source.PDID)
 	e.cache.Upsert(merged)
 	e.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, merged.PDID, models.DeviceReidentifiedPayload{
-		OldPDID: source.PDID, NewPDID: merged.PDID, Reason: "manual_candidate_confirmation",
+		PDID: merged.PDID, OldPDID: source.PDID, NewPDID: merged.PDID, Reason: "manual_candidate_confirmation",
 		MigratedMACs: source.MACs, Timestamp: time.Now(),
 	}))
 	return merged, nil

@@ -6,420 +6,465 @@
 package sync
 
 import (
-    "bufio"
-    "context"
-    "encoding/json"
-    "fmt"
-    "log/slog"
-    "net/http"
-    "net/url"
-    "strings"
-    "time"
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
 
-    "github.com/user/lias-dis/apps/lias/internal/config"
-    "github.com/user/lias-dis/shared/api"
-    "github.com/user/lias-dis/shared/models"
+	"github.com/user/lias-dis/apps/lias/internal/config"
+	"github.com/user/lias-dis/shared/api"
+	"github.com/user/lias-dis/shared/models"
 )
 
+const maxSSEEventBytes = 1 << 20
+
 type EventBroadcaster interface {
-    Broadcast(event models.Event)
-    // CPU-05 Fix: Added method to signal backoff reset
-    SignalSSEConnected() 
+	Broadcast(event models.Event)
+	// CPU-05 Fix: Added method to signal backoff reset
+	SignalSSEConnected()
 }
 
 type StorageMigrator interface {
-    MigrateDeviceTag(oldPDID, newPDID string) error
-    MigrateDevicePolicies(oldPDID, newPDID string) error
+	MigrateDeviceTag(oldPDID, newPDID string) error
+	MigrateDevicePolicies(oldPDID, newPDID string) error
 }
 
 type DISClient struct {
-    cfg           config.DISConfig
-    cache         *Cache
-    store         StorageMigrator
-    client        *http.Client
-    trigger       chan struct{}
-    broker        EventBroadcaster
-    lastSeenInDIS map[string]time.Time
+	cfg           config.DISConfig
+	cache         *Cache
+	store         StorageMigrator
+	client        *http.Client
+	trigger       chan struct{}
+	broker        EventBroadcaster
+	lastSeenInDIS map[string]time.Time
 }
 
 func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, broker EventBroadcaster, store StorageMigrator) *DISClient {
-    return &DISClient{
-        cfg:           cfg,
-        cache:         cache,
-        store:         store,
-        client:        &http.Client{Timeout: 10 * time.Second},
-        trigger:       trigger,
-        broker:        broker,
-        lastSeenInDIS: make(map[string]time.Time),
-    }
+	return &DISClient{
+		cfg:           cfg,
+		cache:         cache,
+		store:         store,
+		client:        &http.Client{Timeout: 10 * time.Second},
+		trigger:       trigger,
+		broker:        broker,
+		lastSeenInDIS: make(map[string]time.Time),
+	}
 }
 
 func (c *DISClient) Run(ctx context.Context) {
-    c.pollDevices()
-    c.tryTrigger()
+	c.pollDevices()
+	c.tryTrigger()
 
-    go c.pollerLoop(ctx)
-    go c.sseLoop(ctx)
+	go c.pollerLoop(ctx)
+	go c.sseLoop(ctx)
 }
 
 func (c *DISClient) tryTrigger() {
-    select {
-    case c.trigger <- struct{}{}:
-    default:
-    }
+	select {
+	case c.trigger <- struct{}{}:
+	default:
+	}
 }
 
 func (c *DISClient) pollerLoop(ctx context.Context) {
-    interval := c.cfg.SyncInterval
-    if interval <= 0 {
-        interval = 30 * time.Second
-    }
+	interval := c.cfg.SyncInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
 
-    ticker := time.NewTicker(interval)
-    defer ticker.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case <-ticker.C:
-            c.pollDevices()
-            c.tryTrigger()
-        }
-    }
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.pollDevices()
+			c.tryTrigger()
+		}
+	}
 }
 
 func (c *DISClient) getEndpointURL(path string) string {
-    rawURL := strings.TrimSpace(c.cfg.URL)
-    if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
-        rawURL = "http://" + rawURL
-    }
+	rawURL := strings.TrimSpace(c.cfg.URL)
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		rawURL = "http://" + rawURL
+	}
 
-    u, err := url.Parse(rawURL)
-    if err != nil {
-        return strings.TrimRight(c.cfg.URL, "/") + path
-    }
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return strings.TrimRight(c.cfg.URL, "/") + path
+	}
 
-    if u.Port() == "" {
-        u.Host = u.Host + ":8080"
-    }
+	if u.Port() == "" {
+		u.Host = u.Host + ":8080"
+	}
 
-    u.Path = strings.TrimRight(u.Path, "/") + path
-    return u.String()
+	u.Path = strings.TrimRight(u.Path, "/") + path
+	return u.String()
 }
 
 func (c *DISClient) pollDevices() {
-    targetURL := c.getEndpointURL("/api/v1/devices")
-    req, err := http.NewRequest("GET", targetURL, nil)
-    if err != nil {
-        slog.Error("Failed to create DIS request", "url", targetURL, "error", err)
-        return
-    }
-    if c.cfg.AuthToken != "" {
-        req.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
-    }
+	targetURL := c.getEndpointURL("/api/v1/devices")
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		slog.Error("Failed to create DIS request", "url", targetURL, "error", err)
+		return
+	}
+	if c.cfg.AuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
+	}
 
-    resp, err := c.client.Do(req)
-    if err != nil {
-        slog.Error("Failed to poll DIS devices", "url", targetURL, "error", err)
-        return
-    }
-    defer resp.Body.Close()
+	resp, err := c.client.Do(req)
+	if err != nil {
+		slog.Error("Failed to poll DIS devices", "url", targetURL, "error", err)
+		return
+	}
+	defer resp.Body.Close()
 
-    if resp.StatusCode != http.StatusOK {
-        slog.Error("DIS poll returned non-200 status", "status", resp.StatusCode)
-        return
-    }
+	if resp.StatusCode != http.StatusOK {
+		slog.Error("DIS poll returned non-200 status", "status", resp.StatusCode)
+		return
+	}
 
-    var listResp api.DeviceListResponse
-    if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
-        slog.Error("Failed to decode DIS device list", "error", err)
-        return
-    }
+	var listResp api.DeviceListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+		slog.Error("Failed to decode DIS device list", "error", err)
+		return
+	}
 
-    activePDIDs := make(map[string]bool)
-    for _, d := range listResp.Devices {
-        activePDIDs[d.PDID] = true
-        c.lastSeenInDIS[d.PDID] = time.Now()
-    }
+	activePDIDs := make(map[string]bool)
+	for _, d := range listResp.Devices {
+		activePDIDs[d.PDID] = true
+		c.lastSeenInDIS[d.PDID] = time.Now()
+	}
 
-    cachedPDIDs := c.cache.ListPDIDs()
-    for _, pdid := range cachedPDIDs {
-        if !activePDIDs[pdid] {
-            if lastSeen, ok := c.lastSeenInDIS[pdid]; ok {
-                if time.Since(lastSeen) < 5*time.Minute {
-                    slog.Debug("Device in grace period, keeping in cache", "pdid", pdid)
-                    continue
-                }
-            }
-            c.cache.RemoveDevice(pdid)
-            delete(c.lastSeenInDIS, pdid)
-            slog.Info("Removed stale device from LIAS cache (grace period expired)", "pdid", pdid)
-        }
-    }
+	cachedPDIDs := c.cache.ListPDIDs()
+	for _, pdid := range cachedPDIDs {
+		if !activePDIDs[pdid] {
+			if lastSeen, ok := c.lastSeenInDIS[pdid]; ok {
+				if time.Since(lastSeen) < 5*time.Minute {
+					slog.Debug("Device in grace period, keeping in cache", "pdid", pdid)
+					continue
+				}
+			}
+			c.cache.RemoveDevice(pdid)
+			delete(c.lastSeenInDIS, pdid)
+			slog.Info("Removed stale device from LIAS cache (grace period expired)", "pdid", pdid)
+		}
+	}
 
-    for _, d := range listResp.Devices {
-        prev := c.cache.Get(d.PDID)
-        isNewDevice := prev == nil
+	for _, d := range listResp.Devices {
+		prev := c.cache.Get(d.PDID)
+		isNewDevice := prev == nil
 
-        c.cache.UpsertDevice(d)
+		c.cache.UpsertDevice(d)
 
-        if isNewDevice {
-            slog.Info("Completely new device discovered in LIAS", "pdid", d.PDID, "name", d.DisplayName())
-            if c.broker != nil {
-                c.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
-            }
-        } else if c.broker != nil && prev.Online != d.Online {
-            evtType := models.EventDeviceOnline
-            if !d.Online {
-                evtType = models.EventDeviceOffline
-            }
-            c.broker.Broadcast(models.NewEvent(evtType, d.PDID, models.DeviceEventPayload{
-                PDID:      d.PDID,
-                MAC:       d.CurrentMAC,
-                IP:        d.CurrentIP,
-                Timestamp: time.Now(),
-            }))
-        }
-    }
-    slog.Info("Synced device inventory from DIS", "count", len(listResp.Devices))
+		if isNewDevice {
+			slog.Info("Completely new device discovered in LIAS", "pdid", d.PDID, "name", d.DisplayName())
+			if c.broker != nil {
+				c.broker.Broadcast(models.NewEvent(models.EventDeviceAdded, d.PDID, d))
+			}
+		} else if c.broker != nil && prev.Online != d.Online {
+			evtType := models.EventDeviceOnline
+			if !d.Online {
+				evtType = models.EventDeviceOffline
+			}
+			c.broker.Broadcast(models.NewEvent(evtType, d.PDID, models.DeviceEventPayload{
+				PDID:      d.PDID,
+				MAC:       d.CurrentMAC,
+				IP:        d.CurrentIP,
+				Timestamp: time.Now(),
+			}))
+		}
+	}
+	slog.Info("Synced device inventory from DIS", "count", len(listResp.Devices))
 }
 
 func (c *DISClient) sseLoop(ctx context.Context) {
-    backoff := 1 * time.Second
-    maxBackoff := 30 * time.Second
+	backoff := 1 * time.Second
+	maxBackoff := 30 * time.Second
 
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        default:
-        }
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 
-        err := c.consumeSSE(ctx)
-        if err == nil {
-            return
-        }
+		err := c.consumeSSE(ctx)
+		if err == nil {
+			return
+		}
 
-        slog.Warn("DIS SSE stream disconnected, reconnecting", "error", err, "backoff", backoff)
-        select {
-        case <-ctx.Done():
-            return
-        case <-time.After(backoff):
-            backoff *= 2
-            if backoff > maxBackoff {
-                backoff = maxBackoff
-            }
-        }
-    }
+		slog.Warn("DIS SSE stream disconnected, reconnecting", "error", err, "backoff", backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
 }
 
 func (c *DISClient) consumeSSE(ctx context.Context) error {
-    targetURL := c.getEndpointURL("/api/v1/events")
-    req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
-    if err != nil {
-        return err
-    }
-    if c.cfg.AuthToken != "" {
-        req.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
-    }
-    req.Header.Set("Accept", "text/event-stream")
+	targetURL := c.getEndpointURL("/api/v1/events")
+	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+	if err != nil {
+		return err
+	}
+	if c.cfg.AuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
+	}
+	req.Header.Set("Accept", "text/event-stream")
 
-    sseClient := &http.Client{Timeout: 0}
-    resp, err := sseClient.Do(req)
-    if err != nil {
-        return err
-    }
-    defer resp.Body.Close()
+	sseClient := &http.Client{Timeout: 0}
+	resp, err := sseClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
 
-    if resp.StatusCode != http.StatusOK {
-        return fmt.Errorf("SSE stream endpoint returned status: %d", resp.StatusCode)
-    }
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("SSE stream endpoint returned status: %d", resp.StatusCode)
+	}
 
-    slog.Info("Successfully connected to DIS SSE event stream", "url", targetURL)
+	slog.Info("Successfully connected to DIS SSE event stream", "url", targetURL)
 
-    // CPU-05 Fix: Signal successful connection to reset backoff
-    if c.broker != nil {
-        c.broker.SignalSSEConnected()
-    }
+	// CPU-05 Fix: Signal successful connection to reset backoff
+	if c.broker != nil {
+		c.broker.SignalSSEConnected()
+	}
 
-    scanner := bufio.NewScanner(resp.Body)
-    var event models.Event
-    var dataBuf strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 4<<10), maxSSEEventBytes)
+	var event models.Event
+	var dataBuf strings.Builder
 
-    for scanner.Scan() {
-        line := scanner.Text()
+	for scanner.Scan() {
+		line := scanner.Text()
 
-        if line == "" {
-            if dataBuf.Len() > 0 {
-                event.Payload = json.RawMessage(dataBuf.String())
+		if line == "" {
+			if dataBuf.Len() > 0 {
+				event.Payload = json.RawMessage(dataBuf.String())
+				event.SetTargetPDID(resolveEventPDID(event.Type, event.Payload))
 
-                if event.DeviceID == "" {
-                    var payloadMeta struct {
-                        PDID     string `json:"pdid"`
-                        DeviceID string `json:"device_id"`
-                    }
-                    if err := json.Unmarshal(event.Payload, &payloadMeta); err == nil {
-                        if payloadMeta.PDID != "" {
-                            event.DeviceID = payloadMeta.PDID
-                        } else if payloadMeta.DeviceID != "" {
-                            event.DeviceID = payloadMeta.DeviceID
-                        }
-                    }
-                }
+				c.handleEvent(event)
 
-                c.handleEvent(event)
+				event = models.Event{}
+				dataBuf.Reset()
+			}
+			continue
+		}
 
-                event = models.Event{}
-                dataBuf.Reset()
-            }
-            continue
-        }
+		if strings.HasPrefix(line, "event: ") {
+			event.Type = models.EventType(strings.TrimPrefix(line, "event: "))
+		} else if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+			separatorBytes := 0
+			if dataBuf.Len() > 0 {
+				separatorBytes = 1
+			}
+			if dataBuf.Len()+separatorBytes+len(data) > maxSSEEventBytes {
+				return fmt.Errorf("SSE event exceeds %d-byte limit", maxSSEEventBytes)
+			}
+			if separatorBytes != 0 {
+				dataBuf.WriteByte('\n')
+			}
+			dataBuf.WriteString(data)
+		}
+	}
 
-        if strings.HasPrefix(line, "event: ") {
-            event.Type = models.EventType(strings.TrimPrefix(line, "event: "))
-        } else if strings.HasPrefix(line, "data: ") {
-            dataBuf.WriteString(strings.TrimPrefix(line, "data: "))
-        }
-    }
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("SSE stream connection closed by server")
+}
 
-    if err := scanner.Err(); err != nil {
-        return err
-    }
-    return fmt.Errorf("SSE stream connection closed by server")
+func resolveEventPDID(eventType models.EventType, payload json.RawMessage) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var metadata struct {
+		PDID     string `json:"pdid"`
+		DeviceID string `json:"device_id"`
+		NewPDID  string `json:"new_pdid"`
+	}
+	if err := json.Unmarshal(payload, &metadata); err != nil {
+		return ""
+	}
+	if metadata.PDID != "" {
+		return metadata.PDID
+	}
+	if eventType == models.EventDeviceReidentified && metadata.NewPDID != "" {
+		return metadata.NewPDID
+	}
+	return metadata.DeviceID
 }
 
 func (c *DISClient) handleEvent(e models.Event) {
-    if e.DeviceID == "" {
-        return
-    }
+	pdid := e.TargetPDID()
+	if pdid != "" {
+		e.SetTargetPDID(pdid)
+	}
 
-    slog.Debug("Received real-time event from DIS", "type", e.Type, "device_id", e.DeviceID)
+	slog.Debug("Received real-time event from DIS", "type", e.Type, "pdid", pdid)
 
-    switch e.Type {
-    case models.EventDeviceRemoved:
-        c.cache.RemoveDevice(e.DeviceID)
-        delete(c.lastSeenInDIS, e.DeviceID)
-        slog.Info("Device removed from local cache via SSE", "pdid", e.DeviceID)
-        c.tryTrigger()
-        if c.broker != nil {
-            c.broker.Broadcast(e)
-        }
+	switch e.Type {
+	case models.EventDeviceRemoved:
+		if pdid == "" {
+			slog.Warn("Ignoring device removal event without PDID")
+			return
+		}
+		c.cache.RemoveDevice(pdid)
+		delete(c.lastSeenInDIS, pdid)
+		slog.Info("Device removed from local cache via SSE", "pdid", pdid)
+		c.tryTrigger()
+		if c.broker != nil {
+			c.broker.Broadcast(e)
+		}
 
-    case models.EventDeviceReidentified:
-        var payload models.DeviceReidentifiedPayload
-        if len(e.Payload) > 0 {
-            json.Unmarshal(e.Payload, &payload)
-        }
+	case models.EventDeviceReidentified:
+		var payload models.DeviceReidentifiedPayload
+		if len(e.Payload) > 0 {
+			json.Unmarshal(e.Payload, &payload)
+		}
 
-        if payload.OldPDID != "" && payload.NewPDID != "" {
-            c.cache.MigrateDeviceIdentity(payload.OldPDID, payload.NewPDID, payload.MigratedMACs)
+		if payload.OldPDID != "" && payload.NewPDID != "" {
+			e.SetTargetPDID(payload.NewPDID)
+			c.cache.MigrateDeviceIdentity(payload.OldPDID, payload.NewPDID, payload.MigratedMACs)
 
-            if c.store != nil {
-                _ = c.store.MigrateDeviceTag(payload.OldPDID, payload.NewPDID)
-                if err := c.store.MigrateDevicePolicies(payload.OldPDID, payload.NewPDID); err != nil {
-                    slog.Error("Failed to migrate device policies during reidentification", "old_pdid", payload.OldPDID, "new_pdid", payload.NewPDID, "error", err)
-                }
-            }
+			if c.store != nil {
+				_ = c.store.MigrateDeviceTag(payload.OldPDID, payload.NewPDID)
+				if err := c.store.MigrateDevicePolicies(payload.OldPDID, payload.NewPDID); err != nil {
+					slog.Error("Failed to migrate device policies during reidentification", "old_pdid", payload.OldPDID, "new_pdid", payload.NewPDID, "error", err)
+				}
+			}
 
-            if c.fetchSingleDevice(payload.NewPDID) {
-                c.tryTrigger()
-            }
+			if c.fetchSingleDevice(payload.NewPDID) {
+				c.tryTrigger()
+			}
 
-            slog.Info("Device reidentified, migrated identity and policies",
-                "old_pdid", payload.OldPDID,
-                "new_pdid", payload.NewPDID,
-                "reason", payload.Reason)
+			slog.Info("Device reidentified, migrated identity and policies",
+				"old_pdid", payload.OldPDID,
+				"new_pdid", payload.NewPDID,
+				"reason", payload.Reason)
 
-            if c.broker != nil {
-                c.broker.Broadcast(e)
-            }
-        }
+			if c.broker != nil {
+				c.broker.Broadcast(e)
+			}
+		}
 
-    // P1-FIX: Handle events that carry the FULL Device struct inline.
-    case models.EventDeviceAdded, models.EventFingerprintUpdated:
-        go func(pdid string, evt models.Event) {
-            prev := c.cache.Get(pdid)
-            isNewDevice := prev == nil || evt.Type == models.EventDeviceAdded
+	// P1-FIX: Handle events that carry the FULL Device struct inline.
+	case models.EventDeviceAdded, models.EventFingerprintUpdated:
+		if pdid == "" {
+			slog.Warn("Ignoring device record event without PDID", "type", e.Type)
+			return
+		}
+		go func(pdid string, evt models.Event) {
+			prev := c.cache.Get(pdid)
+			isNewDevice := prev == nil || evt.Type == models.EventDeviceAdded
 
-            var inlineDev models.Device
-            // FIX: Validate that the unmarshalled struct is actually a full Device 
-            // (must have a MAC) before upserting. This prevents partial payloads 
-            // from corrupting the LIAS cache.
-            if len(evt.Payload) > 0 && json.Unmarshal(evt.Payload, &inlineDev) == nil && inlineDev.PDID == pdid && inlineDev.CurrentMAC != "" {
-                c.cache.UpsertDevice(inlineDev)
-                c.tryTrigger()
-            } else if c.fetchSingleDevice(pdid) {
-                c.tryTrigger()
-            }
+			var inlineDev models.Device
+			// FIX: Validate that the unmarshalled struct is actually a full Device
+			// (must have a MAC) before upserting. This prevents partial payloads
+			// from corrupting the LIAS cache.
+			if len(evt.Payload) > 0 && json.Unmarshal(evt.Payload, &inlineDev) == nil && inlineDev.PDID == pdid && inlineDev.CurrentMAC != "" {
+				c.cache.UpsertDevice(inlineDev)
+				c.tryTrigger()
+			} else if c.fetchSingleDevice(pdid) {
+				c.tryTrigger()
+			}
 
-            if c.broker != nil {
-                if isNewDevice {
-                    evt.Type = models.EventDeviceAdded
-                }
-                c.broker.Broadcast(evt)
-            }
-        }(e.DeviceID, e)
+			if c.broker != nil {
+				if isNewDevice {
+					evt.Type = models.EventDeviceAdded
+				}
+				c.broker.Broadcast(evt)
+			}
+		}(pdid, e)
 
-    // V2.5 FIX: Handle Online/Offline events IMMEDIATELY without waiting for REST fetch
-    case models.EventDeviceOnline, models.EventDeviceOffline:
-        go func(pdid string, evt models.Event) {
-            // 1. Immediately patch local cache for instant UI feedback and firewall sync
-            onlineStatus := evt.Type == models.EventDeviceOnline
-            c.cache.PatchDeviceOnline(pdid, onlineStatus)
-            c.tryTrigger()
-            
-            // 2. Broadcast to frontend immediately
-            if c.broker != nil {
-                c.broker.Broadcast(evt)
-            }
-            
-            // 3. Background fetch to sync any remaining changed fields (IP, MAC, etc.)
-            c.fetchSingleDevice(pdid)
-        }(e.DeviceID, e)
+	// V2.5 FIX: Handle Online/Offline events IMMEDIATELY without waiting for REST fetch
+	case models.EventDeviceOnline, models.EventDeviceOffline:
+		if pdid == "" {
+			slog.Warn("Ignoring presence event without PDID", "type", e.Type)
+			return
+		}
+		go func(pdid string, evt models.Event) {
+			// 1. Immediately patch local cache for instant UI feedback and firewall sync
+			onlineStatus := evt.Type == models.EventDeviceOnline
+			c.cache.PatchDeviceOnline(pdid, onlineStatus)
+			c.tryTrigger()
 
-    // Handle partial payload events that require full struct fetch
-    case models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged:
-        go func(pdid string, evt models.Event) {
-            if c.fetchSingleDevice(pdid) {
-                c.tryTrigger()
-            }
-            if c.broker != nil {
-                c.broker.Broadcast(evt)
-            }
-        }(e.DeviceID, e)
+			// 2. Broadcast to frontend immediately
+			if c.broker != nil {
+				c.broker.Broadcast(evt)
+			}
 
-    default:
-        slog.Debug("Unhandled DIS event type", "type", e.Type, "device_id", e.DeviceID)
-    }
+			// 3. Background fetch to sync any remaining changed fields (IP, MAC, etc.)
+			c.fetchSingleDevice(pdid)
+		}(pdid, e)
+
+	// Handle partial payload events that require full struct fetch
+	case models.EventIPChanged, models.EventMACChanged, models.EventHostnameChanged:
+		if pdid == "" {
+			slog.Warn("Ignoring partial device event without PDID", "type", e.Type)
+			return
+		}
+		go func(pdid string, evt models.Event) {
+			if c.fetchSingleDevice(pdid) {
+				c.tryTrigger()
+			}
+			if c.broker != nil {
+				c.broker.Broadcast(evt)
+			}
+		}(pdid, e)
+
+	default:
+		// Unknown and global events are safe to relay to clients. They never
+		// trigger policy evaluation, cache mutation, storage, or network I/O.
+		if c.broker != nil {
+			c.broker.Broadcast(e)
+		}
+		slog.Debug("Relayed non-enforcement DIS event", "type", e.Type, "pdid", pdid)
+	}
 }
 
 func (c *DISClient) fetchSingleDevice(pdid string) bool {
-    targetURL := c.getEndpointURL("/api/v1/devices/" + pdid)
-    req, err := http.NewRequest("GET", targetURL, nil)
-    if err != nil {
-        return false
-    }
-    if c.cfg.AuthToken != "" {
-        req.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
-    }
+	targetURL := c.getEndpointURL("/api/v1/devices/" + pdid)
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return false
+	}
+	if c.cfg.AuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
+	}
 
-    resp, err := c.client.Do(req)
-    if err != nil {
-        slog.Error("Failed to fetch updated device record from DIS", "pdid", pdid, "error", err)
-        return false
-    }
-    defer resp.Body.Close()
+	resp, err := c.client.Do(req)
+	if err != nil {
+		slog.Error("Failed to fetch updated device record from DIS", "pdid", pdid, "error", err)
+		return false
+	}
+	defer resp.Body.Close()
 
-    if resp.StatusCode != http.StatusOK {
-        return false
-    }
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
 
-    var d models.Device
-    if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-        return false
-    }
+	var d models.Device
+	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		return false
+	}
 
-    c.cache.UpsertDevice(d)
-    return true
+	c.cache.UpsertDevice(d)
+	return true
 }

@@ -72,6 +72,9 @@ negotiated-cipher metadata as automatic PDID merge evidence.
 The parser-fuzz, identity-matrix, event-storm, restart-recovery, benchmark, and
 72-hour soak procedures are documented in
 [`docs/DIS_VALIDATION_AND_RESOURCE_BUDGETS.md`](docs/DIS_VALIDATION_AND_RESOURCE_BUDGETS.md).
+The stable DIS–LIAS v1 wire contract, capability negotiation, and additive
+compatibility rules are documented in
+[`docs/API_COMPATIBILITY.md`](docs/API_COMPATIBILITY.md).
 
 ---
 
