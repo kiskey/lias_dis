@@ -261,25 +261,22 @@ func (e *Engine) isDuplicateObservation(obs discovery.Observation, macStr, ipStr
 
 func canUpdateCurrentIP(source string) bool {
     switch source {
-    case "netlink", "dhcp":
+	case "netlink", "dhcp", "openwrt_neigh":
         return true
     default:
         return false
     }
 }
 
-// V5.4 FIX: Added openwrt_arp as a valid trigger
 func canTriggerOnline(source string) bool {
     switch source {
-    case "netlink", "dhcp", "openwrt_ap", "openwrt_arp":
+	case "netlink", "openwrt_ap", "openwrt_neigh":
         return true
     default:
         return false
     }
 }
 
-// V5.5 FIX: Corrected duplicate case syntax error.
-// openwrt_arp is now in its own case, setting both L2 and L3 flags.
 func hasL2AndL3Confirmation(sources []string) bool {
     hasL2 := false
     hasL3 := false
@@ -289,7 +286,7 @@ func hasL2AndL3Confirmation(sources []string) bool {
             hasL2 = true
         case "dhcp", "pihole":
             hasL3 = true
-        case "openwrt_arp":
+		case "openwrt_neigh":
             hasL2 = true
             hasL3 = true
         }
@@ -472,7 +469,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 		if obs.Online && canTriggerOnline(obs.Source) {
 			d.PendingOnlineObs = append(d.PendingOnlineObs, obs.Source)
 			ApplySmartClassifications(d)
-			isAuthoritativeL2 := obs.Source == "openwrt_ap" || obs.Source == "openwrt_arp"
+			isAuthoritativeL2 := obs.Source == "openwrt_ap" || obs.Source == "openwrt_neigh"
 			isInfra := d.HasTag("infrastructure") || d.DeviceType == "infrastructure"
 			if isAuthoritativeL2 || isInfra {
 				d.Online = true
@@ -516,10 +513,9 @@ func (e *Engine) processObservation(obs discovery.Observation) {
     }
 
 	if !d.Online && obs.Online && canTriggerOnline(obs.Source) {
-        // V5.3 FIX: OpenWrt AP and ARP data is authoritative Layer-2/Layer-3 ground truth.
-        // If the router reports the device as associated/resolved, it is definitively online.
-        // We bypass the 30-second deferred timer to prevent bulk-poll "offline limbo".
-        isAuthoritativeL2 := obs.Source == "openwrt_ap" || obs.Source == "openwrt_arp"
+		// A sampled AP association or NUD_REACHABLE transition is positive
+		// presence evidence. A DHCP lease or stale neighbour mapping is not.
+		isAuthoritativeL2 := obs.Source == "openwrt_ap" || obs.Source == "openwrt_neigh"
 
         exists := false
         for _, s := range d.PendingOnlineObs {

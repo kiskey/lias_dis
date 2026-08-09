@@ -59,22 +59,24 @@ func UnescapeHostname(raw string) string {
     if raw == "" {
         return ""
     }
-
-    s := raw
-    for {
-        idx := strings.Index(s, "\\0")
-        if idx == -1 || idx+4 > len(s) {
-            break
+	var out strings.Builder
+	out.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			out.WriteByte(raw[i])
+			continue
         }
-        octalCode := s[idx+2 : idx+4]
-        if val, err := strconv.ParseInt(octalCode, 8, 64); err == nil {
-            s = s[:idx] + string(rune(val)) + s[idx+4:]
-        } else {
-            break
+		if i+3 < len(raw) {
+			if value, err := strconv.ParseUint(raw[i+1:i+4], 10, 8); err == nil {
+				out.WriteByte(byte(value))
+				i += 3
+				continue
         }
     }
-
-    s = strings.ReplaceAll(s, "\\.", ".")
-    s = strings.ReplaceAll(s, "\\", "")
-    return strings.TrimSpace(s)
+		if i+1 < len(raw) {
+			i++
+			out.WriteByte(raw[i])
+		}
+	}
+	return strings.TrimSpace(out.String())
 }

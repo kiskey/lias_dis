@@ -213,7 +213,10 @@ discovery:
 
   dhcp:
     enabled: true
-    type: "router"
+    # dnsmasq/openwrt/pihole use the five-field dnsmasq lease format.
+    # Use "kea" only for a Kea memfile CSV with its header row.
+    type: "dnsmasq"
+    poll_interval: "2m"
 
     lease_file: "/tmp/dhcp.leases"
 
@@ -221,6 +224,11 @@ discovery:
 
     ssh_host: ""
     ssh_user: "root"
+    # When using OpenWrt over SSH, AP clients come from
+    # `iw dev <iface> station dump`. Only NUD_REACHABLE neighbour rows
+    # are accepted as current presence evidence.
+    openwrt_ap_enabled: false
+    neighbor_table_enabled: false
 
   enrichment:
     avahi_enabled: true
@@ -934,5 +942,3 @@ or
 BLOCK
 ```
 based on the active time window.
-
-

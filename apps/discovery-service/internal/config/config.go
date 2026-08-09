@@ -51,15 +51,17 @@ type PiholeConfig struct {
 // DHCPConfig configures the DHCP lease file parser.
 type DHCPConfig struct {
     Enabled   bool   `yaml:"enabled"`
-    Type      string `yaml:"type"`       // router, pihole, dnsmasq, kea
-    LeaseFile string `yaml:"lease_file"` // Local file path
+	Type         string        `yaml:"type"`          // dnsmasq/openwrt/pihole or kea
+	LeaseFile    string        `yaml:"lease_file"`    // Local or remote lease path
     LeaseURL  string `yaml:"lease_url"`  // Remote HTTP URL
     SSHHost   string `yaml:"ssh_host"`   // Remote SSH host
     SSHUser   string `yaml:"ssh_user"`   // SSH user
+	PollInterval time.Duration `yaml:"poll_interval"` // Defaults to 2m
 
-    // V1.6 ADD: OpenWrt AP & ARP Table Polling for definitive Layer-2/Layer-3 ground truth
+	// OpenWrt sampling: current AP associations and NUD_REACHABLE neighbours.
     OpenWrtAPEnabled bool `yaml:"openwrt_ap_enabled"`
-    ArpTableEnabled  bool `yaml:"arp_table_enabled"`
+	NeighborTableEnabled bool `yaml:"neighbor_table_enabled"`
+	ArpTableEnabled      bool `yaml:"arp_table_enabled"` // Deprecated compatibility alias.
 }
 
 // EnrichmentConfig enables or disables on-demand enrichers.
@@ -107,6 +109,12 @@ func Load(path string) (*Config, error) {
     if cfg.Discovery.Enrichment.ValidationInterval == 0 {
         cfg.Discovery.Enrichment.ValidationInterval = 24 * time.Hour
     }
+	if cfg.Discovery.DHCP.PollInterval == 0 {
+		cfg.Discovery.DHCP.PollInterval = 2 * time.Minute
+	}
+	if cfg.Discovery.DHCP.PollInterval < 30*time.Second {
+		return nil, fmt.Errorf("discovery.dhcp.poll_interval must be at least 30s")
+	}
     if cfg.Storage.Path == "" {
         cfg.Storage.Path = "/var/lib/dis/state.db"
     }

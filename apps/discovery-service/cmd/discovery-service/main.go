@@ -118,10 +118,13 @@ func main() {
     
     if cfg.Discovery.Enrichment.AvahiEnabled {
         e := discovery.NewAvahiEnricher()
-        _ = e.Start(ctx)
+		if err := e.Start(ctx); err != nil {
+			slog.Warn("Avahi enrichment disabled", "error", err)
+		} else {
         primaries = append(primaries, e)
         defer e.Stop()
     }
+	}
     if cfg.Discovery.Enrichment.SSDPEnabled {
         ssdpEnricher = discovery.NewSSDPEnricher(cfg.Discovery.Interface)
         _ = ssdpEnricher.Start(ctx)

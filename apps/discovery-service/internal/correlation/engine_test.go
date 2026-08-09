@@ -100,3 +100,12 @@ func TestDedupMapBounding(t *testing.T) {
         t.Fatalf("Dedup map was not swept clean, %d entries remain", len(eng.lastSeenObs))
     }
 }
+
+func TestLeaseIsNotPresenceEvidence(t *testing.T) {
+	if canTriggerOnline("dhcp") {
+		t.Fatal("DHCP lease must not trigger online state")
+	}
+	if !canTriggerOnline("openwrt_ap") || !canTriggerOnline("openwrt_neigh") {
+		t.Fatal("sampled AP/NUD_REACHABLE evidence should trigger online state")
+	}
+}
