@@ -35,6 +35,7 @@ type Cache struct {
     macIndex       map[string]*models.Device
     ipIndex        map[string]*models.Device
     hostnameOwners map[string]string
+    dormant        map[string]bool
     ownerListener  HostnameOwnerListener
     stopCh         chan struct{}
 }
@@ -46,6 +47,7 @@ func NewCache() *Cache {
         macIndex:       make(map[string]*models.Device),
         ipIndex:        make(map[string]*models.Device),
         hostnameOwners: make(map[string]string),
+        dormant:        make(map[string]bool),
         stopCh:         make(chan struct{}),
     }
     go c.purgeLoop()
@@ -173,6 +175,9 @@ func (c *Cache) DemoteStale() []string {
     var changed []string
     now := time.Now()
     for pdid, d := range c.devices {
+        if c.dormant[pdid] {
+            continue
+        }
         if d.Online && now.Sub(d.LastSeen) > staleThreshold {
             d.Online = false
             changed = append(changed, pdid)
@@ -234,21 +239,11 @@ func (c *Cache) RemoveIPIndex(ipStr string) {
     defer c.mu.Unlock()
 
     if d, found := c.ipIndex[cleanIP]; found {
-        newIPs := make([]string, 0, len(d.IPs))
-        for _, ip := range d.IPs {
-            if ip != cleanIP {
-                newIPs = append(newIPs, ip)
-            }
-        }
-        d.IPs = newIPs
         if d.CurrentIP == cleanIP {
             d.CurrentIP = ""
-            if len(d.IPs) > 0 {
-                d.CurrentIP = d.IPs[len(d.IPs)-1]
-            }
         }
         delete(c.ipIndex, cleanIP)
-        slog.Info("Invalidated stale IP index mapping", "ip", cleanIP, "pdid", d.PDID)
+        slog.Info("Released current IP ownership while preserving history", "ip", cleanIP, "pdid", d.PDID)
     }
 }
 
@@ -289,12 +284,6 @@ func (c *Cache) SetCurrentMAC(pdid, macStr string) {
         return
     }
 
-    if oldMAC := NormalizeMAC(d.CurrentMAC); oldMAC != "" && oldMAC != cleanMAC {
-        if existing, ok := c.macIndex[oldMAC]; ok && existing.PDID == pdid {
-            delete(c.macIndex, oldMAC)
-        }
-    }
-
     if oldDev, exists := c.macIndex[cleanMAC]; exists && oldDev.PDID != pdid {
         slog.Warn("MAC index collision during SetCurrentMAC", "mac", cleanMAC, "old_pdid", oldDev.PDID, "new_pdid", pdid)
     }
@@ -324,6 +313,21 @@ func (c *Cache) Get(pdid string) *models.Device {
 	return d.Clone()
 }
 
+// GetActive preserves the public inventory behavior: dormant identities remain
+// resolvable internally by MAC but are not returned as active inventory rows.
+func (c *Cache) GetActive(pdid string) *models.Device {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+    if c.dormant[pdid] {
+        return nil
+    }
+    d := c.devices[pdid]
+    if d == nil {
+        return nil
+    }
+    return d.Clone()
+}
+
 func (c *Cache) GetByDeviceID(deviceID string) *models.Device {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -338,7 +342,10 @@ func (c *Cache) List() []models.Device {
     defer c.mu.RUnlock()
 
     list := make([]models.Device, 0, len(c.devices))
-    for _, d := range c.devices {
+    for pdid, d := range c.devices {
+        if c.dormant[pdid] {
+            continue
+        }
 		list = append(list, *d.Clone())
     }
     return list
@@ -357,11 +364,18 @@ func (c *Cache) Upsert(d *models.Device) {
 		if old.DeviceID != "" && old.DeviceID != d.DeviceID {
 			delete(c.deviceIDIndex, old.DeviceID)
 		}
-        oldMAC := NormalizeMAC(old.CurrentMAC)
-        newMAC := NormalizeMAC(d.CurrentMAC)
-        if oldMAC != "" && oldMAC != newMAC {
-            if idx, ok := c.macIndex[oldMAC]; ok && idx.PDID == d.PDID {
-                delete(c.macIndex, oldMAC)
+        nextMACs := make(map[string]bool, len(d.MACs))
+        for _, mac := range d.MACs {
+            if clean := NormalizeMAC(mac); clean != "" {
+                nextMACs[clean] = true
+            }
+        }
+        for _, mac := range old.MACs {
+            clean := NormalizeMAC(mac)
+            if clean != "" && !nextMACs[clean] {
+                if idx, ok := c.macIndex[clean]; ok && idx.PDID == d.PDID {
+                    delete(c.macIndex, clean)
+                }
             }
         }
         oldIP := strings.TrimSpace(old.CurrentIP)
@@ -375,12 +389,17 @@ func (c *Cache) Upsert(d *models.Device) {
 
 	devCopy := d.Clone()
 	c.devices[d.PDID] = devCopy
+	delete(c.dormant, d.PDID)
 	if d.DeviceID != "" {
 		c.deviceIDIndex[d.DeviceID] = devCopy
 	}
 
-    if cleanMAC := NormalizeMAC(d.CurrentMAC); cleanMAC != "" {
-		c.macIndex[cleanMAC] = devCopy
+    // device_macs is authoritative. Index every owned historical MAC and do
+    // not index an inconsistent current_mac that has no ownership row.
+    for _, mac := range d.MACs {
+        if cleanMAC := NormalizeMAC(mac); cleanMAC != "" {
+			c.macIndex[cleanMAC] = devCopy
+        }
     }
 
     if cleanIP := strings.TrimSpace(d.CurrentIP); cleanIP != "" {
@@ -404,11 +423,17 @@ func (c *Cache) Delete(pdid string) {
     c.mu.Lock()
     var releasedHosts []string
     if d, ok := c.devices[pdid]; ok {
-        if cleanMAC := NormalizeMAC(d.CurrentMAC); cleanMAC != "" {
-            delete(c.macIndex, cleanMAC)
+        for _, mac := range d.MACs {
+			if cleanMAC := NormalizeMAC(mac); cleanMAC != "" {
+				if indexed := c.macIndex[cleanMAC]; indexed != nil && indexed.PDID == pdid {
+					delete(c.macIndex, cleanMAC)
+				}
+			}
         }
         if cleanIP := strings.TrimSpace(d.CurrentIP); cleanIP != "" {
-            delete(c.ipIndex, cleanIP)
+            if indexed := c.ipIndex[cleanIP]; indexed != nil && indexed.PDID == pdid {
+                delete(c.ipIndex, cleanIP)
+            }
         }
         if d.CanonicalHostname != "" {
             if owner, exists := c.hostnameOwners[d.CanonicalHostname]; exists && owner == pdid {
@@ -418,6 +443,7 @@ func (c *Cache) Delete(pdid string) {
         }
 		delete(c.deviceIDIndex, d.DeviceID)
         delete(c.devices, pdid)
+        delete(c.dormant, pdid)
     }
     listener := c.ownerListener
     c.mu.Unlock()
@@ -454,13 +480,12 @@ func (c *Cache) purgeOffline() {
     var releasedPDIDs []string
 
     for pdid, d := range c.devices {
-        if !d.Online && now.Sub(d.LastSeen) > offlineTTL {
-            slog.Info("Purging offline device from cache", "pdid", pdid, "mac", d.CurrentMAC)
-            if cleanMAC := NormalizeMAC(d.CurrentMAC); cleanMAC != "" {
-                delete(c.macIndex, cleanMAC)
-            }
-            if cleanIP := strings.TrimSpace(d.CurrentIP); cleanIP != "" {
-                delete(c.ipIndex, cleanIP)
+		if !c.dormant[pdid] && !d.Online && now.Sub(d.LastSeen) > offlineTTL {
+			slog.Info("Marking offline device dormant while retaining identity ownership", "pdid", pdid, "mac", d.CurrentMAC)
+			if cleanIP := strings.TrimSpace(d.CurrentIP); cleanIP != "" {
+				if indexed := c.ipIndex[cleanIP]; indexed != nil && indexed.PDID == pdid {
+					delete(c.ipIndex, cleanIP)
+				}
             }
             if d.CanonicalHostname != "" {
                 if owner, exists := c.hostnameOwners[d.CanonicalHostname]; exists && owner == pdid {
@@ -469,8 +494,7 @@ func (c *Cache) purgeOffline() {
                     releasedPDIDs = append(releasedPDIDs, pdid)
                 }
             }
-			delete(c.deviceIDIndex, d.DeviceID)
-            delete(c.devices, pdid)
+			c.dormant[pdid] = true
         }
     }
     listener := c.ownerListener

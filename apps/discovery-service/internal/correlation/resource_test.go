@@ -1,10 +1,12 @@
 package correlation
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -112,6 +114,180 @@ func TestObservationStormIsDeduplicatedAndBounded(t *testing.T) {
 	engine.dedupMu.Unlock()
 	if dedupEntries != 1 {
 		t.Fatalf("duplicate storm grew dedup cache to %d", dedupEntries)
+	}
+}
+
+func TestConcurrentFirstSightOfSameMACCreatesOneIdentity(t *testing.T) {
+	cache := inventory.NewCache()
+	defer cache.Stop()
+	broker := api.NewBroker(cache)
+	defer broker.Stop()
+	store, err := storage.NewStorage(t.TempDir() + "/concurrent-claim.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	engine := NewEngine(cache, broker)
+	engine.SetStorage(store)
+	const workers = 100
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			mac, _ := net.ParseMAC("00:11:22:33:44:55")
+			engine.processObservation(discovery.Observation{Source: fmt.Sprintf("source_%d", i),
+				Group: discovery.GroupA, MAC: mac, Timestamp: time.Now(), Confidence: .9})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	if got := cache.List(); len(got) != 1 {
+		t.Fatalf("concurrent first sight created %d cached identities: %+v", len(got), got)
+	}
+	durable, err := store.LoadHydrate()
+	if err != nil || len(durable) != 1 || len(durable[0].MACs) != 1 {
+		t.Fatalf("concurrent first sight durable=%+v err=%v", durable, err)
+	}
+}
+
+func TestReconcileConfirmedZeroMACOrphan(t *testing.T) {
+	cache := inventory.NewCache()
+	defer cache.Stop()
+	broker := api.NewBroker(cache)
+	defer broker.Stop()
+	client := broker.Subscribe("orphan-repair", 0)
+	defer broker.Unsubscribe(client.ID)
+	dbPath := t.TempDir() + "/orphan-repair.db"
+	store, err := storage.NewStorage(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	owner := &models.Device{DeviceID: "dev_owner", PDID: "pdid_owner", CurrentMAC: "60:be:b4:08:a9:5f",
+		MACs: []string{"60:be:b4:08:a9:5f"}, Vendor: "S-Bluetech co., limited",
+		IdentityAssurance: models.IdentityStrong, IdentityProbability: .999, FirstSeen: now.Add(-time.Hour), LastSeen: now}
+	orphan := &models.Device{DeviceID: "dev_orphan", PDID: "pdid_orphan", CurrentMAC: owner.CurrentMAC,
+		FriendlyName: "duplicate display name", FirstSeen: now, LastSeen: now}
+	if err := store.SaveDevice(owner); err != nil {
+		t.Fatal(err)
+	}
+	// Insert the historical corruption shape directly: modern storage now
+	// refuses to create it through SaveDevice.
+	if err := insertOrphanFixture(dbPath, orphan); err != nil {
+		t.Fatal(err)
+	}
+	hydrated, err := store.LoadHydrate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range hydrated {
+		cache.Upsert(&hydrated[i])
+	}
+	engine := NewEngine(cache, broker)
+	engine.SetStorage(store)
+	repaired, err := engine.ReconcileOrphanMACDuplicates()
+	if err != nil || repaired != 1 {
+		t.Fatalf("repaired=%d err=%v", repaired, err)
+	}
+	select {
+	case event := <-client.Events:
+		if event.Type != models.EventDeviceReidentified || event.DeviceID != owner.PDID {
+			t.Fatalf("repair event changed contract: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("repair did not emit device.reidentified")
+	}
+	durable, err := store.LoadHydrate()
+	if err != nil || len(durable) != 1 || durable[0].PDID != owner.PDID || durable[0].FriendlyName != orphan.FriendlyName {
+		t.Fatalf("reconciled durable=%+v err=%v", durable, err)
+	}
+	if durable[0].IdentityAssurance != models.IdentityStrong {
+		t.Fatalf("repair incorrectly promoted assurance: %+v", durable[0])
+	}
+	if resolved := engine.ResolvePDID(orphan.PDID); resolved != owner.PDID {
+		t.Fatalf("orphan redirect=%q", resolved)
+	}
+	if repeated, err := engine.ReconcileOrphanMACDuplicates(); err != nil || repeated != 0 {
+		t.Fatalf("orphan repair was not idempotent: repaired=%d err=%v", repeated, err)
+	}
+}
+
+func TestReconcileLeavesVerifiedConflictForReview(t *testing.T) {
+	cache := inventory.NewCache()
+	defer cache.Stop()
+	broker := api.NewBroker(cache)
+	defer broker.Stop()
+	dbPath := t.TempDir() + "/orphan-conflict.db"
+	store, err := storage.NewStorage(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	owner := &models.Device{DeviceID: "dev_owner", PDID: "pdid_owner", CurrentMAC: "00:11:22:33:44:55",
+		MACs: []string{"00:11:22:33:44:55"}, FirstSeen: now, LastSeen: now}
+	orphan := &models.Device{DeviceID: "dev_orphan", PDID: "pdid_orphan", CurrentMAC: owner.CurrentMAC,
+		FirstSeen: now, LastSeen: now}
+	if err := store.SaveDevice(owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertOrphanFixture(dbPath, orphan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertIdentityAlias(models.IdentityAlias{DeviceID: orphan.DeviceID, Type: models.AliasMDMDeviceID,
+		ValueHash: "independent-verified-hash", Source: "mdm", Confidence: 1, Verified: true,
+		FirstSeen: now, LastSeen: now}); err != nil {
+		t.Fatal(err)
+	}
+	hydrated, err := store.LoadHydrate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range hydrated {
+		cache.Upsert(&hydrated[i])
+	}
+	engine := NewEngine(cache, broker)
+	engine.SetStorage(store)
+	if repaired, err := engine.ReconcileOrphanMACDuplicates(); err != nil || repaired != 0 {
+		t.Fatalf("verified conflict repaired=%d err=%v", repaired, err)
+	}
+	if durable, err := store.LoadHydrate(); err != nil || len(durable) != 2 {
+		t.Fatalf("verified conflict was merged: devices=%+v err=%v", durable, err)
+	}
+}
+
+func insertOrphanFixture(dbPath string, orphan *models.Device) error {
+	// Kept in the correlation test package so production storage exposes no
+	// escape hatch around MAC ownership. The fixture uses a separate SQLite
+	// connection to reproduce a row created by the former INSERT-OR-IGNORE path.
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec(`INSERT INTO devices(device_id, pdid, current_mac, friendly_name, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?)`, orphan.DeviceID, orphan.PDID, orphan.CurrentMAC,
+		orphan.FriendlyName, orphan.FirstSeen, orphan.LastSeen)
+	return err
+}
+
+func TestDistinctProxmoxMACsRemainSeparate(t *testing.T) {
+	cache := inventory.NewCache()
+	defer cache.Stop()
+	broker := api.NewBroker(cache)
+	defer broker.Stop()
+	engine := NewEngine(cache, broker)
+	for i, value := range []string{"bc:24:11:91:c0:5b", "bc:24:11:a9:4b:a0"} {
+		mac, _ := net.ParseMAC(value)
+		engine.processObservation(discovery.Observation{Source: fmt.Sprintf("proxmox_%d", i), Group: discovery.GroupA,
+			MAC: mac, Vendor: "Proxmox Server Solutions GmbH", Timestamp: time.Now()})
+	}
+	if devices := cache.List(); len(devices) != 2 || devices[0].PDID == devices[1].PDID {
+		t.Fatalf("distinct Proxmox MACs were collapsed: %+v", devices)
 	}
 }
 

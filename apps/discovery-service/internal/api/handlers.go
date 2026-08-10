@@ -126,7 +126,7 @@ func (h *Handlers) GetDevice(w http.ResponseWriter, r *http.Request) {
 	if h.identity != nil {
 		pdid = h.identity.ResolvePDID(pdid)
 	}
-	d := h.cache.Get(pdid)
+	d := h.cache.GetActive(pdid)
 	if d == nil {
 		http.Error(w, `{"error":"device not found"}`, http.StatusNotFound)
 		return
@@ -141,7 +141,7 @@ func (h *Handlers) RefreshDevice(w http.ResponseWriter, r *http.Request) {
 	if h.identity != nil {
 		pdid = h.identity.ResolvePDID(pdid)
 	}
-	d := h.cache.Get(pdid)
+	d := h.cache.GetActive(pdid)
 	if d == nil {
 		http.Error(w, `{"error":"device not found"}`, http.StatusNotFound)
 		return

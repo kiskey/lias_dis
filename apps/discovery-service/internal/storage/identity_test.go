@@ -117,3 +117,32 @@ func TestCandidateDecisionAndRedirect(t *testing.T) {
 		t.Fatalf("decision not persisted: %+v %v", candidate, err)
 	}
 }
+
+func TestIdenticalCandidateEvidenceDoesNotWriteSQLite(t *testing.T) {
+	s, err := NewStorage(filepath.Join(t.TempDir(), "candidate-noop.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	candidate := models.IdentityCandidateLink{SourcePDID: "source", TargetPDID: "target", Probability: .8,
+		Ambiguous: true, Factors: []models.IdentityFactor{{Kind: "same_ip", Matched: true, LikelihoodRatio: 2}}}
+	id, err := s.UpsertIdentityCandidate(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := sqliteTotalChanges(t, s)
+	repeatedID, err := s.UpsertIdentityCandidate(candidate)
+	if err != nil || repeatedID != id {
+		t.Fatalf("repeated candidate id=%d err=%v", repeatedID, err)
+	}
+	if after := sqliteTotalChanges(t, s); after != before {
+		t.Fatalf("identical candidate evidence wrote SQLite: before=%d after=%d", before, after)
+	}
+	candidate.Probability = .85
+	if _, err := s.UpsertIdentityCandidate(candidate); err != nil {
+		t.Fatal(err)
+	}
+	if after := sqliteTotalChanges(t, s); after <= before {
+		t.Fatalf("material candidate score change did not write: before=%d after=%d", before, after)
+	}
+}

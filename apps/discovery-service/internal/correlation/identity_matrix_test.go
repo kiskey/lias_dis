@@ -86,3 +86,58 @@ func TestAuthenticatedStableCredentialPreservesPolicyAcrossPrivateMACChangeAndRe
 		t.Fatalf("revoked credential still merged identity: %+v", cache.List())
 	}
 }
+
+func TestAuthenticatedIdentityCannotStealOwnedMAC(t *testing.T) {
+	cache := inventory.NewCache()
+	defer cache.Stop()
+	broker := api.NewBroker(cache)
+	defer broker.Stop()
+	client := broker.Subscribe("mac-conflict", 0)
+	defer broker.Unsubscribe(client.ID)
+	store, err := storage.NewStorage(filepath.Join(t.TempDir(), "mac-conflict.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	engine := NewEngine(cache, broker)
+	engine.SetStorage(store)
+	now := time.Now()
+	identity := &models.Device{DeviceID: "dev_identity", PDID: "pdid_identity", CurrentMAC: "02:00:00:00:00:01",
+		MACs: []string{"02:00:00:00:00:01"}, FirstSeen: now, LastSeen: now}
+	owner := &models.Device{DeviceID: "dev_owner", PDID: "pdid_owner", CurrentMAC: "02:00:00:00:00:02",
+		MACs: []string{"02:00:00:00:00:02"}, FirstSeen: now, LastSeen: now}
+	for _, d := range []*models.Device{identity, owner} {
+		if err := store.SaveDevice(d); err != nil {
+			t.Fatal(err)
+		}
+		cache.Upsert(d)
+	}
+	if _, err := engine.BindIdentityAlias(identity.PDID, models.IdentityBindingRequest{
+		Type: models.AliasMDMDeviceID, Value: "mdm-conflict", Source: "mdm",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	engine.processObservation(discovery.Observation{Source: "mdm", Group: discovery.GroupE,
+		MAC: mustMAC(t, owner.CurrentMAC), Timestamp: now.Add(time.Second),
+		Raw: map[string]interface{}{"identity_authenticated": true, "mdm_device_id": "mdm-conflict"}})
+	if cache.Get(identity.PDID).HasMAC(owner.CurrentMAC) {
+		t.Fatal("authenticated identity stole a MAC owned by another PDID")
+	}
+	select {
+	case event := <-client.Events:
+		// Bind emits first; drain until the security alert arrives.
+		if event.Type != models.EventIdentityBindingChanged {
+			t.Fatalf("unexpected first event: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("binding event missing")
+	}
+	select {
+	case event := <-client.Events:
+		if event.Type != models.EventSecurityAlert {
+			t.Fatalf("MAC ownership conflict event=%+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("MAC ownership conflict did not emit a security alert")
+	}
+}

@@ -7,6 +7,7 @@ package storage
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -28,6 +29,19 @@ type PendingEventRecord struct {
 	LastSeen      time.Time
 	Confirmations int
 	Sources       string
+}
+
+// MACOwnershipConflict means a normalized MAC is already durably owned by a
+// different PDID. Callers must resolve to that owner; they must never commit a
+// second device row without the corresponding MAC membership.
+type MACOwnershipConflict struct {
+	MAC           string
+	OwnerPDID     string
+	RequestedPDID string
+}
+
+func (e *MACOwnershipConflict) Error() string {
+	return fmt.Sprintf("MAC %s is owned by %s, not %s", e.MAC, e.OwnerPDID, e.RequestedPDID)
 }
 
 type Storage struct {
@@ -162,9 +176,16 @@ func (s *Storage) initSchema() error {
 
     CREATE TABLE IF NOT EXISTS device_ips (
         pdid TEXT NOT NULL,
-        ip TEXT PRIMARY KEY,
+		ip TEXT NOT NULL,
+		PRIMARY KEY(pdid, ip),
         FOREIGN KEY(pdid) REFERENCES devices(pdid) ON DELETE CASCADE
     );
+
+	CREATE TABLE IF NOT EXISTS device_ip_owners (
+		ip TEXT PRIMARY KEY,
+		pdid TEXT NOT NULL,
+		FOREIGN KEY(pdid) REFERENCES devices(pdid) ON DELETE CASCADE
+	);
 
     CREATE TABLE IF NOT EXISTS hostname_owners (
         canonical_hostname TEXT PRIMARY KEY,
@@ -234,6 +255,7 @@ func (s *Storage) initSchema() error {
 
     CREATE INDEX IF NOT EXISTS idx_mac_pdid ON device_macs(pdid);
     CREATE INDEX IF NOT EXISTS idx_ip_pdid ON device_ips(pdid);
+	CREATE INDEX IF NOT EXISTS idx_ip_owner_pdid ON device_ip_owners(pdid);
     CREATE INDEX IF NOT EXISTS idx_pending_pdid ON pending_events(pdid, event_type);
     CREATE INDEX IF NOT EXISTS idx_identity_alias_lookup ON identity_aliases(alias_type, value_hash, verified, revoked_at);
     CREATE INDEX IF NOT EXISTS idx_identity_alias_device ON identity_aliases(device_id);
@@ -244,6 +266,9 @@ func (s *Storage) initSchema() error {
 	_, err := s.db.Exec(query)
 	if err != nil {
 		return fmt.Errorf("failed to execute DIS schema initialization: %w", err)
+	}
+	if err := s.migrateDeviceIPSchemaLocked(); err != nil {
+		return err
 	}
 
 	_, _ = s.db.Exec("ALTER TABLE devices ADD COLUMN identity_tier TEXT NOT NULL DEFAULT 'tentative'")
@@ -304,6 +329,66 @@ func (s *Storage) initSchema() error {
 	}
 
 	return nil
+}
+
+func (s *Storage) migrateDeviceIPSchemaLocked() error {
+	rows, err := s.db.Query("PRAGMA table_info(device_ips)")
+	if err != nil {
+		return err
+	}
+	composite := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "pdid" && primaryKey == 1 {
+			composite = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if composite {
+		_, err := s.db.Exec(`INSERT OR IGNORE INTO device_ip_owners(ip, pdid)
+            SELECT current_ip, pdid FROM devices WHERE current_ip != ''`)
+		return err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	statements := []string{
+		"ALTER TABLE device_ips RENAME TO device_ips_legacy_owner",
+		`CREATE TABLE device_ips (
+            pdid TEXT NOT NULL,
+            ip TEXT NOT NULL,
+            PRIMARY KEY(pdid, ip),
+            FOREIGN KEY(pdid) REFERENCES devices(pdid) ON DELETE CASCADE
+        )`,
+		"INSERT OR IGNORE INTO device_ips(pdid, ip) SELECT pdid, ip FROM device_ips_legacy_owner",
+		`CREATE TABLE IF NOT EXISTS device_ip_owners (
+            ip TEXT PRIMARY KEY,
+            pdid TEXT NOT NULL,
+            FOREIGN KEY(pdid) REFERENCES devices(pdid) ON DELETE CASCADE
+        )`,
+		`INSERT OR REPLACE INTO device_ip_owners(ip, pdid)
+			SELECT ip, pdid FROM device_ips_legacy_owner`,
+		"DROP TABLE device_ips_legacy_owner",
+		"CREATE INDEX IF NOT EXISTS idx_ip_pdid ON device_ips(pdid)",
+		"CREATE INDEX IF NOT EXISTS idx_ip_owner_pdid ON device_ip_owners(pdid)",
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(statement); err != nil {
+			return fmt.Errorf("migrate device IP ownership: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Storage) migrateLegacyIdentityMetadata() error {
@@ -484,6 +569,21 @@ func (s *Storage) LoadHostnameOwners() (map[string]string, error) {
 	return owners, nil
 }
 
+func (s *Storage) LookupPDIDByMAC(mac string) (string, error) {
+	mac = inventory.NormalizeMAC(mac)
+	if mac == "" {
+		return "", nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var pdid string
+	err := s.db.QueryRow("SELECT pdid FROM device_macs WHERE mac = ?", mac).Scan(&pdid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return pdid, err
+}
+
 func (s *Storage) SaveHostnameOwner(canonicalHost, pdid string) error {
 	if canonicalHost == "" || pdid == "" {
 		return nil
@@ -561,6 +661,32 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
 			return fmt.Errorf("allocate device ID: %w", err)
 		}
 		d.DeviceID = deviceID
+	}
+
+	desiredMACs := make(map[string]bool, len(d.MACs))
+	for _, mac := range d.MACs {
+		if clean := inventory.NormalizeMAC(mac); clean != "" {
+			desiredMACs[clean] = true
+		}
+	}
+	if current := inventory.NormalizeMAC(d.CurrentMAC); current != "" {
+		d.CurrentMAC = current
+		if !desiredMACs[current] {
+			desiredMACs[current] = true
+			d.MACs = append(d.MACs, current)
+		}
+	}
+	// Validate every claim before inserting/updating the device row. Under the
+	// Storage writer mutex this makes a familiar-MAC conflict a read-only path.
+	for mac := range desiredMACs {
+		var owner string
+		err := tx.QueryRow("SELECT pdid FROM device_macs WHERE mac = ?", mac).Scan(&owner)
+		if err == nil && owner != d.PDID {
+			return &MACOwnershipConflict{MAC: mac, OwnerPDID: owner, RequestedPDID: d.PDID}
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 	}
 
 	onlineInt := 0
@@ -677,16 +803,11 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
 		macRows.Close()
 	}
 
-	desiredMACs := make(map[string]bool)
-	for _, mac := range d.MACs {
-		if mac != "" {
-			desiredMACs[mac] = true
-		}
-	}
-
 	for mac := range desiredMACs {
 		if !existingMACs[mac] {
-			_, _ = tx.Exec("INSERT OR IGNORE INTO device_macs (pdid, mac) VALUES (?, ?)", d.PDID, mac)
+			if _, err := tx.Exec("INSERT INTO device_macs (pdid, mac) VALUES (?, ?)", d.PDID, mac); err != nil {
+				return err
+			}
 		}
 	}
 	for mac := range existingMACs {
@@ -712,15 +833,49 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
 			desiredIPs[ip] = true
 		}
 	}
+	if current := strings.TrimSpace(d.CurrentIP); current != "" && !desiredIPs[current] {
+		desiredIPs[current] = true
+		d.IPs = append(d.IPs, current)
+	}
 
 	for ip := range desiredIPs {
 		if !existingIPs[ip] {
-			_, _ = tx.Exec("INSERT OR IGNORE INTO device_ips (pdid, ip) VALUES (?, ?)", d.PDID, ip)
+			if _, err := tx.Exec("INSERT OR IGNORE INTO device_ips (pdid, ip) VALUES (?, ?)", d.PDID, ip); err != nil {
+				return err
+			}
 		}
 	}
 	for ip := range existingIPs {
 		if !desiredIPs[ip] {
 			_, _ = tx.Exec("DELETE FROM device_ips WHERE pdid = ? AND ip = ?", d.PDID, ip)
+		}
+	}
+
+	currentIP := strings.TrimSpace(d.CurrentIP)
+	if currentIP == "" {
+		if _, err := tx.Exec("DELETE FROM device_ip_owners WHERE pdid = ?", d.PDID); err != nil {
+			return err
+		}
+	} else {
+		if _, err := tx.Exec("DELETE FROM device_ip_owners WHERE pdid = ? AND ip != ?", d.PDID, currentIP); err != nil {
+			return err
+		}
+		var owner string
+		err := tx.QueryRow("SELECT pdid FROM device_ip_owners WHERE ip = ?", currentIP).Scan(&owner)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err := tx.Exec("INSERT INTO device_ip_owners(ip, pdid) VALUES (?, ?)", currentIP, d.PDID); err != nil {
+				return err
+			}
+		case err != nil:
+			return err
+		case owner != d.PDID:
+			if _, err := tx.Exec("UPDATE devices SET current_ip = '' WHERE pdid = ? AND current_ip = ?", owner, currentIP); err != nil {
+				return err
+			}
+			if _, err := tx.Exec("UPDATE device_ip_owners SET pdid = ? WHERE ip = ?", d.PDID, currentIP); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -760,11 +915,15 @@ func (s *Storage) ReplaceDevicePDID(oldPDID, newPDID string, d *models.Device) e
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Release the old public key's MAC claims inside the same transaction so
+	// the replacement can acquire them without weakening global uniqueness.
+	if _, err := tx.Exec("DELETE FROM device_macs WHERE pdid = ?", oldPDID); err != nil {
+		return err
+	}
 	if err := s.saveDeviceTx(tx, d); err != nil {
 		return err
 	}
 
-	_, _ = tx.Exec("UPDATE device_macs SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
 	_, _ = tx.Exec("UPDATE device_ips SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
 	_, _ = tx.Exec("UPDATE hostname_owners SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)
 	_, _ = tx.Exec("UPDATE pending_events SET pdid = ? WHERE pdid = ?", newPDID, oldPDID)

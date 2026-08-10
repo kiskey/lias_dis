@@ -6,6 +6,7 @@ package correlation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -46,6 +47,7 @@ type Engine struct {
 	identityMu sync.Mutex
 	aliasMu    sync.RWMutex
 	aliases    map[identityAliasKey]identityAliasActivity
+	macClaims  [64]sync.Mutex
 }
 
 func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
@@ -316,12 +318,40 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	if e.isDuplicateObservation(obs, macStr, ipStr, canonicalHost) {
 		return
 	}
+	if macStr != "" {
+		unlock := e.lockMACClaim(macStr)
+		defer unlock()
+	}
 
 	signals := identitycore.ObservationSignals(obs, macStr, canonicalHost)
 	d := e.resolveVerifiedObservation(signals)
 	verifiedResolution := d != nil
+	macOwner := e.cache.GetByMAC(macStr)
+	if d != nil && macOwner != nil && macOwner.PDID != d.PDID {
+		details := fmt.Sprintf("authenticated identity %s observed with MAC owned by %s", d.PDID, macOwner.PDID)
+		e.broker.Broadcast(models.NewEvent(models.EventSecurityAlert, d.PDID, models.SecurityAlertPayload{
+			AlertType: "mac_identity_conflict", PDID: d.PDID, Details: details, Timestamp: time.Now(),
+		}))
+		slog.Warn("Rejected conflicting authenticated MAC observation", "identity_pdid", d.PDID,
+			"mac_owner_pdid", macOwner.PDID, "mac", macStr, "source", obs.Source)
+		return
+	}
 	if d == nil {
-		d = e.cache.GetByMAC(macStr)
+		d = macOwner
+	}
+	if d == nil && macStr != "" && e.store != nil {
+		ownerPDID, err := e.store.LookupPDIDByMAC(macStr)
+		if err != nil {
+			slog.Warn("Failed durable MAC owner lookup", "mac", macStr, "error", err)
+			return
+		}
+		if ownerPDID != "" {
+			d = e.cache.Get(ownerPDID)
+			if d == nil {
+				slog.Error("Durable MAC owner missing from identity registry", "mac", macStr, "pdid", ownerPDID)
+				return
+			}
+		}
 	}
 	if d == nil && macStr == "" {
 		d = e.cache.GetByIP(ipStr)
@@ -457,17 +487,21 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 			}
 		}
 
-		e.cache.Upsert(d)
-		if canonicalHost != "" {
-			_ = e.cache.AcquireHostname(canonicalHost, d.PDID)
-		}
-
 		if e.store != nil {
 			if err := e.store.SaveDevice(d); err != nil {
-				e.cache.Delete(d.PDID)
+				var conflict *storage.MACOwnershipConflict
+				if errors.As(err, &conflict) {
+					slog.Warn("Prevented duplicate permanent identity", "mac", conflict.MAC,
+						"owner_pdid", conflict.OwnerPDID, "rejected_pdid", conflict.RequestedPDID)
+					return
+				}
 				slog.Error("Failed to persist new permanent identity", "pdid", d.PDID, "error", err)
 				return
 			}
+		}
+		e.cache.Upsert(d)
+		if canonicalHost != "" {
+			_ = e.cache.AcquireHostname(canonicalHost, d.PDID)
 		}
 		e.recordIdentitySignals(d, signals, candidateTarget, candidateDecision, seenAt)
 
@@ -488,6 +522,11 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 
 	newTier, newAnchor := inventory.DeriveTierAndAnchor(macStr, canonicalHost, obs.Vendor)
 	if inventory.CanPromote(d.IdentityTier, newTier) {
+		seenAt := normalizedObservationTime(obs.Timestamp)
+		if seenAt.After(d.LastSeen) {
+			d.Touch(seenAt)
+		}
+		recordObservationSource(d, obs, seenAt)
 		e.promoteDevice(d, newTier, newAnchor, canonicalHost, "observed")
 		return
 	}
@@ -588,6 +627,17 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 	if materialDirty {
 		e.markDirty(d.PDID)
 	}
+}
+
+func (e *Engine) lockMACClaim(mac string) func() {
+	var hash uint32 = 2166136261
+	for i := 0; i < len(mac); i++ {
+		hash ^= uint32(mac[i])
+		hash *= 16777619
+	}
+	lock := &e.macClaims[hash%uint32(len(e.macClaims))]
+	lock.Lock()
+	return lock.Unlock
 }
 
 func (e *Engine) promoteDevice(d *models.Device, newTier models.IdentityTier, newAnchor, canonicalHost, reasonSuffix string) {

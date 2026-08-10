@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +48,8 @@ type DISClient struct {
 	trigger         chan struct{}
 	broker          EventBroadcaster
 	lastSeenInDIS   map[string]time.Time
+	redirectChecked map[string]bool
+	lastEventID     int64
 	stateMu         sync.RWMutex
 	disCapabilities *api.CapabilitiesResponse
 	upstream        api.UpstreamState
@@ -54,13 +57,14 @@ type DISClient struct {
 
 func NewDISClient(cfg config.DISConfig, cache *Cache, trigger chan struct{}, broker EventBroadcaster, migrator IdentityMigrator) *DISClient {
 	return &DISClient{
-		cfg:           cfg,
-		cache:         cache,
-		migrator:      migrator,
-		client:        &http.Client{Timeout: 10 * time.Second},
-		trigger:       trigger,
-		broker:        broker,
-		lastSeenInDIS: make(map[string]time.Time),
+		cfg:             cfg,
+		cache:           cache,
+		migrator:        migrator,
+		client:          &http.Client{Timeout: 10 * time.Second},
+		trigger:         trigger,
+		broker:          broker,
+		lastSeenInDIS:   make(map[string]time.Time),
+		redirectChecked: make(map[string]bool),
 	}
 }
 
@@ -159,22 +163,45 @@ func (c *DISClient) pollDevices() {
 	}
 
 	activePDIDs := make(map[string]bool)
+	c.stateMu.Lock()
 	for _, d := range listResp.Devices {
 		activePDIDs[d.PDID] = true
 		c.lastSeenInDIS[d.PDID] = time.Now()
+		delete(c.redirectChecked, d.PDID)
 	}
+	c.stateMu.Unlock()
 
 	cachedPDIDs := c.cache.ListPDIDs()
 	for _, pdid := range cachedPDIDs {
 		if !activePDIDs[pdid] {
-			if lastSeen, ok := c.lastSeenInDIS[pdid]; ok {
+			c.stateMu.RLock()
+			lastSeen, seen := c.lastSeenInDIS[pdid]
+			checked := c.redirectChecked[pdid]
+			c.stateMu.RUnlock()
+			if !checked {
+				c.stateMu.Lock()
+				c.redirectChecked[pdid] = true
+				c.stateMu.Unlock()
+				if resolved, ok := c.fetchDeviceRecord(pdid); ok && resolved.PDID != "" && resolved.PDID != pdid {
+					if c.reconcileMissedRedirect(pdid, resolved) {
+						continue
+					}
+					c.stateMu.Lock()
+					delete(c.redirectChecked, pdid)
+					c.stateMu.Unlock()
+				}
+			}
+			if seen {
 				if time.Since(lastSeen) < 5*time.Minute {
 					slog.Debug("Device in grace period, keeping in cache", "pdid", pdid)
 					continue
 				}
 			}
 			c.cache.RemoveDevice(pdid)
+			c.stateMu.Lock()
 			delete(c.lastSeenInDIS, pdid)
+			delete(c.redirectChecked, pdid)
+			c.stateMu.Unlock()
 			slog.Info("Removed stale device from LIAS cache (grace period expired)", "pdid", pdid)
 		}
 	}
@@ -250,6 +277,15 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
 		req.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
 	}
 	req.Header.Set("Accept", "text/event-stream")
+	c.stateMu.RLock()
+	lastEventID := c.lastEventID
+	c.stateMu.RUnlock()
+	if lastEventID == 0 {
+		// Request events emitted during DIS startup (including one-time identity
+		// repair) even when LIAS itself has just restarted.
+		lastEventID = 1
+	}
+	req.Header.Set("Last-Event-ID", fmt.Sprintf("%d", lastEventID))
 
 	sseClient := &http.Client{Timeout: 0}
 	resp, err := sseClient.Do(req)
@@ -293,6 +329,14 @@ func (c *DISClient) consumeSSE(ctx context.Context) error {
 
 		if strings.HasPrefix(line, "event: ") {
 			event.Type = models.EventType(strings.TrimPrefix(line, "event: "))
+		} else if strings.HasPrefix(line, "id: ") {
+			if parsed, parseErr := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(line, "id: ")), 10, 64); parseErr == nil {
+				c.stateMu.Lock()
+				if parsed > c.lastEventID {
+					c.lastEventID = parsed
+				}
+				c.stateMu.Unlock()
+			}
 		} else if strings.HasPrefix(line, "data: ") {
 			data := strings.TrimPrefix(line, "data: ")
 			separatorBytes := 0
@@ -356,7 +400,10 @@ func (c *DISClient) handleEvent(e models.Event) {
 			return
 		}
 		c.cache.RemoveDevice(pdid)
+		c.stateMu.Lock()
 		delete(c.lastSeenInDIS, pdid)
+		delete(c.redirectChecked, pdid)
+		c.stateMu.Unlock()
 		slog.Info("Device removed from local cache via SSE", "pdid", pdid)
 		c.tryTrigger()
 		if c.broker != nil {
@@ -473,10 +520,19 @@ func (c *DISClient) handleEvent(e models.Event) {
 }
 
 func (c *DISClient) fetchSingleDevice(pdid string) bool {
+	d, ok := c.fetchDeviceRecord(pdid)
+	if !ok {
+		return false
+	}
+	c.cache.UpsertDevice(d)
+	return true
+}
+
+func (c *DISClient) fetchDeviceRecord(pdid string) (models.Device, bool) {
 	targetURL := c.getEndpointURL("/api/v1/devices/" + pdid)
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
-		return false
+		return models.Device{}, false
 	}
 	if c.cfg.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
@@ -485,19 +541,51 @@ func (c *DISClient) fetchSingleDevice(pdid string) bool {
 	resp, err := c.client.Do(req)
 	if err != nil {
 		slog.Error("Failed to fetch updated device record from DIS", "pdid", pdid, "error", err)
-		return false
+		return models.Device{}, false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return false
+		return models.Device{}, false
 	}
 
 	var d models.Device
 	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		return models.Device{}, false
+	}
+	return d, true
+}
+
+func (c *DISClient) reconcileMissedRedirect(oldPDID string, resolved models.Device) bool {
+	old := c.cache.Get(oldPDID)
+	if old == nil {
 		return false
 	}
-
-	c.cache.UpsertDevice(d)
+	migratedMACs := append([]string(nil), old.Device.MACs...)
+	if len(migratedMACs) == 0 && old.Device.CurrentMAC != "" {
+		migratedMACs = []string{old.Device.CurrentMAC}
+	}
+	if c.migrator != nil {
+		if _, err := c.migrator.MigrateIdentity(oldPDID, resolved.PDID, migratedMACs); err != nil {
+			slog.Error("Failed to reconcile missed DIS identity redirect", "old_pdid", oldPDID,
+				"new_pdid", resolved.PDID, "error", err)
+			return false
+		}
+	} else {
+		c.cache.MigrateDeviceIdentity(oldPDID, resolved.PDID, migratedMACs)
+	}
+	c.cache.UpsertDevice(resolved)
+	c.cache.RemoveDevice(oldPDID)
+	c.stateMu.Lock()
+	delete(c.lastSeenInDIS, oldPDID)
+	delete(c.redirectChecked, oldPDID)
+	c.stateMu.Unlock()
+	c.tryTrigger()
+	if c.broker != nil {
+		c.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, resolved.PDID, models.DeviceReidentifiedPayload{
+			PDID: resolved.PDID, OldPDID: oldPDID, NewPDID: resolved.PDID,
+			Reason: "missed_dis_redirect", MigratedMACs: migratedMACs, Timestamp: time.Now(),
+		}))
+	}
 	return true
 }

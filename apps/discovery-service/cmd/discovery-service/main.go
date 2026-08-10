@@ -84,6 +84,11 @@ func main() {
 	eng := correlation.NewEngine(cache, broker)
 	if st != nil {
 		eng.SetStorage(st)
+		if repaired, err := eng.ReconcileOrphanMACDuplicates(); err != nil {
+			slog.Error("Failed to reconcile duplicate MAC identities", "error", err)
+		} else if repaired > 0 {
+			slog.Warn("Reconciled duplicate MAC identity records", "count", repaired)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

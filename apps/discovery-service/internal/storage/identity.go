@@ -157,6 +157,31 @@ func (s *Storage) FindVerifiedAliasPDIDs(aliasType models.IdentityAliasType, val
 	return pdids, rows.Err()
 }
 
+// HasIndependentVerifiedAliases prevents automatic duplicate repair when the
+// orphan carries authenticated identity evidence not already known by the
+// authoritative MAC owner. Such a record requires administrator review.
+func (s *Storage) HasIndependentVerifiedAliases(sourceDeviceID, targetDeviceID string) (bool, error) {
+	if sourceDeviceID == "" || targetDeviceID == "" {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var exists int
+	err := s.db.QueryRow(`SELECT EXISTS(
+        SELECT 1 FROM identity_aliases source_alias
+        WHERE source_alias.device_id = ? AND source_alias.verified = 1
+          AND source_alias.revoked_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM identity_aliases target_alias
+              WHERE target_alias.device_id = ?
+                AND target_alias.alias_type = source_alias.alias_type
+                AND target_alias.value_hash = source_alias.value_hash
+                AND target_alias.revoked_at IS NULL
+          )
+    )`, sourceDeviceID, targetDeviceID).Scan(&exists)
+	return exists == 1, err
+}
+
 func (s *Storage) ListIdentityAliases(pdid string) ([]models.IdentityAlias, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -295,21 +320,38 @@ func (s *Storage) UpsertIdentityCandidate(candidate models.IdentityCandidateLink
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var id int64
-	err = s.db.QueryRow(`
-        INSERT INTO identity_candidates (
-            source_pdid, target_pdid, probability, ambiguous, status,
-            factors_json, created_at, updated_at, decision_source, decision_note
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(source_pdid, target_pdid) DO UPDATE SET
-            probability = excluded.probability,
-            ambiguous = excluded.ambiguous,
-            factors_json = excluded.factors_json,
-            updated_at = excluded.updated_at
-        RETURNING id
-	`, candidate.SourcePDID, candidate.TargetPDID, candidate.Probability,
-		ambiguous, candidate.Status, string(factorsJSON), candidate.CreatedAt,
-		candidate.UpdatedAt, candidate.DecisionSource, candidate.DecisionNote).Scan(&id)
-	return id, err
+	var existingProbability float64
+	var existingAmbiguous int
+	var existingStatus, existingFactors string
+	err = s.db.QueryRow(`SELECT id, probability, ambiguous, status, factors_json
+        FROM identity_candidates WHERE source_pdid = ? AND target_pdid = ?`,
+		candidate.SourcePDID, candidate.TargetPDID).Scan(
+		&id, &existingProbability, &existingAmbiguous, &existingStatus, &existingFactors)
+	if err == nil {
+		// Candidate activity is material only when its score/factors change.
+		// Decided candidates are immutable unless explicitly reopened.
+		if existingStatus != "pending" || (existingProbability == candidate.Probability &&
+			existingAmbiguous == ambiguous && existingFactors == string(factorsJSON)) {
+			return id, nil
+		}
+		_, err = s.db.Exec(`UPDATE identity_candidates SET probability = ?, ambiguous = ?,
+            factors_json = ?, updated_at = ? WHERE id = ? AND status = 'pending'`,
+			candidate.Probability, ambiguous, string(factorsJSON), candidate.UpdatedAt, id)
+		return id, err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	result, err := s.db.Exec(`INSERT INTO identity_candidates (
+        source_pdid, target_pdid, probability, ambiguous, status,
+        factors_json, created_at, updated_at, decision_source, decision_note
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, candidate.SourcePDID, candidate.TargetPDID,
+		candidate.Probability, ambiguous, candidate.Status, string(factorsJSON), candidate.CreatedAt,
+		candidate.UpdatedAt, candidate.DecisionSource, candidate.DecisionNote)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
 }
 
 func (s *Storage) ListIdentityCandidates(pdid string) ([]models.IdentityCandidateLink, error) {

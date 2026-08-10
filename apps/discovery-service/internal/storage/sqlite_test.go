@@ -5,7 +5,9 @@
 package storage
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -229,6 +231,152 @@ func TestVolatileDeviceStateDoesNotWriteSQLite(t *testing.T) {
 	}
 	if after := sqliteTotalChanges(t, s); after <= before {
 		t.Fatalf("material hostname change did not write SQLite: before=%d after=%d", before, after)
+	}
+}
+
+func TestMACOwnershipConflictDoesNotCreateDeviceOrWriteWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mac-owner.db")
+	s, err := NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now()
+	owner := &models.Device{DeviceID: "dev_owner", PDID: "pdid_owner", CurrentMAC: "00:11:22:33:44:55",
+		MACs: []string{"00:11:22:33:44:55"}, FirstSeen: now, LastSeen: now}
+	if err := s.SaveDevice(owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatal(err)
+	}
+	before := sqliteTotalChanges(t, s)
+	duplicate := &models.Device{DeviceID: "dev_duplicate", PDID: "pdid_duplicate", CurrentMAC: owner.CurrentMAC,
+		FirstSeen: now, LastSeen: now}
+	err = s.SaveDevice(duplicate)
+	var conflict *MACOwnershipConflict
+	if !errors.As(err, &conflict) || conflict.OwnerPDID != owner.PDID {
+		t.Fatalf("expected ownership conflict, got %v", err)
+	}
+	if after := sqliteTotalChanges(t, s); after != before {
+		t.Fatalf("MAC conflict changed SQLite: before=%d after=%d", before, after)
+	}
+	if info, err := os.Stat(path + "-wal"); err == nil && info.Size() != 0 {
+		t.Fatalf("MAC conflict appended %d bytes to WAL", info.Size())
+	}
+	devices, err := s.LoadHydrate()
+	if err != nil || len(devices) != 1 || devices[0].PDID != owner.PDID {
+		t.Fatalf("ownership conflict left an orphan: devices=%+v err=%v", devices, err)
+	}
+}
+
+func TestIPOwnershipTransfersOnceAndPreservesHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ip-owner.db")
+	s, err := NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now()
+	first := &models.Device{DeviceID: "dev_first", PDID: "pdid_first", CurrentIP: "192.0.2.10",
+		IPs: []string{"192.0.2.10"}, FirstSeen: now, LastSeen: now}
+	second := &models.Device{DeviceID: "dev_second", PDID: "pdid_second", CurrentIP: "192.0.2.10",
+		IPs: []string{"192.0.2.10"}, FirstSeen: now, LastSeen: now}
+	if err := s.SaveDevice(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveDevice(second); err != nil {
+		t.Fatal(err)
+	}
+	var owner string
+	if err := s.db.QueryRow("SELECT pdid FROM device_ip_owners WHERE ip = ?", second.CurrentIP).Scan(&owner); err != nil || owner != second.PDID {
+		t.Fatalf("IP owner=%q err=%v", owner, err)
+	}
+	var history int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM device_ips WHERE ip = ?", second.CurrentIP).Scan(&history); err != nil || history != 2 {
+		t.Fatalf("IP history count=%d err=%v", history, err)
+	}
+	if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatal(err)
+	}
+	before := sqliteTotalChanges(t, s)
+	if err := s.SaveDevice(second); err != nil {
+		t.Fatal(err)
+	}
+	if after := sqliteTotalChanges(t, s); after != before {
+		t.Fatalf("repeated IP ownership wrote SQLite: before=%d after=%d", before, after)
+	}
+	if info, err := os.Stat(path + "-wal"); err == nil && info.Size() != 0 {
+		t.Fatalf("repeated IP ownership appended %d bytes to WAL", info.Size())
+	}
+}
+
+func TestLegacyIPSchemaMigratesWithoutLosingAssociations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-ip.db")
+	s, err := NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	device := &models.Device{DeviceID: "dev_legacy", PDID: "pdid_legacy", CurrentIP: "192.0.2.25",
+		IPs: []string{"192.0.2.25"}, FirstSeen: now, LastSeen: now}
+	if err := s.SaveDevice(device); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{
+		"DROP INDEX IF EXISTS idx_ip_pdid",
+		"DROP TABLE device_ip_owners",
+		"ALTER TABLE device_ips RENAME TO device_ips_composite",
+		"CREATE TABLE device_ips(pdid TEXT NOT NULL, ip TEXT PRIMARY KEY, FOREIGN KEY(pdid) REFERENCES devices(pdid) ON DELETE CASCADE)",
+		"INSERT INTO device_ips(pdid, ip) SELECT pdid, ip FROM device_ips_composite",
+		"DROP TABLE device_ips_composite",
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			t.Fatalf("legacy fixture %q: %v", statement, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var owner string
+	if err := s.db.QueryRow("SELECT pdid FROM device_ip_owners WHERE ip = ?", device.CurrentIP).Scan(&owner); err != nil || owner != device.PDID {
+		t.Fatalf("migrated owner=%q err=%v", owner, err)
+	}
+	var primaryKeyColumns int
+	rows, err := s.db.Query("PRAGMA table_info(device_ips)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		if primaryKey > 0 {
+			primaryKeyColumns++
+		}
+	}
+	rows.Close()
+	if primaryKeyColumns != 2 {
+		t.Fatalf("device_ips primary key columns=%d", primaryKeyColumns)
 	}
 }
 

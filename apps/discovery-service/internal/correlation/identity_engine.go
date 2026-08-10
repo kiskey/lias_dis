@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"sort"
 	"strings"
@@ -51,6 +52,7 @@ func (e *Engine) loadIdentityAliasActivity(store *storage.Storage) {
 	}
 	e.aliasMu.Lock()
 	defer e.aliasMu.Unlock()
+	e.aliases = make(map[identityAliasKey]identityAliasActivity, len(aliases))
 	for _, alias := range aliases {
 		key := identityAliasKey{DeviceID: alias.DeviceID, Type: alias.Type, Hash: alias.ValueHash}
 		e.aliases[key] = identityAliasActivity{
@@ -60,6 +62,110 @@ func (e *Engine) loadIdentityAliasActivity(store *storage.Storage) {
 			DurableVerified: alias.Verified, Revoked: alias.RevokedAt != nil,
 		}
 	}
+}
+
+// ReconcileOrphanMACDuplicates repairs the exact corruption shape produced by
+// the former cache-purge/INSERT-OR-IGNORE interaction. Only a device with zero
+// authoritative MAC memberships and no independent verified alias is merged.
+func (e *Engine) ReconcileOrphanMACDuplicates() (int, error) {
+	if e.store == nil {
+		return 0, nil
+	}
+	devices := e.cache.List()
+	owners := make(map[string]*models.Device)
+	for i := range devices {
+		d := &devices[i]
+		for _, mac := range d.MACs {
+			if normalized := inventory.NormalizeMAC(mac); normalized != "" {
+				owners[normalized] = d
+			}
+		}
+	}
+	repaired := 0
+	for i := range devices {
+		source := &devices[i]
+		if len(source.MACs) != 0 {
+			continue
+		}
+		mac := inventory.NormalizeMAC(source.CurrentMAC)
+		target := owners[mac]
+		if mac == "" || target == nil || target.PDID == source.PDID {
+			continue
+		}
+		conflicting, err := e.store.HasIndependentVerifiedAliases(source.DeviceID, target.DeviceID)
+		if err != nil {
+			return repaired, err
+		}
+		if conflicting {
+			slog.Warn("Duplicate-MAC orphan requires identity review", "source_pdid", source.PDID,
+				"owner_pdid", target.PDID, "mac", mac)
+			continue
+		}
+		merged := mergeOrphanDeviceData(source, target)
+		if err := e.store.MergeDevices(source, merged, "exact_mac_orphan_repair"); err != nil {
+			return repaired, err
+		}
+		e.cache.Delete(source.PDID)
+		e.cache.Upsert(merged)
+		if merged.CanonicalHostname != "" {
+			_ = e.cache.AcquireHostname(merged.CanonicalHostname, merged.PDID)
+		}
+		owners[mac] = merged
+		migratedMACs := append([]string(nil), source.MACs...)
+		if len(migratedMACs) == 0 {
+			migratedMACs = []string{mac}
+		}
+		e.broker.Broadcast(models.NewEvent(models.EventDeviceReidentified, merged.PDID, models.DeviceReidentifiedPayload{
+			PDID: merged.PDID, OldPDID: source.PDID, NewPDID: merged.PDID,
+			Reason: "exact_mac_orphan_repair", MigratedMACs: migratedMACs, Timestamp: time.Now(),
+		}))
+		repaired++
+	}
+	if repaired > 0 {
+		e.loadIdentityAliasActivity(e.store)
+	}
+	return repaired, nil
+}
+
+func mergeOrphanDeviceData(source, target *models.Device) *models.Device {
+	merged := mergeDeviceData(source, target)
+	// Repairing a storage artifact is not an administrator verification.
+	merged.IdentityAssurance = target.IdentityAssurance
+	merged.IdentityProbability = target.IdentityProbability
+	merged.IdentityAmbiguous = target.IdentityAmbiguous
+	if merged.Hostname == "" {
+		merged.Hostname = source.Hostname
+		merged.CanonicalHostname = source.CanonicalHostname
+	}
+	if merged.FriendlyName == "" {
+		merged.FriendlyName = source.FriendlyName
+	}
+	if merged.Manufacturer == "" {
+		merged.Manufacturer = source.Manufacturer
+	}
+	if merged.Vendor == "" {
+		merged.Vendor = source.Vendor
+	}
+	if merged.Model == "" {
+		merged.Model = source.Model
+	}
+	if merged.DeviceType == "" {
+		merged.DeviceType = source.DeviceType
+	}
+	if target.CurrentIP != "" {
+		merged.CurrentIP = target.CurrentIP
+	} else if source.CurrentIP != "" {
+		merged.CurrentIP = source.CurrentIP
+	}
+	if merged.SourceInfo == nil {
+		merged.SourceInfo = make(map[string]models.SourceMeta)
+	}
+	for key, meta := range source.SourceInfo {
+		if _, exists := merged.SourceInfo[key]; !exists {
+			merged.SourceInfo[key] = meta
+		}
+	}
+	return merged
 }
 
 func (e *Engine) resolveVerifiedObservation(signals []identitycore.Signal) *models.Device {
