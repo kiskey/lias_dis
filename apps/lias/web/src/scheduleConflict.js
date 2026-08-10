@@ -52,6 +52,8 @@ export function projectSchedule(schedule) {
   if (!schedule || !schedule.rules) return segments;
 
   schedule.rules.forEach((rule, ruleIdx) => {
+    // Calendar conflicts are authoritative in LIAS core/API.
+    if (rule.start_date && rule.end_date) return;
     const startMin = parseTime(rule.start_time);
     const endMin = parseTime(rule.end_time);
 

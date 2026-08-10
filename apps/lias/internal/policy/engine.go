@@ -88,204 +88,180 @@ func (e *Engine) ReconcileDeviceIdentity(oldPDID, newPDID string, policies []mod
 	}
 }
 
+func policyActionRank(action models.Action) int {
+	switch action {
+	case models.ActionBlock:
+		return 3
+	case models.ActionSchedule:
+		return 2
+	case models.ActionAllow:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func preferPolicy(candidate models.Policy, best *models.Policy) bool {
+	if best == nil {
+		return true
+	}
+	if candidate.Priority != best.Priority {
+		return candidate.Priority > best.Priority
+	}
+	if policyActionRank(candidate.Action) != policyActionRank(best.Action) {
+		return policyActionRank(candidate.Action) > policyActionRank(best.Action)
+	}
+	if !candidate.UpdatedAt.Equal(best.UpdatedAt) {
+		return candidate.UpdatedAt.After(best.UpdatedAt)
+	}
+	return candidate.ID < best.ID
+}
+
+func (e *Engine) bestPolicyForTargetLocked(pt models.PolicyType, target string) *models.Policy {
+	var best *models.Policy
+	for _, p := range e.policies {
+		if !p.Enabled || p.Type != pt || p.TargetID != target {
+			continue
+		}
+		if preferPolicy(p, best) {
+			x := p
+			best = &x
+		}
+	}
+	return best
+}
+
+func (e *Engine) GetEffectiveTagPolicy(tagID string) (models.Policy, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	best := e.bestPolicyForTargetLocked(models.PolicyTypeTag, tagID)
+	if best == nil {
+		return models.Policy{}, false
+	}
+	return *best, true
+}
+
+func (e *Engine) tagOutcomeLocked(tags []string) (hasBlock, hasAllow bool, scheduleIDs []string) {
+	for _, tag := range tags {
+		best := e.bestPolicyForTargetLocked(models.PolicyTypeTag, tag)
+		if best == nil {
+			continue
+		}
+		switch best.Action {
+		case models.ActionBlock:
+			hasBlock = true
+		case models.ActionAllow:
+			hasAllow = true
+		case models.ActionSchedule:
+			ids := best.GetScheduleIDs()
+			if len(ids) == 0 {
+				hasBlock = true
+			} else {
+				scheduleIDs = append(scheduleIDs, ids...)
+			}
+		default:
+			hasBlock = true
+		}
+	}
+	return
+}
+
 func (e *Engine) GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy {
 	if d == nil {
 		return models.Policy{ID: "fallback", Action: models.ActionAllow}
 	}
-
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-
-	// 1. INFRASTRUCTURE IMMUNITY CHECK
-	for _, t := range d.Tags {
-		if t == "infrastructure" {
-			return models.Policy{
-				ID:     "infrastructure_override",
-				Name:   "Infrastructure Immunity",
-				Type:   models.PolicyTypeTag,
-				Action: models.ActionAllow,
-			}
-		}
+	if d.HasTag("infrastructure") {
+		return models.Policy{ID: "infrastructure_override", Type: models.PolicyTypeTag, Action: models.ActionAllow}
 	}
-
-	// 2. GLOBAL KILL-SWITCH CHECK (ONLY ActionBlock acts as override)
-	globalPol, hasGlobal := e.policies["global_default"]
-	if hasGlobal && globalPol.Action == models.ActionBlock {
-		return models.Policy{
-			ID:     "global_killswitch",
-			Name:   "Global Access Switch (Block All)",
-			Type:   models.PolicyTypeGlobal,
-			Action: models.ActionBlock,
-		}
+	gp, has := e.policies["global_default"]
+	if has && gp.Enabled && gp.Action == models.ActionBlock {
+		return models.Policy{ID: "global_killswitch", Type: models.PolicyTypeGlobal, Action: models.ActionBlock}
 	}
-
-	// 2b. GLOBAL ALLOW OVERRIDE
-	if hasGlobal && globalPol.Action == models.ActionAllow {
-		return models.Policy{
-			ID:     "global_allow_override",
-			Name:   "Global Access Switch (Allow All)",
-			Type:   models.PolicyTypeGlobal,
-			Action: models.ActionAllow,
-		}
+	if has && gp.Enabled && gp.Action == models.ActionAllow {
+		return models.Policy{ID: "global_allow_override", Type: models.PolicyTypeGlobal, Action: models.ActionAllow}
 	}
-
-	// 3. DEVICE-SPECIFIC POLICY
-	var bestDevPolicy *models.Policy
-	for _, p := range e.policies {
-		if !p.Enabled {
-			continue
-		}
-		if p.Type == models.PolicyTypeDevice && p.TargetID == d.PDID {
-			if bestDevPolicy == nil || p.Priority > bestDevPolicy.Priority {
-				pCopy := p
-				bestDevPolicy = &pCopy
-			}
-		}
+	if best := e.bestPolicyForTargetLocked(models.PolicyTypeDevice, d.PDID); best != nil {
+		return *best
 	}
-	if bestDevPolicy != nil {
-		return *bestDevPolicy
+	block, allow, ids := e.tagOutcomeLocked(d.Tags)
+	if block {
+		return models.Policy{ID: "tag_block_override", Type: models.PolicyTypeTag, Action: models.ActionBlock}
 	}
-
-	// 4. TAG-GROUP POLICIES (MATH-06 Fix: Fail-Closed OR Model)
-	var hasAllowTag bool
-	var tagSchedIDs []string
-	for _, tagID := range d.Tags {
-		for _, p := range e.policies {
-			if !p.Enabled {
-				continue
-			}
-			if p.Type == models.PolicyTypeTag && p.TargetID == tagID {
-				switch p.Action {
-				case models.ActionBlock:
-					return models.Policy{
-						ID:     "tag_block_override",
-						Name:   "Tag Block (" + tagID + ")",
-						Type:   models.PolicyTypeTag,
-						Action: models.ActionBlock,
-					}
-				case models.ActionAllow:
-					hasAllowTag = true
-				case models.ActionSchedule:
-					tagSchedIDs = append(tagSchedIDs, p.GetScheduleIDs()...)
-				}
-			}
-		}
+	if allow {
+		return models.Policy{ID: "tag_allow_override", Type: models.PolicyTypeTag, Action: models.ActionAllow}
 	}
-
-	if hasAllowTag {
-		return models.Policy{
-			ID:     "tag_allow_override",
-			Name:   "Tag Allow Override",
-			Type:   models.PolicyTypeTag,
-			Action: models.ActionAllow,
-		}
+	if len(ids) > 0 {
+		return models.Policy{ID: "tag_schedule_bundle", Type: models.PolicyTypeTag, Action: models.ActionSchedule, ScheduleIDs: ids}
 	}
-
-	if len(tagSchedIDs) > 0 {
-		return models.Policy{
-			ID:          "tag_schedule_bundle",
-			Name:        "Tag Schedule Bundle",
-			Type:        models.PolicyTypeTag,
-			Action:      models.ActionSchedule,
-			ScheduleIDs: tagSchedIDs,
-		}
+	if has {
+		return gp
 	}
-
-	// 5. GLOBAL POLICY FALLBACK
-	if hasGlobal {
-		return globalPol
-	}
-
-	return models.Policy{
-		ID:     "fallback",
-		Name:   "Fallback Allow",
-		Type:   models.PolicyTypeGlobal,
-		Action: models.ActionAllow,
-	}
+	return models.Policy{ID: "fallback", Type: models.PolicyTypeGlobal, Action: models.ActionAllow}
 }
 
 // EvaluateAction resolves final action for a device record using strict
 // precedence hierarchy.
-func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, schedEval ScheduleEvaluator) models.Action {
+func (e *Engine) EvaluateAction(d *liasSync.LocalDevice, sched ScheduleEvaluator) models.Action {
 	if d == nil {
 		return models.ActionAllow
 	}
-
-	// 1. Infrastructure immunity check
 	if d.HasTag("infrastructure") {
 		return models.ActionAllow
 	}
-
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-
-	// 2. Global Kill-Switch / Allow Override
-	if globalPol, ok := e.policies["global_default"]; ok {
-		if globalPol.Enabled && globalPol.Action == models.ActionBlock {
+	if gp, ok := e.policies["global_default"]; ok && gp.Enabled {
+		if gp.Action == models.ActionBlock {
 			return models.ActionBlock
 		}
-		if globalPol.Enabled && globalPol.Action == models.ActionAllow {
+		if gp.Action == models.ActionAllow {
 			return models.ActionAllow
 		}
 	}
-
-	// 3. Evaluate Device-Specific Policies
-	var bestDevPolicy *models.Policy
-	for _, p := range e.policies {
-		if !p.Enabled {
-			continue
-		}
-		if p.Type == models.PolicyTypeDevice && p.TargetID == d.PDID {
-			if bestDevPolicy == nil || p.Priority > bestDevPolicy.Priority {
-				pCopy := p
-				bestDevPolicy = &pCopy
+	if best := e.bestPolicyForTargetLocked(models.PolicyTypeDevice, d.PDID); best != nil {
+		if best.Action == models.ActionSchedule {
+			ids := best.GetScheduleIDs()
+			if len(ids) == 0 || sched == nil {
+				return models.ActionBlock
 			}
+			return sched.EvaluateBundle(ids)
 		}
-	}
-	if bestDevPolicy != nil {
-		if bestDevPolicy.Action == models.ActionSchedule && schedEval != nil {
-			return schedEval.EvaluateBundle(bestDevPolicy.GetScheduleIDs())
+		if best.Action != models.ActionAllow && best.Action != models.ActionBlock {
+			return models.ActionBlock
 		}
-		return bestDevPolicy.Action
+		return best.Action
 	}
-
-	// 4. Evaluate Tag-Group Policies (MATH-06 Fix: Fail-Closed OR Model)
-	var hasAllowTag bool
-	var tagSchedIDs []string
-	for _, tagID := range d.Tags {
-		for _, p := range e.policies {
-			if !p.Enabled {
-				continue
-			}
-			if p.Type == models.PolicyTypeTag && p.TargetID == tagID {
-				switch p.Action {
-				case models.ActionBlock:
-					return models.ActionBlock
-				case models.ActionAllow:
-					hasAllowTag = true
-				case models.ActionSchedule:
-					tagSchedIDs = append(tagSchedIDs, p.GetScheduleIDs()...)
-				}
-			}
-		}
+	block, allow, ids := e.tagOutcomeLocked(d.Tags)
+	if block {
+		return models.ActionBlock
 	}
-
-	if hasAllowTag {
+	if allow {
 		return models.ActionAllow
 	}
-
-	if len(tagSchedIDs) > 0 && schedEval != nil {
-		return schedEval.EvaluateBundle(tagSchedIDs)
-	}
-
-	// 5. Fallback to Global Default Policy
-	if globalPol, ok := e.policies["global_default"]; ok {
-		if globalPol.Enabled && globalPol.Action == models.ActionSchedule && schedEval != nil {
-			return schedEval.EvaluateBundle(globalPol.GetScheduleIDs())
+	if len(ids) > 0 {
+		if sched == nil {
+			return models.ActionBlock
 		}
-		return globalPol.Action
+		return sched.EvaluateBundle(ids)
 	}
-
+	if gp, ok := e.policies["global_default"]; ok && gp.Enabled {
+		if gp.Action == models.ActionSchedule {
+			ids := gp.GetScheduleIDs()
+			if len(ids) == 0 {
+				return models.ActionAllow
+			}
+			if sched == nil {
+				return models.ActionBlock
+			}
+			return sched.EvaluateBundle(ids)
+		}
+		if gp.Action != models.ActionAllow && gp.Action != models.ActionBlock {
+			return models.ActionBlock
+		}
+		return gp.Action
+	}
 	return models.ActionAllow
 }
 

@@ -938,7 +938,6 @@ func (h *Handlers) computeTagEffectiveStatus(tagID string) api.EffectiveStatusRe
 		res.Source = api.EffectiveSourceInfrastructure
 		return res
 	}
-
 	if gp, ok := h.polEng.GetPolicy("global_default"); ok && gp.Enabled {
 		if gp.Action == models.ActionBlock {
 			res.Action = models.ActionBlock
@@ -951,61 +950,33 @@ func (h *Handlers) computeTagEffectiveStatus(tagID string) api.EffectiveStatusRe
 			return res
 		}
 	}
-
-	pols := h.polEng.ListPolicies()
-	var activeExt *models.Policy
-	var bestTagPol *models.Policy
-
-	for _, p := range pols {
-		if !p.Enabled || p.TargetID != tagID || p.Type != models.PolicyTypeTag {
-			continue
-		}
-		if p.ID == "pol_extend_tag_"+tagID {
-			pCopy := p
-			activeExt = &pCopy
-			continue
-		}
-		if bestTagPol == nil || p.Priority > bestTagPol.Priority {
-			pCopy := p
-			bestTagPol = &pCopy
-		}
-	}
-
-	if activeExt != nil {
-		res.Action = models.ActionAllow
-		res.Source = api.EffectiveSourceTagPolicy
-		if activeExt.ExpiresAt != nil {
-			minsLeft := int(time.Until(*activeExt.ExpiresAt).Minutes())
-			if minsLeft < 0 {
-				minsLeft = 0
+	best, ok := h.polEng.GetEffectiveTagPolicy(tagID)
+	if ok {
+		if best.Action == models.ActionSchedule {
+			if len(best.GetScheduleIDs()) == 0 {
+				res.Action = models.ActionBlock
+			} else {
+				res.Action = h.schedEng.EvaluateBundle(best.GetScheduleIDs())
 			}
-			res.ActiveExtension = &api.ExtensionInfo{
-				ExpiresAt:   activeExt.ExpiresAt.UTC().Format(time.RFC3339),
-				MinutesLeft: minsLeft,
-				ReasonTag:   activeExt.ReasonTag,
-			}
-		}
-		return res
-	}
-
-	if bestTagPol != nil {
-		if bestTagPol.Action == models.ActionSchedule {
-			res.Action = h.schedEng.EvaluateBundle(bestTagPol.GetScheduleIDs())
 			res.Source = api.EffectiveSourceSchedule
 		} else {
-			res.Action = bestTagPol.Action
+			res.Action = best.Action
 			res.Source = api.EffectiveSourceTagPolicy
 		}
-	} else {
-		if gp, ok := h.polEng.GetPolicy("global_default"); ok && gp.Enabled && gp.Action == models.ActionSchedule {
-			res.Action = h.schedEng.EvaluateBundle(gp.GetScheduleIDs())
-			res.Source = api.EffectiveSourceSchedule
-		} else {
-			res.Action = models.ActionAllow
-			res.Source = api.EffectiveSourceFallback
+		if best.ReasonTag == "extend_access" && best.ExpiresAt != nil {
+			mins := int(time.Until(*best.ExpiresAt).Minutes())
+			if mins < 0 {
+				mins = 0
+			}
+			res.ActiveExtension = &api.ExtensionInfo{ExpiresAt: best.ExpiresAt.UTC().Format(time.RFC3339), MinutesLeft: mins, ReasonTag: best.ReasonTag}
 		}
+	} else if gp, ok := h.polEng.GetPolicy("global_default"); ok && gp.Enabled && gp.Action == models.ActionSchedule {
+		res.Action = h.schedEng.EvaluateBundle(gp.GetScheduleIDs())
+		res.Source = api.EffectiveSourceSchedule
+	} else {
+		res.Action = models.ActionAllow
+		res.Source = api.EffectiveSourceFallback
 	}
-
 	if res.Action == models.ActionBlock {
 		res.ExtendAvailable = true
 	}
@@ -1406,9 +1377,11 @@ func (h *Handlers) validateAndMergePolicySchedules(p *models.Policy) ([]schedule
 	}
 	schedIDs := p.GetScheduleIDs()
 	if len(schedIDs) == 0 {
-		return nil, nil
+		if p.ID == "global_default" {
+			return nil, nil
+		}
+		return nil, httpError{status: http.StatusBadRequest, msg: "schedule policy requires at least one schedule"}
 	}
-
 	var scheds []models.Schedule
 	for _, sid := range schedIDs {
 		sch, ok := h.schedEng.GetSchedule(sid)
@@ -1418,6 +1391,9 @@ func (h *Handlers) validateAndMergePolicySchedules(p *models.Policy) ([]schedule
 		scheds = append(scheds, sch)
 	}
 	_, conflicts, err := scheduleconflict.MergeSchedules(scheds)
+	if err != nil && len(conflicts) == 0 {
+		return nil, httpError{status: http.StatusBadRequest, msg: err.Error()}
+	}
 	return conflicts, err
 }
 
@@ -1462,7 +1438,11 @@ func (h *Handlers) ValidatePolicy(w http.ResponseWriter, r *http.Request) {
 		}
 		scheds = append(scheds, sch)
 	}
-	_, conflicts, _ := scheduleconflict.MergeSchedules(scheds)
+	_, conflicts, err := scheduleconflict.MergeSchedules(scheds)
+	if err != nil && len(conflicts) == 0 {
+		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+		return
+	}
 	_ = json.NewEncoder(w).Encode(api.ConflictResponse{Conflicts: toAPIConflicts(conflicts)})
 }
 
@@ -1483,11 +1463,13 @@ func (h *Handlers) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	conflicts, err := h.validateAndMergePolicySchedules(&p)
-	if err != nil && conflicts == nil {
+	if err != nil && len(conflicts) == 0 {
 		if hErr, ok := err.(httpError); ok {
 			http.Error(w, `{"error":"`+hErr.msg+`"}`, hErr.status)
 			return
 		}
+		http.Error(w, `{"error":"invalid schedule bundle"}`, http.StatusBadRequest)
+		return
 	}
 	if len(conflicts) > 0 {
 		w.Header().Set("Content-Type", "application/json")
@@ -1531,11 +1513,13 @@ func (h *Handlers) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	conflicts, err := h.validateAndMergePolicySchedules(&p)
-	if err != nil && conflicts == nil {
+	if err != nil && len(conflicts) == 0 {
 		if hErr, ok := err.(httpError); ok {
 			http.Error(w, `{"error":"`+hErr.msg+`"}`, hErr.status)
 			return
 		}
+		http.Error(w, `{"error":"invalid schedule bundle"}`, http.StatusBadRequest)
+		return
 	}
 	if len(conflicts) > 0 {
 		w.Header().Set("Content-Type", "application/json")
@@ -1582,10 +1566,36 @@ func isSupportedTimezone(tz string) bool {
 	return err == nil
 }
 
+func validScheduleDay(day string) bool {
+	switch strings.ToLower(strings.TrimSpace(day)) {
+	case "sun", "sunday", "mon", "monday", "tue", "tuesday", "wed", "wednesday", "thu", "thursday", "fri", "friday", "sat", "saturday":
+		return true
+	default:
+		return false
+	}
+}
+
 func validateScheduleRules(s *models.Schedule) error {
+	if s.Mode != models.ScheduleModeDowntime && s.Mode != models.ScheduleModeWhitelist {
+		return fmt.Errorf("invalid schedule mode %q", s.Mode)
+	}
 	for i, rule := range s.Rules {
-		if len(rule.Days) == 0 && (rule.StartDate == "" || rule.EndDate == "") {
-			return fmt.Errorf("rule %d: days must be non-empty if calendar dates are not specified", i+1)
+		if rule.Action != models.ActionAllow && rule.Action != models.ActionBlock {
+			return fmt.Errorf("rule %d: action must be allow or block", i+1)
+		}
+		hasStartDate, hasEndDate := rule.StartDate != "", rule.EndDate != ""
+		if hasStartDate != hasEndDate {
+			return fmt.Errorf("rule %d: start_date and end_date must be provided together", i+1)
+		}
+		if !hasStartDate {
+			if len(rule.Days) == 0 {
+				return fmt.Errorf("rule %d: days must be non-empty if calendar dates are not specified", i+1)
+			}
+			for _, day := range rule.Days {
+				if !validScheduleDay(day) {
+					return fmt.Errorf("rule %d: invalid day %q", i+1, day)
+				}
+			}
 		}
 		if rule.StartTime == rule.EndTime {
 			return fmt.Errorf("rule %d: start_time and end_time cannot be identical", i+1)
@@ -1596,14 +1606,17 @@ func validateScheduleRules(s *models.Schedule) error {
 		if _, err := time.Parse("15:04", rule.EndTime); err != nil {
 			return fmt.Errorf("rule %d: invalid end_time format %q", i+1, rule.EndTime)
 		}
-		if rule.StartDate != "" {
-			if _, err := time.Parse("2006-01-02", rule.StartDate); err != nil {
-				return fmt.Errorf("rule %d: invalid start_date format %q (expected YYYY-MM-DD)", i+1, rule.StartDate)
+		if hasStartDate {
+			startDate, err := time.Parse("2006-01-02", rule.StartDate)
+			if err != nil {
+				return fmt.Errorf("rule %d: invalid start_date format %q", i+1, rule.StartDate)
 			}
-		}
-		if rule.EndDate != "" {
-			if _, err := time.Parse("2006-01-02", rule.EndDate); err != nil {
-				return fmt.Errorf("rule %d: invalid end_date format %q (expected YYYY-MM-DD)", i+1, rule.EndDate)
+			endDate, err := time.Parse("2006-01-02", rule.EndDate)
+			if err != nil {
+				return fmt.Errorf("rule %d: invalid end_date format %q", i+1, rule.EndDate)
+			}
+			if endDate.Before(startDate) {
+				return fmt.Errorf("rule %d: end_date cannot be before start_date", i+1)
 			}
 		}
 	}

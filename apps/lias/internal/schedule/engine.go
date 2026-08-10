@@ -5,231 +5,247 @@
 package schedule
 
 import (
-    "context"
-    "log/slog"
-    "sort"
-    "strings"
-    "sync"
-    "time"
+	"context"
+	"log/slog"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 
-    "github.com/user/lias-dis/apps/lias/internal/scheduleconflict"
-    liasSync "github.com/user/lias-dis/apps/lias/internal/sync"
-    "github.com/user/lias-dis/shared/models"
+	"github.com/user/lias-dis/apps/lias/internal/scheduleconflict"
+	liasSync "github.com/user/lias-dis/apps/lias/internal/sync"
+	"github.com/user/lias-dis/shared/models"
 )
 
 type EffectivePolicyProvider interface {
-    GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy
+	GetEffectivePolicy(d *liasSync.LocalDevice) models.Policy
 }
 
 type Engine struct {
-    mu             sync.RWMutex
-    schedules      map[string]models.Schedule
-    mergedCache    map[string]models.Schedule
-    reverseIdx     map[string][]string
-    cache          *liasSync.Cache
-    policyProvider EffectivePolicyProvider
-    trigger        chan struct{}
-    
-    // CPU-04 Fix: Track the timer to prevent leaks
-    nextTransitionTimer *time.Timer
-    timerMu             sync.Mutex
+	mu             sync.RWMutex
+	schedules      map[string]models.Schedule
+	mergedCache    map[string]models.Schedule
+	reverseIdx     map[string][]string
+	cache          *liasSync.Cache
+	policyProvider EffectivePolicyProvider
+	trigger        chan struct{}
+
+	// CPU-04 Fix: Track the timer to prevent leaks
+	nextTransitionTimer *time.Timer
+	timerMu             sync.Mutex
 }
 
 func NewEngine(cache *liasSync.Cache, policyProvider EffectivePolicyProvider, trigger chan struct{}) *Engine {
-    return &Engine{
-        schedules:      make(map[string]models.Schedule),
-        mergedCache:    make(map[string]models.Schedule),
-        reverseIdx:     make(map[string][]string),
-        cache:          cache,
-        policyProvider: policyProvider,
-        trigger:        trigger,
-    }
+	return &Engine{
+		schedules:      make(map[string]models.Schedule),
+		mergedCache:    make(map[string]models.Schedule),
+		reverseIdx:     make(map[string][]string),
+		cache:          cache,
+		policyProvider: policyProvider,
+		trigger:        trigger,
+	}
+}
+
+func normalizeScheduleIDs(scheduleIDs []string) []string {
+	seen := make(map[string]struct{}, len(scheduleIDs))
+	out := make([]string, 0, len(scheduleIDs))
+	for _, id := range scheduleIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func bundleKey(scheduleIDs []string) string {
-    sorted := make([]string, len(scheduleIDs))
-    copy(sorted, scheduleIDs)
-    sort.Strings(sorted)
-    return strings.Join(sorted, "+")
+	return strings.Join(normalizeScheduleIDs(scheduleIDs), "+")
 }
 
 func (e *Engine) invalidateCacheForScheduleLocked(id string) {
-    if keys, ok := e.reverseIdx[id]; ok {
-        for _, k := range keys {
-            delete(e.mergedCache, k)
-        }
-        delete(e.reverseIdx, id)
-    }
+	if keys, ok := e.reverseIdx[id]; ok {
+		for _, k := range keys {
+			delete(e.mergedCache, k)
+		}
+		delete(e.reverseIdx, id)
+	}
 }
 
 func (e *Engine) UpsertSchedule(s models.Schedule) {
-    e.mu.Lock()
-    defer e.mu.Unlock()
-    e.schedules[s.ID] = s
-    e.invalidateCacheForScheduleLocked(s.ID)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.schedules[s.ID] = s
+	e.invalidateCacheForScheduleLocked(s.ID)
 }
 
 func (e *Engine) DeleteSchedule(id string) {
-    e.mu.Lock()
-    defer e.mu.Unlock()
-    delete(e.schedules, id)
-    e.invalidateCacheForScheduleLocked(id)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.schedules, id)
+	e.invalidateCacheForScheduleLocked(id)
 }
 
 func (e *Engine) GetSchedule(id string) (models.Schedule, bool) {
-    e.mu.RLock()
-    defer e.mu.RUnlock()
-    s, ok := e.schedules[id]
-    return s, ok
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	s, ok := e.schedules[id]
+	return s, ok
 }
 
 func (e *Engine) ListSchedules() []models.Schedule {
-    e.mu.RLock()
-    defer e.mu.RUnlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 
-    list := make([]models.Schedule, 0, len(e.schedules))
-    for _, s := range e.schedules {
-        list = append(list, s)
-    }
-    return list
+	list := make([]models.Schedule, 0, len(e.schedules))
+	for _, s := range e.schedules {
+		list = append(list, s)
+	}
+	return list
 }
 
 func (e *Engine) EvaluateNow(schedID string) models.Action {
-    if schedID == "" {
-        return models.ActionAllow
-    }
-    return e.EvaluateBundle([]string{schedID})
+	if schedID == "" {
+		return models.ActionAllow
+	}
+	return e.EvaluateBundle([]string{schedID})
 }
 
 func (e *Engine) EvaluateBundle(scheduleIDs []string) models.Action {
-    if len(scheduleIDs) == 0 {
-        return models.ActionAllow
-    }
+	scheduleIDs = normalizeScheduleIDs(scheduleIDs)
+	if len(scheduleIDs) == 0 {
+		return models.ActionAllow
+	}
 
-    key := bundleKey(scheduleIDs)
+	key := bundleKey(scheduleIDs)
 
-    e.mu.RLock()
-    merged, cached := e.mergedCache[key]
-    e.mu.RUnlock()
+	e.mu.RLock()
+	merged, cached := e.mergedCache[key]
+	e.mu.RUnlock()
 
-    if !cached {
-        e.mu.Lock()
-        merged, cached = e.mergedCache[key]
-        if !cached {
-            var resolved []models.Schedule
-            for _, id := range scheduleIDs {
-                s, ok := e.schedules[id]
-                if !ok {
-                    e.mu.Unlock()
-                    slog.Warn("Schedule in bundle missing, failing closed (block)", "schedule_id", id)
-                    return models.ActionBlock
-                }
-                resolved = append(resolved, s)
-            }
+	if !cached {
+		e.mu.Lock()
+		merged, cached = e.mergedCache[key]
+		if !cached {
+			var resolved []models.Schedule
+			for _, id := range scheduleIDs {
+				s, ok := e.schedules[id]
+				if !ok {
+					e.mu.Unlock()
+					slog.Warn("Schedule in bundle missing, failing closed (block)", "schedule_id", id)
+					return models.ActionBlock
+				}
+				resolved = append(resolved, s)
+			}
 
-            comp, conflicts, err := scheduleconflict.MergeSchedules(resolved)
-            if err != nil || len(conflicts) > 0 {
-                e.mu.Unlock()
-                slog.Error("Schedule bundle contains conflicts, failing closed (block)", "schedule_ids", scheduleIDs, "conflicts", len(conflicts))
-                return models.ActionBlock
-            }
+			comp, conflicts, err := scheduleconflict.MergeSchedules(resolved)
+			if err != nil || len(conflicts) > 0 {
+				e.mu.Unlock()
+				slog.Error("Schedule bundle contains conflicts, failing closed (block)", "schedule_ids", scheduleIDs, "conflicts", len(conflicts))
+				return models.ActionBlock
+			}
 
-            merged = comp
-            e.mergedCache[key] = merged
-            for _, id := range scheduleIDs {
-                e.reverseIdx[id] = append(e.reverseIdx[id], key)
-            }
-        }
-        e.mu.Unlock()
-    }
+			merged = comp
+			e.mergedCache[key] = merged
+			for _, id := range scheduleIDs {
+				e.reverseIdx[id] = append(e.reverseIdx[id], key)
+			}
+		}
+		e.mu.Unlock()
+	}
 
-    action, err := Evaluate(merged, time.Now())
-    if err != nil {
-        slog.Error("Schedule bundle evaluation error, failing closed (block)", "key", key, "error", err)
-        return models.ActionBlock
-    }
-    return action
+	action, err := Evaluate(merged, time.Now())
+	if err != nil {
+		slog.Error("Schedule bundle evaluation error, failing closed (block)", "key", key, "error", err)
+		return models.ActionBlock
+	}
+	return action
 }
 
 func (e *Engine) Run(ctx context.Context) {
-    ticker := time.NewTicker(1 * time.Minute)
-    defer ticker.Stop()
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
 
-    e.updateNextStateChanges()
+	e.updateNextStateChanges()
 
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case <-ticker.C:
-            e.updateNextStateChanges()
-        }
-    }
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.updateNextStateChanges()
+		}
+	}
 }
 
 func (e *Engine) updateNextStateChanges() {
-    devs := e.cache.List()
-    var minNextChange *time.Time
+	devs := e.cache.List()
+	var minNextChange *time.Time
 
-    for _, d := range devs {
-        if e.policyProvider != nil {
-            devCopy := d
-            pol := e.policyProvider.GetEffectivePolicy(&devCopy)
-            
-            if pol.Action == models.ActionSchedule {
-                schedIDs := pol.GetScheduleIDs()
-                if len(schedIDs) > 0 {
-                    key := bundleKey(schedIDs)
-                    e.mu.RLock()
-                    merged, ok := e.mergedCache[key]
-                    e.mu.RUnlock()
+	for _, d := range devs {
+		if e.policyProvider != nil {
+			devCopy := d
+			pol := e.policyProvider.GetEffectivePolicy(&devCopy)
 
-                    if !ok {
-                        _ = e.EvaluateBundle(schedIDs)
-                        e.mu.RLock()
-                        merged, ok = e.mergedCache[key]
-                        e.mu.RUnlock()
-                    }
+			if pol.Action == models.ActionSchedule {
+				schedIDs := pol.GetScheduleIDs()
+				if len(schedIDs) > 0 {
+					key := bundleKey(schedIDs)
+					e.mu.RLock()
+					merged, ok := e.mergedCache[key]
+					e.mu.RUnlock()
 
-                    if ok {
-                        nextChange, err := NextStateChange(merged, time.Now())
-                        if err == nil {
-                            e.cache.SetNextStateChange(d.PDID, &nextChange)
-                            
-                            if minNextChange == nil || nextChange.Before(*minNextChange) {
-                                n := nextChange
-                                minNextChange = &n
-                            }
-                        }
-                    }
-                } else {
-                    e.cache.SetNextStateChange(d.PDID, nil)
-                }
-            } else {
-                e.cache.SetNextStateChange(d.PDID, nil)
-            }
-        }
-    }
+					if !ok {
+						_ = e.EvaluateBundle(schedIDs)
+						e.mu.RLock()
+						merged, ok = e.mergedCache[key]
+						e.mu.RUnlock()
+					}
 
-    // CPU-04 Fix: Stop the previous timer before creating a new one to prevent leaks
-    e.timerMu.Lock()
-    if e.nextTransitionTimer != nil {
-        e.nextTransitionTimer.Stop()
-    }
-    
-    if minNextChange != nil {
-        duration := time.Until(*minNextChange)
-        if duration < 0 {
-            duration = 0
-        }
-        
-        e.nextTransitionTimer = time.AfterFunc(duration, func() {
-            select {
-            case e.trigger <- struct{}{}:
-                slog.Info("Triggered immediate nftables sync for schedule transition", "transition_time", minNextChange)
-            default:
-            }
-        })
-    }
-    e.timerMu.Unlock()
+					if ok {
+						nextChange, err := NextStateChange(merged, time.Now())
+						if err == nil {
+							e.cache.SetNextStateChange(d.PDID, &nextChange)
+
+							if minNextChange == nil || nextChange.Before(*minNextChange) {
+								n := nextChange
+								minNextChange = &n
+							}
+						}
+					}
+				} else {
+					e.cache.SetNextStateChange(d.PDID, nil)
+				}
+			} else {
+				e.cache.SetNextStateChange(d.PDID, nil)
+			}
+		}
+	}
+
+	// CPU-04 Fix: Stop the previous timer before creating a new one to prevent leaks
+	e.timerMu.Lock()
+	if e.nextTransitionTimer != nil {
+		e.nextTransitionTimer.Stop()
+	}
+
+	if minNextChange != nil {
+		duration := time.Until(*minNextChange)
+		if duration < 0 {
+			duration = 0
+		}
+
+		e.nextTransitionTimer = time.AfterFunc(duration, func() {
+			select {
+			case e.trigger <- struct{}{}:
+				slog.Info("Triggered immediate nftables sync for schedule transition", "transition_time", minNextChange)
+			default:
+			}
+		})
+	}
+	e.timerMu.Unlock()
 }

@@ -5,225 +5,208 @@
 package schedule
 
 import (
-    "log/slog"
-    "sort"
-    "strings"
-    "time"
+	"log/slog"
+	"sort"
+	"strings"
+	"time"
 
-    "github.com/user/lias-dis/shared/models"
+	"github.com/user/lias-dis/shared/models"
 )
 
 var dayMap = map[string]time.Weekday{
-    "sun": time.Sunday,
-    "mon": time.Monday,
-    "tue": time.Tuesday,
-    "wed": time.Wednesday,
-    "thu": time.Thursday,
-    "fri": time.Friday,
-    "sat": time.Saturday,
+	"sun": time.Sunday,
+	"mon": time.Monday,
+	"tue": time.Tuesday,
+	"wed": time.Wednesday,
+	"thu": time.Thursday,
+	"fri": time.Friday,
+	"sat": time.Saturday,
 }
 
 // Evaluate determines the effective action for a schedule at a specific time.
 // Handles DST spring-forward (skipped hour) and fall-back (repeated hour).
 func Evaluate(s models.Schedule, now time.Time) (models.Action, error) {
-    loc, err := time.LoadLocation(s.Timezone)
-    if err != nil {
-        loc = time.UTC
-    }
-    now = now.In(loc)
-    
-    var bestMatch *models.ScheduleRule
-    var bestDuration time.Duration = -1
+	loc, err := time.LoadLocation(s.Timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	now = now.In(loc)
 
-    currentWeekday := now.Weekday()
-    prevWeekday := (now.Weekday() + 6) % 7
+	var bestMatch *models.ScheduleRule
+	var bestDuration time.Duration = -1
 
-    for _, rule := range s.Rules {
-        // LIAS-SCH-09 Fix: Calendar Date Scheduling
-        if rule.StartDate != "" && rule.EndDate != "" {
-            startDt, err1 := time.ParseInLocation("2006-01-02", rule.StartDate, loc)
-            endDt, err2 := time.ParseInLocation("2006-01-02", rule.EndDate, loc)
-            if err1 == nil && err2 == nil {
-                // Add 1 day to EndDate to make it inclusive of the whole day
-                endDt = endDt.AddDate(0, 0, 1)
-                if now.Before(startDt) || now.After(endDt) {
-                    continue
-                }
-                
-                // Match time within the date range
-                startTime, _ := time.Parse("15:04", rule.StartTime)
-                endTime, _ := time.Parse("15:04", rule.EndTime)
-                
-                year, month, day := now.Date()
-                start := time.Date(year, month, day, startTime.Hour(), startTime.Minute(), 0, 0, loc)
-                end := time.Date(year, month, day, endTime.Hour(), endTime.Minute(), 0, 0, loc)
+	currentWeekday := now.Weekday()
+	prevWeekday := (now.Weekday() + 6) % 7
 
-                if start.Equal(end) {
-                    continue // Zero duration
-                }
+	for _, rule := range s.Rules {
+		// Calendar-date rules are evaluated by their occurrence start date.
+		// For overnight windows we must also consider yesterday's occurrence.
+		if rule.StartDate != "" && rule.EndDate != "" {
+			startDate, err1 := time.ParseInLocation("2006-01-02", rule.StartDate, loc)
+			endDate, err2 := time.ParseInLocation("2006-01-02", rule.EndDate, loc)
+			startTime, err3 := time.Parse("15:04", rule.StartTime)
+			endTime, err4 := time.Parse("15:04", rule.EndTime)
+			if err1 == nil && err2 == nil && err3 == nil && err4 == nil {
+				today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+				for _, baseDate := range []time.Time{today, today.AddDate(0, 0, -1)} {
+					if baseDate.Before(startDate) || baseDate.After(endDate) {
+						continue
+					}
+					start := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), startTime.Hour(), startTime.Minute(), 0, 0, loc)
+					end := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), endTime.Hour(), endTime.Minute(), 0, 0, loc)
+					if !end.After(start) {
+						end = end.AddDate(0, 0, 1)
+					}
+					if (now.Equal(start) || now.After(start)) && now.Before(end) {
+						windowDuration := end.Sub(start)
+						if bestDuration == -1 || windowDuration < bestDuration {
+							bestDuration = windowDuration
+							r := rule
+							bestMatch = &r
+						}
+					}
+				}
+			}
+			continue
+		}
 
-                isMatch := false
-                var windowDuration time.Duration
+		// Weekly Scheduling
+		matchesCurrentDay := false
+		matchesPrevDay := false
 
-                if end.After(start) {
-                    isMatch = (now.Equal(start) || now.After(start)) && now.Before(end)
-                    windowDuration = end.Sub(start)
-                } else {
-                    // Overnight
-                    windowDuration = end.Add(24 * time.Hour).Sub(start)
-                    if (now.Equal(start) || now.After(start)) && now.Before(end.AddDate(0, 0, 1)) {
-                        isMatch = true
-                    }
-                }
+		for _, dayStr := range rule.Days {
+			dLower := strings.ToLower(strings.TrimSpace(dayStr))
+			if day, ok := dayMap[dLower]; ok {
+				if day == currentWeekday {
+					matchesCurrentDay = true
+				}
+				if day == prevWeekday {
+					matchesPrevDay = true
+				}
+			}
+		}
 
-                if isMatch {
-                    if bestDuration == -1 || windowDuration < bestDuration {
-                        bestDuration = windowDuration
-                        r := rule
-                        bestMatch = &r
-                    }
-                }
-            }
-            continue // Skip weekly logic if dates were specified
-        }
+		if !matchesCurrentDay && !matchesPrevDay {
+			continue
+		}
 
-        // Weekly Scheduling
-        matchesCurrentDay := false
-        matchesPrevDay := false
+		startTime, err := time.Parse("15:04", rule.StartTime)
+		if err != nil {
+			continue
+		}
+		endTime, err := time.Parse("15:04", rule.EndTime)
+		if err != nil {
+			continue
+		}
 
-        for _, dayStr := range rule.Days {
-            dLower := strings.ToLower(strings.TrimSpace(dayStr))
-            if day, ok := dayMap[dLower]; ok {
-                if day == currentWeekday {
-                    matchesCurrentDay = true
-                }
-                if day == prevWeekday {
-                    matchesPrevDay = true
-                }
-            }
-        }
+		year, month, day := now.Date()
+		start := time.Date(year, month, day, startTime.Hour(), startTime.Minute(), 0, 0, loc)
+		end := time.Date(year, month, day, endTime.Hour(), endTime.Minute(), 0, 0, loc)
 
-        if !matchesCurrentDay && !matchesPrevDay {
-            continue
-        }
+		if rule.StartTime != rule.EndTime && start.Equal(end) {
+			slog.Warn("Schedule rule window collapsed to zero duration due to DST transition",
+				"schedule_id", s.ID, "rule_start", rule.StartTime, "rule_end", rule.EndTime)
+			continue
+		}
 
-        startTime, err := time.Parse("15:04", rule.StartTime)
-        if err != nil {
-            continue
-        }
-        endTime, err := time.Parse("15:04", rule.EndTime)
-        if err != nil {
-            continue
-        }
+		isMatch := false
+		var windowDuration time.Duration
 
-        year, month, day := now.Date()
-        start := time.Date(year, month, day, startTime.Hour(), startTime.Minute(), 0, 0, loc)
-        end := time.Date(year, month, day, endTime.Hour(), endTime.Minute(), 0, 0, loc)
+		if end.After(start) {
+			if matchesCurrentDay {
+				isMatch = (now.Equal(start) || now.After(start)) && now.Before(end)
+			}
+			windowDuration = end.Sub(start)
+		} else {
+			windowDuration = end.Add(24 * time.Hour).Sub(start)
 
-        if rule.StartTime != rule.EndTime && start.Equal(end) {
-            slog.Warn("Schedule rule window collapsed to zero duration due to DST transition",
-                "schedule_id", s.ID, "rule_start", rule.StartTime, "rule_end", rule.EndTime)
-            continue
-        }
+			if matchesPrevDay {
+				startOvernight := start.AddDate(0, 0, -1)
+				if (now.Equal(startOvernight) || now.After(startOvernight)) && now.Before(end) {
+					isMatch = true
+				}
+			}
 
-        isMatch := false
-        var windowDuration time.Duration
+			if matchesCurrentDay {
+				if (now.Equal(start) || now.After(start)) && now.Before(end.AddDate(0, 0, 1)) {
+					isMatch = true
+				}
+			}
+		}
 
-        if end.After(start) {
-            if matchesCurrentDay {
-                isMatch = (now.Equal(start) || now.After(start)) && now.Before(end)
-            }
-            windowDuration = end.Sub(start)
-        } else {
-            windowDuration = end.Add(24 * time.Hour).Sub(start)
+		if isMatch {
+			if bestDuration == -1 || windowDuration < bestDuration {
+				bestDuration = windowDuration
+				r := rule
+				bestMatch = &r
+			}
+		}
+	}
 
-            if matchesPrevDay {
-                startOvernight := start.AddDate(0, 0, -1)
-                if (now.Equal(startOvernight) || now.After(startOvernight)) && now.Before(end) {
-                    isMatch = true
-                }
-            }
+	if bestMatch != nil {
+		return bestMatch.Action, nil
+	}
 
-            if matchesCurrentDay {
-                if (now.Equal(start) || now.After(start)) && now.Before(end.AddDate(0, 0, 1)) {
-                    isMatch = true
-                }
-            }
-        }
+	if s.Mode == models.ScheduleModeWhitelist {
+		return models.ActionBlock, nil
+	}
 
-        if isMatch {
-            if bestDuration == -1 || windowDuration < bestDuration {
-                bestDuration = windowDuration
-                r := rule
-                bestMatch = &r
-            }
-        }
-    }
-
-    if bestMatch != nil {
-        return bestMatch.Action, nil
-    }
-
-    if s.Mode == models.ScheduleModeWhitelist {
-        return models.ActionBlock, nil
-    }
-
-    return models.ActionAllow, nil
+	return models.ActionAllow, nil
 }
 
 // NextStateChange calculates the exact next timestamp when the schedule action or rule context will transition.
 func NextStateChange(s models.Schedule, now time.Time) (time.Time, error) {
-    loc, err := time.LoadLocation(s.Timezone)
-    if err != nil {
-        loc = time.UTC
-    }
-    now = now.In(loc)
+	loc, err := time.LoadLocation(s.Timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	now = now.In(loc)
 
-    var transitionPoints []time.Time
-    year, month, day := now.Date()
+	var transitionPoints []time.Time
+	year, month, day := now.Date()
 
-    for i := 0; i < 8; i++ {
-        baseDate := time.Date(year, month, day+i, 0, 0, 0, 0, loc)
+	for i := 0; i < 8; i++ {
+		baseDate := time.Date(year, month, day+i, 0, 0, 0, 0, loc)
 
-        for _, rule := range s.Rules {
-            // LIAS-SCH-09 Fix: Check calendar date transitions
-            if rule.StartDate != "" && rule.EndDate != "" {
-                startDt, err1 := time.ParseInLocation("2006-01-02", rule.StartDate, loc)
-                endDt, err2 := time.ParseInLocation("2006-01-02", rule.EndDate, loc)
-                if err1 == nil && err2 == nil {
-                    endDt = endDt.AddDate(0, 0, 1) // Include full end date
-                    if baseDate.Before(startDt) || baseDate.After(endDt) {
-                        continue
-                    }
-                }
-            }
+		for _, rule := range s.Rules {
+			// LIAS-SCH-09 Fix: Check calendar date transitions
+			if rule.StartDate != "" && rule.EndDate != "" {
+				startDt, err1 := time.ParseInLocation("2006-01-02", rule.StartDate, loc)
+				endDt, err2 := time.ParseInLocation("2006-01-02", rule.EndDate, loc)
+				if err1 == nil && err2 == nil {
+					endDt = endDt.AddDate(0, 0, 1) // Include full end date
+					if baseDate.Before(startDt) || baseDate.After(endDt) {
+						continue
+					}
+				}
+			}
 
-            if startT, err := time.Parse("15:04", rule.StartTime); err == nil {
-                t := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), startT.Hour(), startT.Minute(), 0, 0, loc)
-                if t.After(now) {
-                    transitionPoints = append(transitionPoints, t)
-                }
-            }
+			if startT, err := time.Parse("15:04", rule.StartTime); err == nil {
+				t := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), startT.Hour(), startT.Minute(), 0, 0, loc)
+				if t.After(now) {
+					transitionPoints = append(transitionPoints, t)
+				}
+			}
 
-            if endT, err := time.Parse("15:04", rule.EndTime); err == nil {
-                t := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), endT.Hour(), endT.Minute(), 0, 0, loc)
-                if t.After(now) {
-                    transitionPoints = append(transitionPoints, t)
-                }
-            }
-        }
-    }
+			if endT, err := time.Parse("15:04", rule.EndTime); err == nil {
+				t := time.Date(baseDate.Year(), baseDate.Month(), baseDate.Day(), endT.Hour(), endT.Minute(), 0, 0, loc)
+				if t.After(now) {
+					transitionPoints = append(transitionPoints, t)
+				}
+			}
+		}
+	}
 
-    if len(transitionPoints) == 0 {
-        return now.Add(24 * time.Hour), nil
-    }
+	if len(transitionPoints) == 0 {
+		return now.Add(24 * time.Hour), nil
+	}
 
-    sort.Slice(transitionPoints, func(i, j int) bool {
-        return transitionPoints[i].Before(transitionPoints[j])
-    })
+	sort.Slice(transitionPoints, func(i, j int) bool {
+		return transitionPoints[i].Before(transitionPoints[j])
+	})
 
-    // MATH-07 Fix: Return the very next transition point.
-    // Nftables syncs are cheap and idempotent, so triggering on rule boundaries
-    // (even if the action doesn't change) is safe and prevents missed evaluations.
-    return transitionPoints[0], nil
+	// MATH-07 Fix: Return the very next transition point.
+	// Nftables syncs are cheap and idempotent, so triggering on rule boundaries
+	// (even if the action doesn't change) is safe and prevents missed evaluations.
+	return transitionPoints[0], nil
 }
