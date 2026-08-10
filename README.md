@@ -21,7 +21,7 @@ DIS continuously observes the network using multiple passive and active discover
 - mDNS (Avahi)
 - SSDP / UPnP
 - NetBIOS
-- TLS fingerprinting
+- TLS server-metadata observation (not a device fingerprint)
 - Nmap enrichment (optional)
 
 DIS correlates all observations into a persistent device database and exposes both:
@@ -57,11 +57,24 @@ LIAS never modifies existing firewall tables, routing, NAT, VPN, or `sing-box` r
 
 ## Deterministic Device Identity (PDID)
 
-Provides persistent hardware identities that survive:
+Provides persistent device identities that survive:
 
 - service restarts
 - IP address changes
-- randomized MAC transitions (when validated)
+- randomized MAC transitions only when continuity is authenticated or otherwise
+  explicitly confirmed
+
+Passive SSDP, TLS, Nmap, DHCP, hostname, or traffic evidence can raise or lower
+a reversible correlation score, but cannot mathematically prove that two private
+MAC addresses are the same physical device. DIS does not use TLS certificate or
+negotiated-cipher metadata as automatic PDID merge evidence.
+
+The parser-fuzz, identity-matrix, event-storm, restart-recovery, benchmark, and
+72-hour soak procedures are documented in
+[`docs/DIS_VALIDATION_AND_RESOURCE_BUDGETS.md`](docs/DIS_VALIDATION_AND_RESOURCE_BUDGETS.md).
+The stable DIS–LIAS v1 wire contract, capability negotiation, and additive
+compatibility rules are documented in
+[`docs/API_COMPATIBILITY.md`](docs/API_COMPATIBILITY.md).
 
 ---
 
@@ -213,7 +226,10 @@ discovery:
 
   dhcp:
     enabled: true
-    type: "router"
+    # dnsmasq/openwrt/pihole use the five-field dnsmasq lease format.
+    # Use "kea" only for a Kea memfile CSV with its header row.
+    type: "dnsmasq"
+    poll_interval: "2m"
 
     lease_file: "/tmp/dhcp.leases"
 
@@ -221,6 +237,11 @@ discovery:
 
     ssh_host: ""
     ssh_user: "root"
+    # When using OpenWrt over SSH, AP clients come from
+    # `iw dev <iface> station dump`. Only NUD_REACHABLE neighbour rows
+    # are accepted as current presence evidence.
+    openwrt_ap_enabled: false
+    neighbor_table_enabled: false
 
   enrichment:
     avahi_enabled: true
@@ -230,6 +251,19 @@ discovery:
     nmap_enabled: true
     unknown_device_scan: true
     validation_interval: "24h"
+    # Bounded small-LAN execution. At most worker_count devices are enriched;
+    # excess requests are coalesced into a fixed queue.
+    worker_count: 2
+    queue_size: 128
+    primary_timeout: "5s"
+    fallback_timeout: "20s"
+    # Nmap defaults to unprivileged TCP connect/service-light scanning. OS
+    # detection is opt-in because it is privileged and materially more costly.
+    nmap_host_timeout: "10s"
+    nmap_process_timeout: "15s"
+    nmap_max_rate: 50
+    nmap_max_output_bytes: 1048576
+    nmap_os_detection: false
 
 storage:
   path: "/var/lib/dis/state.db"
@@ -258,6 +292,8 @@ logging:
 
 http:
   listen: ":8081"
+  auth_token: ""
+  secure_cookies: false  # Set true when the dashboard is served over HTTPS.
 
 dis:
   url: "http://127.0.0.1:8080"
@@ -934,5 +970,3 @@ or
 BLOCK
 ```
 based on the active time window.
-
-

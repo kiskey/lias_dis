@@ -1,14 +1,13 @@
-// Package discovery implements the core observation, enrichment, and
-// correlation logic for the Discovery Intelligence Service.
-//
-// File:    apps/discovery-service/internal/discovery/dhcp_provider.go
-// Version: 1.9 (Replaced Bridge FDB with ARP Table for L3 accuracy)
+// Package discovery implements DHCP lease and OpenWrt observation providers.
 package discovery
 
 import (
     "bufio"
     "bytes"
     "context"
+	"crypto/sha256"
+	"encoding/csv"
+	"encoding/hex"
     "fmt"
     "io"
     "log/slog"
@@ -16,11 +15,17 @@ import (
     "net/http"
     "os"
     "os/exec"
+	"sort"
     "strconv"
     "strings"
     "time"
 
     "github.com/user/lias-dis/apps/discovery-service/internal/config"
+)
+
+const (
+	maxDHCPPayloadBytes = 4 << 20
+	maxDHCPRecords      = 4096
 )
 
 type DHCPProvider struct {
@@ -30,20 +35,22 @@ type DHCPProvider struct {
     events chan Observation
     done   chan struct{}
     client *http.Client
+	seenLeases map[string]string
 }
 
 func NewDHCPProvider(cfg config.DHCPConfig) *DHCPProvider {
     return &DHCPProvider{
-        cfg:    cfg,
-        events: make(chan Observation, 256),
-        done:   make(chan struct{}),
-        client: &http.Client{Timeout: 10 * time.Second},
+		cfg: cfg, events: make(chan Observation, 256), done: make(chan struct{}),
+		client: &http.Client{Timeout: 10 * time.Second}, seenLeases: make(map[string]string),
     }
 }
 
 func (p *DHCPProvider) Name() string { return "dhcp" }
 
 func (p *DHCPProvider) Start(ctx context.Context) error {
+	if _, err := normalizeLeaseType(p.cfg.Type); err != nil {
+		return err
+	}
     p.ctx, p.cancel = context.WithCancel(ctx)
     go p.run()
     return nil
@@ -57,18 +64,17 @@ func (p *DHCPProvider) Stop() error {
     return nil
 }
 
-func (p *DHCPProvider) Events() <-chan Observation {
-    return p.events
-}
+func (p *DHCPProvider) Events() <-chan Observation { return p.events }
 
 func (p *DHCPProvider) run() {
     defer close(p.done)
-    
-    ticker := time.NewTicker(60 * time.Second)
+	interval := p.cfg.PollInterval
+	if interval <= 0 {
+		interval = 2 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
     defer ticker.Stop()
-    
     p.poll()
-    
     for {
         select {
         case <-p.ctx.Done():
@@ -80,266 +86,343 @@ func (p *DHCPProvider) run() {
 }
 
 func (p *DHCPProvider) poll() {
-    var reader io.Reader
-    var err error
+	payload, err := p.fetchPayload()
+	if err != nil {
+		slog.Debug("DHCP/OpenWrt poll failed", "error", err)
+		return
+	}
+	leaseData, apLines, neighLines, err := splitDHCPPayload(payload)
+	if err != nil {
+		slog.Warn("Rejected malformed DHCP/OpenWrt payload", "error", err)
+		return
+	}
+	leaseType, _ := normalizeLeaseType(p.cfg.Type)
+	leases, err := parseLeasePayload(leaseType, leaseData, time.Now())
+	if err != nil {
+		slog.Warn("Rejected malformed DHCP lease payload", "type", leaseType, "error", err)
+		return
+	}
+	p.emitChangedLeases(leases)
+	for _, line := range apLines {
+		if obs, ok := parseOpenWrtStationLine(line); ok {
+			p.emit(obs)
+		}
+	}
+	for _, line := range neighLines {
+		if obs, ok := parseOpenWrtNeighborLine(line); ok {
+			p.emit(obs)
+		}
+	}
+}
 
+func (p *DHCPProvider) fetchPayload() ([]byte, error) {
     if p.cfg.SSHHost != "" {
         user := p.cfg.SSHUser
         if user == "" {
             user = "root"
         }
-        
-        target := fmt.Sprintf("%s@%s", user, p.cfg.SSHHost)
-        
         leaseFile := p.cfg.LeaseFile
         if leaseFile == "" {
             leaseFile = "/tmp/dhcp.leases"
         }
-        
-        // V1.9 ADD: Build compound command to fetch Leases, Wi-Fi APs, and ARP Table
-        cmdStr := "cat " + leaseFile
+		var script strings.Builder
+		script.WriteString("cat -- ")
+		script.WriteString(shellQuote(leaseFile))
         if p.cfg.OpenWrtAPEnabled {
-            cmdStr += "; echo '===AP_ASSOC==='; iw dev | grep -E 'Interface|Station' | awk '/Interface/{iface=$2} /Station/{print iface, $2}'"
+			script.WriteString(`; printf '\n===AP_ASSOC===\n'; for iface in $(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'); do iw dev "$iface" station dump 2>/dev/null | awk -v iface="$iface" '$1=="Station"{print iface, $2}'; done`)
         }
-        if p.cfg.ArpTableEnabled {
-            // ip neigh show pulls the kernel ARP cache.
-            // We grep for lladdr to ensure we only get resolved MACs.
-            // awk prints IP (field 1) and MAC (field 5).
-            // Format: 192.168.1.50 aa:bb:cc:dd:ee:ff
-            cmdStr += "; echo '===ARP_TABLE==='; ip neigh show | grep lladdr | awk '{print $1, $5}'"
+		if p.cfg.NeighborTableEnabled || p.cfg.ArpTableEnabled {
+			script.WriteString(`; printf '\n===NEIGH_REACHABLE===\n'; ip -o neigh show nud reachable 2>/dev/null | awk '$0 ~ /lladdr/ {for(i=1;i<=NF;i++) if($i=="lladdr") {print $1, $(i+1), "REACHABLE"}}'`)
         }
-
-        cmd := exec.CommandContext(p.ctx, "ssh", 
-            "-o", "StrictHostKeyChecking=accept-new", 
-            "-o", "UserKnownHostsFile=/etc/dis/known_hosts",
-            "-o", "ConnectTimeout=5", 
-            target, cmdStr)
-        
-        var stdout bytes.Buffer
-        cmd.Stdout = &stdout
-        err = cmd.Run()
+		target := fmt.Sprintf("%s@%s", user, p.cfg.SSHHost)
+		sshArgs := []string{"-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+			"-o", "UserKnownHostsFile=/etc/dis/known_hosts", "-o", "ConnectTimeout=5"}
+		if err := os.MkdirAll("/run/dis", 0o700); err == nil {
+			sshArgs = append(sshArgs, "-o", "ControlMaster=auto", "-o", "ControlPersist=5m", "-o", "ControlPath=/run/dis/ssh-%C")
+		}
+		sshArgs = append(sshArgs, target, "sh", "-c", shellQuote(script.String()))
+		cmd := exec.CommandContext(p.ctx, "ssh", sshArgs...)
+		output, err := cmd.Output()
         if err != nil {
-            slog.Debug("Failed to fetch DHCP/ARP data via SSH", "host", p.cfg.SSHHost, "error", err)
-            return
+			return nil, fmt.Errorf("SSH collection: %w", err)
         }
-        reader = &stdout
-        
-    } else if p.cfg.LeaseURL != "" {
-        req, reqErr := http.NewRequestWithContext(p.ctx, "GET", p.cfg.LeaseURL, nil)
-        if reqErr != nil {
-            return
+		if len(output) > maxDHCPPayloadBytes {
+			return nil, fmt.Errorf("SSH payload exceeds %d bytes", maxDHCPPayloadBytes)
+		}
+		return output, nil
         }
         
-        resp, httpErr := p.client.Do(req)
-        if httpErr != nil {
-            return
+	if p.cfg.LeaseURL != "" {
+		req, err := http.NewRequestWithContext(p.ctx, http.MethodGet, p.cfg.LeaseURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := p.client.Do(req)
+		if err != nil {
+			return nil, err
         }
         defer resp.Body.Close()
-        
         if resp.StatusCode != http.StatusOK {
-            return
+			return nil, fmt.Errorf("lease endpoint status %d", resp.StatusCode)
+		}
+		return readBounded(resp.Body, maxDHCPPayloadBytes)
         }
         
-        reader = resp.Body
-        
-    } else if p.cfg.LeaseFile != "" {
-        file, fileErr := os.Open(p.cfg.LeaseFile)
-        if fileErr != nil {
-            return
+	if p.cfg.LeaseFile == "" {
+		return nil, fmt.Errorf("no DHCP lease source configured")
+	}
+	file, err := os.Open(p.cfg.LeaseFile)
+	if err != nil {
+		return nil, err
         }
         defer file.Close()
-        reader = file
-    } else {
-        return
+	return readBounded(file, maxDHCPPayloadBytes)
+}
+
+func readBounded(reader io.Reader, limit int64) ([]byte, error) {
+	limited := io.LimitReader(reader, limit+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("payload exceeds %d bytes", limit)
+	}
+	return data, nil
     }
 
-    scanner := bufio.NewScanner(reader)
-    currentSection := "dhcp"
+func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'" }
     
+func splitDHCPPayload(payload []byte) ([]byte, []string, []string, error) {
+	var lease bytes.Buffer
+	var apLines, neighLines []string
+	section := "lease"
+	scanner := bufio.NewScanner(bytes.NewReader(payload))
+	scanner.Buffer(make([]byte, 4096), 256<<10)
     for scanner.Scan() {
-        line := scanner.Text()
-        
-        if line == "===AP_ASSOC===" {
-            currentSection = "ap"
+		line := strings.TrimSpace(scanner.Text())
+		switch line {
+		case "===AP_ASSOC===":
+			section = "ap"
+            continue
+		case "===NEIGH_REACHABLE===", "===ARP_TABLE===":
+			section = "neigh"
             continue
         }
-        if line == "===ARP_TABLE===" {
-            currentSection = "arp"
-            continue
-        }
-
-        if currentSection == "dhcp" {
-            p.parseDHCPLine(line)
-        } else if currentSection == "ap" {
-            p.parseAPLine(line)
-        } else if currentSection == "arp" {
-            p.parseARPLine(line)
+		switch section {
+		case "lease":
+			lease.WriteString(scanner.Text())
+			lease.WriteByte('\n')
+		case "ap":
+			if line != "" {
+				if len(apLines) >= maxDHCPRecords {
+					return nil, nil, nil, fmt.Errorf("AP station count exceeds limit")
+				}
+				apLines = append(apLines, line)
+			}
+		case "neigh":
+			if line != "" {
+				if len(neighLines) >= maxDHCPRecords {
+					return nil, nil, nil, fmt.Errorf("neighbour count exceeds limit")
+				}
+				neighLines = append(neighLines, line)
         }
     }
 }
+	if err := scanner.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	return lease.Bytes(), apLines, neighLines, nil
+}
 
-func (p *DHCPProvider) parseDHCPLine(line string) {
-    parts := strings.Fields(line)
-    if len(parts) < 4 {
-        return
+func normalizeLeaseType(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "router", "openwrt", "pihole", "dnsmasq":
+		return "dnsmasq", nil
+	case "kea":
+		return "kea", nil
+	default:
+		return "", fmt.Errorf("unsupported DHCP lease type %q", value)
+	}
     }
     
-    mac, err := net.ParseMAC(parts[1])
-    if err != nil {
-        return
+func parseLeasePayload(leaseType string, data []byte, now time.Time) ([]Observation, error) {
+	switch leaseType {
+	case "dnsmasq":
+		return parseDNSMasqLeases(data, now)
+	case "kea":
+		return parseKeaLeases(data, now)
+	default:
+		return nil, fmt.Errorf("unsupported DHCP lease type %q", leaseType)
+	}
     }
     
+func parseDNSMasqLeases(data []byte, now time.Time) ([]Observation, error) {
+	var result []Observation
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 4096), 256<<10)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "duid ") {
+			continue
+		}
+		parts := strings.Fields(line)
+		// dnsmasq IPv4 lease format is exactly:
+		// expiry, hardware address, IPv4 address, hostname, client-id.
+		if len(parts) != 5 {
+			continue
+		}
+		expires, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil || (expires != 0 && expires <= now.Unix()) {
+			continue
+		}
+		mac, err := net.ParseMAC(parts[1])
     ip := net.ParseIP(parts[2])
-    if ip == nil {
-        return
+		if err != nil || len(mac) != 6 || ip == nil || ip.To4() == nil {
+			continue
     }
-    
     hostname := parts[3]
     if hostname == "*" {
         hostname = ""
     }
-
-    obs := Observation{
-        Source:     p.Name(),
-        Group:      GroupB,
-        MAC:        mac,
-        IP:         ip,
-        Hostname:   hostname,
-        Online:     true,
-        Confidence: 0.50,
-        Timestamp:  time.Now(),
-        Raw:        make(map[string]interface{}),
+		raw := map[string]interface{}{"lease_format": "dnsmasq"}
+		if expires != 0 {
+			raw["lease_expires_at"] = time.Unix(expires, 0).UTC().Format(time.RFC3339)
     }
-
-    if len(parts) > 5 {
-        opt55 := parts[5]
-        obs.Raw["dhcp_option_55"] = opt55
-        osGuess := fingerprintOSFromDHCP(opt55)
-        if osGuess != "" {
-            obs.Raw["dhcp_os"] = osGuess
-            obs.Confidence = 0.70
+		if parts[4] != "*" {
+			raw["dhcp_client_id_hash"] = hashCredential(parts[4])
         }
-    } else if len(parts) > 4 {
-        obs.Raw["client_id"] = parts[4]
+		result = append(result, Observation{Source: "dhcp", Group: GroupB, MAC: mac, IP: ip,
+			Hostname: hostname, Online: false, Confidence: 0.60, Timestamp: now, Raw: raw})
+		if len(result) > maxDHCPRecords {
+			return nil, fmt.Errorf("dnsmasq active lease count exceeds limit")
     }
-    
-    select {
-    case p.events <- obs:
-    default:
-        slog.Warn("DHCP observation channel full, dropping event")
     }
+	return result, scanner.Err()
 }
 
-// V1.8 ADD: Parse Wi-Fi AP Associations (iw dev)
-func (p *DHCPProvider) parseAPLine(line string) {
-    parts := strings.Fields(line)
-    if len(parts) != 2 {
-        return
+func parseKeaLeases(data []byte, now time.Time) ([]Observation, error) {
+	reader := csv.NewReader(bytes.NewReader(data))
+	reader.FieldsPerRecord = -1
+	header, err := reader.Read()
+	if err == io.EOF {
+		return nil, nil
     }
-    
-    iface := parts[0]
-    macStr := parts[1]
-    
-    mac, err := net.ParseMAC(macStr)
     if err != nil {
-        return
+		return nil, err
     }
-
-    obs := Observation{
-        Source:     "openwrt_ap",
-        Group:      GroupA, // Layer-2 Ground Truth
-        MAC:        mac,
-        IP:         nil,
-        Online:     true,
-        Confidence: 0.99,
-        Timestamp:  time.Now(),
-        Raw: map[string]interface{}{
-            "wifi_interface": iface,
-        },
+	columns := make(map[string]int, len(header))
+	for i, name := range header {
+		columns[strings.ToLower(strings.TrimSpace(name))] = i
     }
-
-    select {
-    case p.events <- obs:
-    default:
-        slog.Warn("AP observation channel full, dropping event")
+	for _, required := range []string{"address", "hwaddr", "expire"} {
+		if _, ok := columns[required]; !ok {
+			return nil, fmt.Errorf("Kea CSV missing %q column", required)
     }
 }
-
-// V1.9 ADD: Parse ARP Table entries (ip neigh show)
-// Line format: 192.168.1.50 aa:bb:cc:dd:ee:ff
-func (p *DHCPProvider) parseARPLine(line string) {
-    parts := strings.Fields(line)
-    if len(parts) != 2 {
-        return
+	latest := make(map[string]Observation)
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
     }
-    
-    ipStr := parts[0]
-    macStr := parts[1]
-    
-    ip := net.ParseIP(ipStr)
-    if ip == nil {
-        return
-    }
-    
-    mac, err := net.ParseMAC(macStr)
     if err != nil {
-        return
+			return nil, err
     }
-
-    obs := Observation{
-        Source:     "openwrt_arp",
-        Group:      GroupA, // Layer-2 + Layer-3 Ground Truth
-        MAC:        mac,
-        IP:         ip,     // We now have the IP binding!
-        Online:     true,
-        Confidence: 0.99,
-        Timestamp:  time.Now(),
-        Raw:        make(map[string]interface{}),
+		field := func(name string) string {
+			idx, ok := columns[name]
+			if !ok || idx >= len(record) {
+				return ""
     }
-
-    select {
-    case p.events <- obs:
-    default:
-        slog.Warn("ARP observation channel full, dropping event")
+			return strings.TrimSpace(record[idx])
+		}
+		mac, err := net.ParseMAC(field("hwaddr"))
+		ip := net.ParseIP(field("address"))
+		if err != nil || len(mac) != 6 || ip == nil || ip.To4() == nil {
+			continue
+		}
+		// Kea memfile is append-only between lease-file cleanups. The last
+		// row for an address is authoritative, including a reclaimed/expired
+		// tombstone, so never resurrect an older active row.
+		key := ip.String()
+		expires, err := strconv.ParseInt(field("expire"), 10, 64)
+		if state := field("state"); err != nil || expires <= now.Unix() || (state != "" && state != "0") {
+			delete(latest, key)
+			continue
+		}
+		hostname := field("hostname")
+		raw := map[string]interface{}{"lease_format": "kea", "lease_expires_at": time.Unix(expires, 0).UTC().Format(time.RFC3339)}
+		if clientID := field("client_id"); clientID != "" {
+			raw["dhcp_client_id_hash"] = hashCredential(clientID)
+		}
+		obs := Observation{Source: "dhcp", Group: GroupB, MAC: mac, IP: ip, Hostname: hostname,
+			Online: false, Confidence: 0.60, Timestamp: now, Raw: raw}
+		if _, exists := latest[key]; !exists && len(latest) >= maxDHCPRecords {
+			return nil, fmt.Errorf("Kea active lease count exceeds limit")
     }
+		latest[key] = obs
+	}
+	keys := make([]string, 0, len(latest))
+	for key := range latest {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]Observation, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, latest[key])
+	}
+	return result, nil
 }
 
-func fingerprintOSFromDHCP(opt55 string) string {
-    set := make(map[byte]bool)
+func hashCredential(value string) string {
+	sum := sha256.Sum256([]byte("dhcp-client-id\x00" + strings.TrimSpace(value)))
+	return hex.EncodeToString(sum[:])
+}
     
-    if strings.Contains(opt55, ",") {
-        bytesStr := strings.Split(opt55, ",")
-        for _, b := range bytesStr {
-            n, err := strconv.Atoi(strings.TrimSpace(b))
-            if err == nil {
-                set[byte(n)] = true
+func (p *DHCPProvider) emitChangedLeases(leases []Observation) {
+	current := make(map[string]string, len(leases))
+	for _, obs := range leases {
+		key := obs.MAC.String() + "|" + obs.IP.String()
+		signature := obs.Hostname + "|" + fmt.Sprint(obs.Raw["lease_expires_at"]) + "|" + fmt.Sprint(obs.Raw["dhcp_client_id_hash"])
+		current[key] = signature
+		if p.seenLeases[key] != signature {
+			p.emit(obs)
             }
         }
-    } else {
-        cleanHex := strings.ReplaceAll(opt55, ":", "")
-        cleanHex = strings.ReplaceAll(cleanHex, " ", "")
-        if len(cleanHex)%2 == 0 {
-            for i := 0; i < len(cleanHex); i += 2 {
-                n, err := strconv.ParseUint(cleanHex[i:i+2], 16, 8)
-                if err == nil {
-                    set[byte(n)] = true
+	p.seenLeases = current
                 }
+
+func parseOpenWrtStationLine(line string) (Observation, bool) {
+	parts := strings.Fields(line)
+	if len(parts) != 2 {
+		return Observation{}, false
             }
+	mac, err := net.ParseMAC(parts[1])
+	if err != nil || len(mac) != 6 {
+		return Observation{}, false
         }
+	return Observation{Source: "openwrt_ap", Group: GroupA, MAC: mac, Online: true,
+		Confidence: 0.99, Timestamp: time.Now(), Raw: map[string]interface{}{"wifi_interface": parts[0]}}, true
     }
 
-    if set[31] && set[33] && set[44] {
-        return "Windows"
+func parseOpenWrtNeighborLine(line string) (Observation, bool) {
+	parts := strings.Fields(line)
+	if len(parts) != 3 || !strings.EqualFold(parts[2], "REACHABLE") {
+		return Observation{}, false
     }
-    if set[119] && set[252] && set[95] {
-        return "Apple macOS/iOS"
+	ip := net.ParseIP(parts[0])
+	mac, err := net.ParseMAC(parts[1])
+	if ip == nil || err != nil || len(mac) != 6 {
+		return Observation{}, false
     }
-    if set[28] && set[51] && !set[44] {
-        return "Android"
-    }
-    if set[1] && set[28] && set[2] && set[5] && !set[119] {
-        return "Linux"
+	return Observation{Source: "openwrt_neigh", Group: GroupA, MAC: mac, IP: ip, Online: true,
+		Confidence: 0.95, Timestamp: time.Now(), Raw: map[string]interface{}{"nud_state": "reachable"}}, true
     }
 
-    return ""
+func (p *DHCPProvider) emit(obs Observation) {
+	select {
+	case p.events <- obs:
+	default:
+		slog.Warn("DHCP/OpenWrt observation channel full, dropping event", "source", obs.Source)
+	}
 }

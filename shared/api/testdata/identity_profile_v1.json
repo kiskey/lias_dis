@@ -1,0 +1,23 @@
+{
+  "device_id": "immutable-device-id",
+  "pdid": "pdid_target",
+  "assurance": "verified",
+  "probability": 1,
+  "ambiguous": false,
+  "aliases": [
+    {
+      "id": 9,
+      "device_id": "immutable-device-id",
+      "pdid": "pdid_target",
+      "type": "device_public_key",
+      "value_hash": "sha256:fixture",
+      "source": "authenticated",
+      "confidence": 1,
+      "verified": true,
+      "first_seen": "2026-08-09T19:00:00Z",
+      "last_seen": "2026-08-09T20:00:00Z"
+    }
+  ],
+  "candidates": [],
+  "evidence": []
+}

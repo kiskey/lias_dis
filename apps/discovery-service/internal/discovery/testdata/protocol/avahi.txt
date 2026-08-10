@@ -1,0 +1,1 @@
+=;eth0;IPv4;Living\032Room;_airplay._tcp;local;living-room.local;192.168.1.30;7000;"model=AppleTV"

@@ -42,11 +42,11 @@ func TestValidateIPClaim(t *testing.T) {
     }
     obs.MAC = net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01} // Randomized MAC
     res = ValidateIPClaim(obs, staleDev)
-    if res != ClaimCreateNewSilent {
-        t.Errorf("Expected ClaimCreateNewSilent for stale device, got %v", res)
+	if res == ClaimAttach {
+		t.Errorf("stale passive observation must not attach, got %v", res)
     }
 
-    // Case 3: Randomized MAC, hostname match, recent -> ClaimAttach
+	// Case 3: even a private MAC with matching passive signals never auto-attaches.
     recentDev := &models.Device{
         PDID:       "pdid_l7_recent",
         CurrentMAC: "02:00:00:00:00:01",
@@ -57,8 +57,8 @@ func TestValidateIPClaim(t *testing.T) {
     obs.MAC = net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02} // New randomized MAC
     obs.Hostname = "iphone"
     res = ValidateIPClaim(obs, recentDev)
-    if res != ClaimAttach {
-        t.Errorf("Expected ClaimAttach for randomized MAC with hostname match, got %v", res)
+	if res == ClaimAttach {
+		t.Errorf("passive evidence must never return ClaimAttach, got %v", res)
     }
 
     // Case 4: Randomized MAC, vendor mismatch -> ClaimCreateNew

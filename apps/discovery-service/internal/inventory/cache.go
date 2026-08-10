@@ -31,6 +31,7 @@ type HostnameOwnerListener func(canonicalHost, pdid string, isDelete bool)
 type Cache struct {
     mu             sync.RWMutex
     devices        map[string]*models.Device
+	deviceIDIndex  map[string]*models.Device
     macIndex       map[string]*models.Device
     ipIndex        map[string]*models.Device
     hostnameOwners map[string]string
@@ -41,6 +42,7 @@ type Cache struct {
 func NewCache() *Cache {
     c := &Cache{
         devices:        make(map[string]*models.Device),
+		deviceIDIndex:  make(map[string]*models.Device),
         macIndex:       make(map[string]*models.Device),
         ipIndex:        make(map[string]*models.Device),
         hostnameOwners: make(map[string]string),
@@ -186,8 +188,7 @@ func (c *Cache) GetByMAC(macStr string) *models.Device {
     cleanMAC := NormalizeMAC(macStr)
     if cleanMAC != "" {
         if d, found := c.macIndex[cleanMAC]; found {
-            devCopy := *d
-            return &devCopy
+			return d.Clone()
         }
     }
     return nil
@@ -204,8 +205,7 @@ func (c *Cache) GetByMACCluster(macStr string) *models.Device {
 
     for _, d := range c.devices {
         if d.HasMAC(cleanMAC) {
-            devCopy := *d
-            return &devCopy
+			return d.Clone()
         }
     }
     return nil
@@ -218,8 +218,7 @@ func (c *Cache) GetByIP(ipStr string) *models.Device {
     cleanIP := strings.TrimSpace(ipStr)
     if cleanIP != "" {
         if d, found := c.ipIndex[cleanIP]; found {
-            devCopy := *d
-            return &devCopy
+			return d.Clone()
         }
     }
     return nil
@@ -322,8 +321,16 @@ func (c *Cache) Get(pdid string) *models.Device {
     if !ok {
         return nil
     }
-    devCopy := *d
-    return &devCopy
+	return d.Clone()
+}
+
+func (c *Cache) GetByDeviceID(deviceID string) *models.Device {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if d := c.deviceIDIndex[strings.TrimSpace(deviceID)]; d != nil {
+		return d.Clone()
+	}
+	return nil
 }
 
 func (c *Cache) List() []models.Device {
@@ -332,7 +339,7 @@ func (c *Cache) List() []models.Device {
 
     list := make([]models.Device, 0, len(c.devices))
     for _, d := range c.devices {
-        list = append(list, *d)
+		list = append(list, *d.Clone())
     }
     return list
 }
@@ -347,6 +354,9 @@ func (c *Cache) Upsert(d *models.Device) {
     defer c.mu.Unlock()
 
     if old, exists := c.devices[d.PDID]; exists {
+		if old.DeviceID != "" && old.DeviceID != d.DeviceID {
+			delete(c.deviceIDIndex, old.DeviceID)
+		}
         oldMAC := NormalizeMAC(old.CurrentMAC)
         newMAC := NormalizeMAC(d.CurrentMAC)
         if oldMAC != "" && oldMAC != newMAC {
@@ -363,15 +373,18 @@ func (c *Cache) Upsert(d *models.Device) {
         }
     }
 
-    devCopy := *d
-    c.devices[d.PDID] = &devCopy
+	devCopy := d.Clone()
+	c.devices[d.PDID] = devCopy
+	if d.DeviceID != "" {
+		c.deviceIDIndex[d.DeviceID] = devCopy
+	}
 
     if cleanMAC := NormalizeMAC(d.CurrentMAC); cleanMAC != "" {
-        c.macIndex[cleanMAC] = &devCopy
+		c.macIndex[cleanMAC] = devCopy
     }
 
     if cleanIP := strings.TrimSpace(d.CurrentIP); cleanIP != "" {
-        c.ipIndex[cleanIP] = &devCopy
+		c.ipIndex[cleanIP] = devCopy
     }
 }
 
@@ -403,6 +416,7 @@ func (c *Cache) Delete(pdid string) {
                 releasedHosts = append(releasedHosts, d.CanonicalHostname)
             }
         }
+		delete(c.deviceIDIndex, d.DeviceID)
         delete(c.devices, pdid)
     }
     listener := c.ownerListener
@@ -455,6 +469,7 @@ func (c *Cache) purgeOffline() {
                     releasedPDIDs = append(releasedPDIDs, pdid)
                 }
             }
+			delete(c.deviceIDIndex, d.DeviceID)
             delete(c.devices, pdid)
         }
     }

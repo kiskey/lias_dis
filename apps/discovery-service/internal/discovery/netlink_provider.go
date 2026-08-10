@@ -7,10 +7,8 @@ package discovery
 
 import (
     "context"
-    "fmt"
     "log/slog"
     "net"
-    "os"
     "sync"
     "time"
 
@@ -27,7 +25,6 @@ type NetlinkProvider struct {
     iface     string
     targetIdx int
     mu        sync.RWMutex
-    probeSem  chan struct{}
 }
 
 func NewNetlinkProvider(iface string) *NetlinkProvider {
@@ -35,7 +32,6 @@ func NewNetlinkProvider(iface string) *NetlinkProvider {
         events:   make(chan Observation, 256),
         done:     make(chan struct{}),
         iface:    iface,
-        probeSem: make(chan struct{}, 10),
     }
 }
 
@@ -45,10 +41,7 @@ func (p *NetlinkProvider) Start(ctx context.Context) error {
     p.ctx, p.cancel = context.WithCancel(ctx)
 
     p.resolveInterface()
-    p.checkGcStaleTime()
-
     go p.runSubscriptionLoop()
-    go p.monitorStaleNeighbors()
 
     return nil
 }
@@ -69,22 +62,6 @@ func (p *NetlinkProvider) resolveInterface() {
     p.targetIdx = link.Attrs().Index
     p.mu.Unlock()
     slog.Info("Netlink provider bound to interface", "iface", p.iface, "index", link.Attrs().Index)
-}
-
-func (p *NetlinkProvider) checkGcStaleTime() {
-    if p.iface == "" {
-        return
-    }
-    path := "/proc/sys/net/ipv4/neigh/" + p.iface + "/gc_stale_time"
-    data, err := os.ReadFile(path)
-    if err == nil {
-        var val int
-        _, err := fmt.Sscanf(string(data), "%d", &val)
-        if err == nil && val < 180 {
-            slog.Warn("Kernel neighbor gc_stale_time is lower than DIS staleThreshold (180s). Devices may flap between online/offline.",
-                "iface", p.iface, "gc_stale_time", val, "path", path)
-        }
-    }
 }
 
 func (p *NetlinkProvider) runSubscriptionLoop() {
@@ -119,7 +96,7 @@ func (p *NetlinkProvider) runSubscriptionLoop() {
             }
         }
 
-        ch := make(chan netlink.NeighUpdate)
+		ch := make(chan netlink.NeighUpdate, 256)
         innerDone := make(chan struct{})
 
         opt := netlink.NeighSubscribeOptions{
@@ -148,6 +125,7 @@ func (p *NetlinkProvider) runSubscriptionLoop() {
                     return
                 case <-time.After(2 * time.Second):
                 }
+				goto ReconnectLoop
             case update, ok := <-ch:
                 if !ok {
                     close(innerDone)
@@ -164,96 +142,6 @@ func (p *NetlinkProvider) runSubscriptionLoop() {
             return
         default:
         }
-    }
-}
-
-func (p *NetlinkProvider) monitorStaleNeighbors() {
-    ticker := time.NewTicker(20 * time.Second)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-p.ctx.Done():
-            return
-        case <-ticker.C:
-            p.auditKernelNeighbors()
-        }
-    }
-}
-
-func (p *NetlinkProvider) auditKernelNeighbors() {
-    p.mu.RLock()
-    idx := p.targetIdx
-    p.mu.RUnlock()
-    if idx == 0 {
-        return
-    }
-
-    families := []int{netlink.FAMILY_V4, netlink.FAMILY_V6}
-
-    for _, fam := range families {
-        neighs, err := netlink.NeighList(idx, fam)
-        if err != nil {
-            continue
-        }
-
-        for _, n := range neighs {
-            if n.HardwareAddr == nil || len(n.HardwareAddr) != 6 {
-                continue
-            }
-            if IsMulticastOrBroadcast(n.HardwareAddr, n.IP) {
-                continue
-            }
-
-            if (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0 {
-                obs := Observation{
-                    Source:     p.Name(),
-                    MAC:        n.HardwareAddr,
-                    IP:         n.IP,
-                    Vendor:     oui.Lookup(n.HardwareAddr.String()),
-                    Online:     false,
-                    Confidence: 0.95,
-                    Timestamp:  time.Now(),
-                }
-                select {
-                case p.events <- obs:
-                default:
-                }
-                continue
-            }
-
-            if (n.State & (unix.NUD_STALE | unix.NUD_DELAY)) != 0 && n.IP != nil {
-                select {
-                case p.probeSem <- struct{}{}:
-                    go func(ip net.IP) {
-                        defer func() { <-p.probeSem }()
-                        p.probeNeighborIP(ip)
-                    }(n.IP)
-                default:
-                }
-            }
-        }
-    }
-}
-
-func (p *NetlinkProvider) probeNeighborIP(ip net.IP) {
-    var addr string
-    if ip.To4() != nil {
-        addr = net.JoinHostPort(ip.String(), "9")
-    } else {
-        if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-            addr = net.JoinHostPort(ip.String()+"%"+p.iface, "9")
-        } else {
-            addr = net.JoinHostPort(ip.String(), "9")
-        }
-    }
-
-    conn, err := net.DialTimeout("udp", addr, 1*time.Second)
-    if err == nil {
-        // High 1 Fix Enhancement: Actually send a packet to force kernel L2 resolution
-        // and trigger an ICMP Port Unreachable if the host is up.
-        _, _ = conn.Write([]byte{0})
-        _ = conn.Close()
     }
 }
 
@@ -276,14 +164,19 @@ func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
         return
     }
 
-    isFailed := (n.State & (unix.NUD_FAILED | unix.NUD_INCOMPLETE)) != 0
-    isOnline := !isFailed && (n.State&(unix.NUD_REACHABLE|unix.NUD_PERMANENT|unix.NUD_STALE|unix.NUD_DELAY|unix.NUD_PROBE|unix.NUD_NOARP)) != 0
-
-    if update.Type == unix.RTM_DELNEIGH {
-        isOnline = false
+	// A neighbour-cache mapping is not the same as current device presence.
+	// STALE is explicitly "valid but suspicious"; PERMANENT and NOARP are
+	// configuration states. Only a positive NUD_REACHABLE transition is used
+	// as presence evidence. Deletion/failure is left to the correlation
+	// staleness horizon and never treated as an immediate offline verdict.
+	if update.Type == unix.RTM_DELNEIGH || n.State != unix.NUD_REACHABLE {
+		return
     }
 
-    vendor := oui.Lookup(n.HardwareAddr.String())
+	vendor := ""
+	if isGloballyAdministeredUnicast(n.HardwareAddr) {
+		vendor = oui.Lookup(n.HardwareAddr.String())
+	}
 
     obs := Observation{
         Source:     p.Name(),
@@ -291,9 +184,12 @@ func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
         MAC:        n.HardwareAddr,
         IP:         n.IP,
         Vendor:     vendor,
-        Online:     isOnline,
+		Online:     true,
         Confidence: 0.95,
         Timestamp:  time.Now(),
+		Raw: map[string]interface{}{
+			"nud_state": "reachable",
+		},
     }
 
     select {
@@ -301,6 +197,10 @@ func (p *NetlinkProvider) handleNeighUpdate(update netlink.NeighUpdate) {
     default:
         slog.Warn("Netlink observation channel full, dropping event", "mac", n.HardwareAddr.String())
     }
+}
+
+func isGloballyAdministeredUnicast(mac net.HardwareAddr) bool {
+	return len(mac) == 6 && mac[0]&0x01 == 0 && mac[0]&0x02 == 0
 }
 
 func IsMulticastOrBroadcast(mac net.HardwareAddr, ip net.IP) bool {

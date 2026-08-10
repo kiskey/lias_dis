@@ -27,6 +27,12 @@ type Broker struct {
 	history  []models.Event
 	histHead int
 	stopPing chan struct{}
+	stopOnce sync.Once
+}
+
+// Stop terminates the broker heartbeat loop. It is safe to call more than once.
+func (b *Broker) Stop() {
+	b.stopOnce.Do(func() { close(b.stopPing) })
 }
 
 func NewBroker(cache *inventory.Cache) *Broker {

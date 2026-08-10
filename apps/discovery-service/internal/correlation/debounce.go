@@ -211,7 +211,9 @@ func (d *Debouncer) Flush() {
         if d.store != nil {
             payloadBytes, _ := json.Marshal(p.Payload)
             sourcesStr := strings.Join(p.ConfirmedBy, ",")
-            _ = d.store.SavePendingEvent(p.PDID, string(p.EventType), payloadBytes, p.FirstSeen, p.LastSeen, p.Confirmations, sourcesStr)
+			if err := d.store.SavePendingEvent(p.PDID, string(p.EventType), payloadBytes, p.FirstSeen, p.LastSeen, p.Confirmations, sourcesStr); err != nil {
+				slog.Error("Failed to persist pending event", "pdid", p.PDID, "event_type", p.EventType, "error", err)
+			}
         }
 
         if p.Confirmations >= p.RequiredConfirmations || now.Sub(p.FirstSeen) > 10*time.Second {
@@ -228,7 +230,9 @@ func (d *Debouncer) Flush() {
     }
 
     if d.store != nil && len(confirmedRecords) > 0 {
-        _ = d.store.DeletePendingEventsBatch(confirmedRecords)
+		if err := d.store.DeletePendingEventsBatch(confirmedRecords); err != nil {
+			slog.Error("Failed to delete confirmed pending events", "count", len(confirmedRecords), "error", err)
+		}
     }
 
     for k, t := range d.recentValTime {

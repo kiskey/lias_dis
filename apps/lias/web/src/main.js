@@ -2,8 +2,38 @@
 //
 // File:    apps/lias/web/src/main.js
 // Version: 4.2 (Fixed Global Switch toggle to strictly enforce policy hierarchy)
-import { API } from './api.js';
+import { API } from './api.js?v=7d';
 import { projectSchedule, detectConflicts, expandDayRange } from './scheduleConflict.js';
+
+export function escapeHTML(value) {
+  return String(value ?? '').replace(/[&<>'"]/g, character => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+  })[character]);
+}
+
+function setSafeHTML(element, html) {
+  const template = document.createElement('template');
+  template.innerHTML = String(html);
+  template.content.querySelectorAll('script, iframe, object, embed, link, meta, base, form').forEach(node => node.remove());
+  template.content.querySelectorAll('*').forEach(node => {
+    Array.from(node.attributes).forEach(attribute => {
+      const name = attribute.name.toLowerCase();
+      const value = attribute.value.trim().toLowerCase();
+      if (name.startsWith('on') || name === 'srcdoc' ||
+          ((name === 'href' || name === 'src' || name === 'action') && /^(javascript|data):/.test(value)) ||
+          (name === 'style' && /(url\s*\(|expression\s*\(|javascript:|@import|-moz-binding)/i.test(value))) {
+        node.removeAttribute(attribute.name);
+      }
+    });
+  });
+  element.replaceChildren(template.content.cloneNode(true));
+}
+
+function appendSafeHTML(element, html) {
+  const holder = document.createElement('div');
+  setSafeHTML(holder, html);
+  element.append(...holder.childNodes);
+}
 
 class App {
   constructor() {
@@ -12,6 +42,11 @@ class App {
     this.tags = [];
     this.policies = [];
     this.schedules = [];
+    this.users = [];
+    this.identityCandidates = [];
+    this.capabilities = null;
+    this.snapshotETag = '';
+    this.sse = null;
     this.searchQuery = '';
     this.wizardState = {};
 
@@ -20,13 +55,7 @@ class App {
     this.statusReloadTimer = null;
 
     this.initRouter();
-    this.initSSE();
-    this.loadData();
-
-    // UI-UX-05 Fix: First-run onboarding wizard
-    if (!localStorage.getItem('lias_onboarded')) {
-      this.openOnboardingWizard();
-    }
+    this.bootstrap();
 
     // Auto-refresh dashboard view every minute to update live enforcements dynamically
     setInterval(() => {
@@ -34,6 +63,57 @@ class App {
         this.renderCurrentView();
       }
     }, 60000);
+  }
+
+  async bootstrap() {
+    try {
+      this.capabilities = await API.getCapabilities();
+      await this.loadData(true);
+      if (!this.sse) this.initSSE();
+      if (this.hasFeature('identity_candidate_queue')) await this.refreshIdentityReview(false);
+      if (!localStorage.getItem('lias_onboarded')) this.openOnboardingWizard();
+    } catch (err) {
+      if (err.status === 401) {
+        this.renderLoginView();
+        return;
+      }
+      this.showToast(`Error loading data: ${err.message}`, 'danger');
+    }
+  }
+
+  hasFeature(feature) {
+    return Boolean(this.capabilities?.features?.includes(feature));
+  }
+
+  renderLoginView() {
+    const container = document.getElementById('view-container');
+    document.getElementById('view-title').textContent = 'Sign in';
+    setSafeHTML(container, `
+      <div class="card login-card">
+        <h3>LIAS Control Center</h3>
+        <p>Enter the configured dashboard token. It is exchanged for a private browser session and is not stored in the page.</p>
+        <label for="session-token">Dashboard token</label>
+        <input id="session-token" type="password" autocomplete="current-password" class="modal-input">
+        <button class="btn btn-primary" id="session-login">Sign in</button>
+        <p id="session-error" role="alert" class="form-error"></p>
+      </div>`);
+    const input = document.getElementById('session-token');
+    const submit = async () => {
+      const button = document.getElementById('session-login');
+      button.disabled = true;
+      try {
+        await API.createSession(input.value);
+        input.value = '';
+        await this.bootstrap();
+      } catch (err) {
+        document.getElementById('session-error').textContent = err.message || 'Sign-in failed';
+        button.disabled = false;
+        input.focus();
+      }
+    };
+    document.getElementById('session-login').addEventListener('click', submit);
+    input.addEventListener('keydown', event => { if (event.key === 'Enter') submit(); });
+    input.focus();
   }
 
   // UI-UX-05 Fix: Onboarding Wizard
@@ -113,10 +193,13 @@ class App {
     if (modalCloseX) {
       modalCloseX.addEventListener('click', () => this.closeModal());
     }
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !document.getElementById('modal-root').classList.contains('hidden')) this.closeModal();
+    });
   }
 
   initSSE() {
-    API.subscribeEvents((event) => {
+    this.sse = API.subscribeEvents((event) => {
       this.handleRealtimeEvent(event);
     });
   }
@@ -126,7 +209,7 @@ class App {
     
     const confirmedBy = event.payload?.confirmed_by || [];
     const verifiedBadge = confirmedBy.length > 0
-        ? ` <span class="verified-badge">✓ ${confirmedBy.length} sources</span>`
+        ? ` (verified by ${confirmedBy.length} sources)`
         : '';
 
     if (event.type === 'device.added') {
@@ -142,17 +225,47 @@ class App {
       this.showToast(`🚨 Security Alert: ${event.payload.details || 'Unknown alert'}`, 'danger');
     }
 
-    // V4.0: Debounce rapid status updates to prevent flooding the API
+    if (event.type.startsWith('identity.candidate.')) {
+      this.refreshIdentityReview(this.currentView === 'identity');
+      return;
+    }
+    if (event.type === 'identity.binding.changed') return;
+
+    // Coalesce only events which can alter the dashboard snapshot.
     if (event.type === 'effective.status_changed' || event.type.startsWith('device.') || event.type === 'policy.updated') {
       clearTimeout(this.statusReloadTimer);
       this.statusReloadTimer = setTimeout(() => this.loadData(), 250);
-    } else {
-      this.loadData();
     }
   }
 
-  async loadData() {
+  async loadData(throwOnError = false) {
     try {
+      return await this.fetchData();
+    } catch (err) {
+      if (throwOnError) throw err;
+      this.showToast(`Error loading data: ${err.message}`, 'danger');
+      return null;
+    }
+  }
+
+  async fetchData() {
+    if (this.hasFeature('snapshot_v1')) {
+      const result = await API.getSnapshot(this.snapshotETag);
+      this.snapshotETag = result.etag;
+      if (!result.notModified) {
+        const snapshot = result.snapshot;
+        this.devices = snapshot.devices || [];
+        this.tags = snapshot.tags || [];
+        this.policies = snapshot.policies || [];
+        this.schedules = snapshot.schedules || [];
+        this.users = snapshot.users || [];
+        this.devices.forEach(device => { device.effective_status = snapshot.device_effective_statuses?.[device.pdid] || null; });
+        this.tags.forEach(tag => { tag.effective_status = snapshot.tag_effective_statuses?.[tag.id] || null; });
+      }
+      this.renderCurrentView();
+      return;
+    }
+
       const [devsResp, tags, policies, schedules] = await Promise.all([
         API.getDevices(),
         API.getTags(),
@@ -178,9 +291,6 @@ class App {
       });
 
       this.renderCurrentView();
-    } catch (err) {
-      this.showToast(`Error loading data: ${err.message}`, 'danger');
-    }
   }
 
   navigateTo(view) {
@@ -194,6 +304,7 @@ class App {
       devices: 'Tag Groups',
       schedules: 'Schedules',
       policies: 'Policies',
+      identity: 'Identity Review',
       analytics: 'Analytics',
       settings: 'Settings'
     };
@@ -219,6 +330,9 @@ class App {
       case 'policies':
         this.renderPoliciesView(container);
         break;
+      case 'identity':
+        this.renderIdentityReviewView(container);
+        break;
       case 'analytics':
         this.renderAnalyticsView(container);
         break;
@@ -226,8 +340,219 @@ class App {
         this.renderSettingsView(container);
         break;
       default:
-        container.innerHTML = '<p>View not found</p>';
+        setSafeHTML(container, '<p>View not found</p>');
     }
+  }
+
+  async refreshIdentityReview(render = true) {
+    if (!this.hasFeature('identity_candidate_queue')) return;
+    try {
+      const response = await API.getIdentityCandidates('pending', 50);
+      this.identityCandidates = response.candidates || [];
+      document.querySelectorAll('.identity-review-badge').forEach(badge => {
+        badge.textContent = String(this.identityCandidates.length);
+        badge.hidden = this.identityCandidates.length === 0;
+      });
+      if (render && this.currentView === 'identity') this.renderCurrentView();
+    } catch (err) {
+      if (err.status !== 404 && err.status !== 501 && err.status !== 503) {
+        this.showToast(`Identity review unavailable: ${err.message}`, 'danger');
+      }
+    }
+  }
+
+  isLocallyAdministeredMAC(mac) {
+    const first = Number.parseInt(String(mac || '').split(':')[0], 16);
+    return Number.isFinite(first) && (first & 2) === 2;
+  }
+
+  identityDeviceName(summary, fallbackPDID) {
+    const device = this.devices.find(item => item.pdid === fallbackPDID);
+    return summary?.display_name || device?.friendly_name || device?.hostname || fallbackPDID;
+  }
+
+  renderIdentityReviewView(container) {
+    if (!this.hasFeature('identity_candidate_queue')) {
+      setSafeHTML(container, '<div class="card"><h3>Identity review is unavailable</h3><p>The connected DIS engine does not advertise the candidate-review capability.</p></div>');
+      return;
+    }
+    const rows = this.identityCandidates.map(candidate => {
+      const sourceName = this.identityDeviceName(candidate.source_device, candidate.source_pdid);
+      const targetName = this.identityDeviceName(candidate.target_device, candidate.target_pdid);
+      const sourceMAC = candidate.source_device?.current_mac || '';
+      const targetMAC = candidate.target_device?.current_mac || '';
+      const score = Math.round((candidate.probability || 0) * 100);
+      const localMAC = this.isLocallyAdministeredMAC(sourceMAC) || this.isLocallyAdministeredMAC(targetMAC);
+      return `
+        <button class="identity-candidate-card" data-candidate-id="${candidate.id}" aria-label="Review possible match between ${escapeHTML(sourceName)} and ${escapeHTML(targetName)}">
+          <div class="identity-pair"><strong>${escapeHTML(sourceName)}</strong><span aria-hidden="true">↔</span><strong>${escapeHTML(targetName)}</strong></div>
+          <div class="identity-macs"><code>${escapeHTML(sourceMAC || 'No current MAC')}</code><code>${escapeHTML(targetMAC || 'No current MAC')}</code></div>
+          <div class="identity-meta">
+            <span class="score-pill">Correlation score ${score}% — not proof</span>
+            ${candidate.ambiguous ? '<span class="warning-pill">Ambiguous</span>' : ''}
+            ${localMAC ? '<span class="warning-pill">Locally administered MAC</span>' : ''}
+            <span>${(candidate.factors || []).length} matches · ${(candidate.conflicts || []).length} conflicts</span>
+          </div>
+          <time datetime="${escapeHTML(candidate.updated_at)}">Updated ${escapeHTML(new Date(candidate.updated_at).toLocaleString())}</time>
+        </button>`;
+    }).join('');
+    setSafeHTML(container, `
+      <div class="identity-review-header">
+        <div><h3>Possible device matches</h3><p>Review evidence before changing identity. A score is a correlation estimate, not proof.</p></div>
+        <button class="btn btn-secondary" id="identity-refresh">Refresh</button>
+      </div>
+      <div class="identity-candidate-list">
+        ${rows || '<div class="card identity-empty"><h3>No pending matches</h3><p>New candidates will appear here automatically.</p></div>'}
+      </div>`);
+    document.getElementById('identity-refresh')?.addEventListener('click', () => this.refreshIdentityReview(true));
+    container.querySelectorAll('.identity-candidate-card').forEach(button => {
+      button.addEventListener('click', () => this.openIdentityCandidate(Number(button.dataset.candidateId)));
+    });
+  }
+
+  renderIdentityEvidence(items, emptyText) {
+    if (!items?.length) return `<p class="muted">${escapeHTML(emptyText)}</p>`;
+    return `<ul class="identity-evidence-list">${items.map(item => `
+      <li><strong>${escapeHTML(item.kind || 'signal')}</strong><span>${item.matched === false ? 'Conflict' : 'Match'}</span><code>LR ${escapeHTML(item.likelihood_ratio ?? 'n/a')}</code></li>`).join('')}</ul>`;
+  }
+
+  renderIdentityDevicePanel(label, summary, device, profile, pdid) {
+    const name = this.identityDeviceName(summary, pdid);
+    const macs = [...new Set([summary?.current_mac, device?.current_mac, ...(device?.macs || [])].filter(Boolean))];
+    const ips = [...new Set([device?.current_ip, ...(device?.ips || [])].filter(Boolean))];
+    return `<section class="identity-device-panel">
+      <span class="eyebrow">${escapeHTML(label)}</span><h4>${escapeHTML(name)}</h4><code>${escapeHTML(pdid)}</code>
+      <dl><dt>MAC history</dt><dd>${escapeHTML(macs.join(', ') || 'None recorded')}</dd><dt>IP history</dt><dd>${escapeHTML(ips.join(', ') || 'None recorded')}</dd><dt>Last seen</dt><dd>${escapeHTML(summary?.last_seen ? new Date(summary.last_seen).toLocaleString() : 'Unknown')}</dd><dt>Identity assurance</dt><dd>${escapeHTML(profile?.assurance || 'Unknown')}</dd></dl>
+      ${macs.some(mac => this.isLocallyAdministeredMAC(mac)) ? '<p class="identity-warning">This device uses a locally administered MAC.</p>' : ''}
+    </section>`;
+  }
+
+  async openIdentityCandidate(id) {
+    try {
+      const candidate = await API.getIdentityCandidate(id);
+      const sourceDevice = this.devices.find(device => device.pdid === candidate.source_pdid);
+      const targetDevice = this.devices.find(device => device.pdid === candidate.target_pdid);
+      const [sourceProfile, targetProfile] = await Promise.all([
+        API.getIdentityProfile(candidate.source_pdid).catch(() => null),
+        API.getIdentityProfile(candidate.target_pdid).catch(() => null)
+      ]);
+      const score = Math.round((candidate.probability || 0) * 100);
+      this.openModal('Review possible identity match', `
+        <p class="identity-score-explainer"><strong>Correlation score ${score}% — not proof.</strong> Confirm only when the device history and evidence support the same physical device.</p>
+        <div class="identity-comparison">
+          ${this.renderIdentityDevicePanel('Source record', candidate.source_device, sourceDevice, sourceProfile, candidate.source_pdid)}
+          ${this.renderIdentityDevicePanel('Surviving target', candidate.target_device, targetDevice, targetProfile, candidate.target_pdid)}
+        </div>
+        <div class="identity-evidence-grid"><section><h4>Matching evidence</h4>${this.renderIdentityEvidence(candidate.factors, 'No matching factors supplied.')}</section><section><h4>Conflicts</h4>${this.renderIdentityEvidence(candidate.conflicts, 'No conflicts supplied.')}</section></div>
+        <details class="identity-advanced"><summary>Advanced identity actions</summary><div><button class="btn btn-secondary" id="identity-bind">Add verified binding</button><button class="btn btn-danger" id="identity-split">Split source MAC from target</button></div></details>
+      `, `
+        <button class="btn btn-secondary" id="identity-close">Close</button>
+        <button class="btn btn-danger" id="identity-reject">Reject match</button>
+        <button class="btn btn-primary" id="identity-confirm">Continue to merge</button>`);
+      document.getElementById('identity-close').addEventListener('click', () => this.closeModal());
+      document.getElementById('identity-reject').addEventListener('click', () => this.openIdentityReject(candidate));
+      document.getElementById('identity-confirm').addEventListener('click', () => this.openIdentityMergeConfirmation(candidate));
+      document.getElementById('identity-bind').addEventListener('click', () => this.openIdentityBinding(candidate.target_pdid));
+      document.getElementById('identity-split').addEventListener('click', () => this.openIdentitySplit(candidate.target_pdid, candidate.source_device?.current_mac || ''));
+    } catch (err) {
+      this.showToast(`Could not open identity candidate: ${err.message}`, 'danger');
+      if (err.status === 409) this.refreshIdentityReview(true);
+    }
+  }
+
+  identityDecision(candidate, note) {
+    return {
+      expected_source_pdid: candidate.source_pdid,
+      expected_target_pdid: candidate.target_pdid,
+      expected_updated_at: candidate.updated_at,
+      decision_note: note
+    };
+  }
+
+  openIdentityMergeConfirmation(candidate) {
+    const target = this.identityDeviceName(candidate.target_device, candidate.target_pdid);
+    this.openModal('Confirm identity merge', `
+      <div class="modal-warning-icon">⚠️</div>
+      <p><strong>${escapeHTML(target)}</strong> will survive. LIAS will preserve and reconcile names, users, tags, policies, overrides, and flow-log references.</p>
+      <label for="identity-note">Decision note (optional)</label><textarea id="identity-note" maxlength="1024" class="modal-input"></textarea>
+      <label for="identity-merge-phrase">Type <strong>MERGE</strong> to confirm</label><input id="identity-merge-phrase" class="modal-input" autocomplete="off">`, `
+      <button class="btn btn-secondary" id="identity-cancel">Cancel</button><button class="btn btn-danger" id="identity-merge-submit" disabled>Merge records</button>`);
+    const phrase = document.getElementById('identity-merge-phrase');
+    const submit = document.getElementById('identity-merge-submit');
+    phrase.addEventListener('input', () => { submit.disabled = phrase.value !== 'MERGE'; });
+    document.getElementById('identity-cancel').addEventListener('click', () => this.closeModal());
+    submit.addEventListener('click', async () => {
+      submit.disabled = true;
+      try {
+        await API.decideIdentityCandidate(candidate.id, 'confirm', this.identityDecision(candidate, document.getElementById('identity-note').value));
+        this.closeModal();
+        this.snapshotETag = '';
+        await Promise.all([this.loadData(), this.refreshIdentityReview(false)]);
+        this.showToast(`Identity records merged into ${target}`);
+      } catch (err) {
+        this.showToast(err.status === 409 ? 'The candidate changed. Review the refreshed evidence before deciding.' : `Merge failed: ${err.message}`, 'danger');
+        this.closeModal();
+        await this.refreshIdentityReview(true);
+      }
+    });
+    phrase.focus();
+  }
+
+  openIdentityReject(candidate) {
+    this.openModal('Reject possible match', `
+      <p>Rejecting keeps both device records separate. You can reopen this decision later through the API.</p>
+      <label for="identity-reject-note">Decision note (optional)</label><textarea id="identity-reject-note" maxlength="1024" class="modal-input"></textarea>`, `
+      <button class="btn btn-secondary" id="identity-cancel">Cancel</button><button class="btn btn-danger" id="identity-reject-submit">Reject match</button>`);
+    document.getElementById('identity-cancel').addEventListener('click', () => this.closeModal());
+    document.getElementById('identity-reject-submit').addEventListener('click', async event => {
+      event.currentTarget.disabled = true;
+      try {
+        await API.decideIdentityCandidate(candidate.id, 'reject', this.identityDecision(candidate, document.getElementById('identity-reject-note').value));
+        this.closeModal();
+        await this.refreshIdentityReview(true);
+        this.showToast('Possible match rejected; both records remain separate.');
+      } catch (err) {
+        this.showToast(`Reject failed: ${err.message}`, 'danger');
+        await this.refreshIdentityReview(true);
+      }
+    });
+  }
+
+  openIdentityBinding(pdid) {
+    this.openModal('Add verified identity binding', `
+      <label for="identity-binding-type">Binding type</label><select id="identity-binding-type" class="modal-input"><option value="manual">Manual identifier</option><option value="mac">MAC address</option><option value="dhcp_client_id">DHCP client ID</option><option value="ppsk_id">PPSK ID</option><option value="device_public_key">Device public key</option></select>
+      <label for="identity-binding-value">Value</label><input id="identity-binding-value" class="modal-input" autocomplete="off">`, `
+      <button class="btn btn-secondary" id="identity-cancel">Cancel</button><button class="btn btn-primary" id="identity-bind-submit">Add binding</button>`);
+    document.getElementById('identity-cancel').addEventListener('click', () => this.closeModal());
+    document.getElementById('identity-bind-submit').addEventListener('click', async () => {
+      const value = document.getElementById('identity-binding-value').value.trim();
+      if (!value) return;
+      try {
+        await API.bindIdentity(pdid, { type: document.getElementById('identity-binding-type').value, value, source: 'lias_dashboard' });
+        this.closeModal();
+        this.showToast('Verified binding added.');
+      } catch (err) { this.showToast(`Binding failed: ${err.message}`, 'danger'); }
+    });
+    document.getElementById('identity-binding-value').focus();
+  }
+
+  openIdentitySplit(pdid, mac) {
+    this.openModal('Split device identity', `
+      <p>This creates a separate device record for <code>${escapeHTML(mac || 'the selected MAC')}</code>. Existing policy objects are not silently discarded.</p>
+      <label for="identity-split-mac">MAC to split</label><input id="identity-split-mac" class="modal-input" value="${escapeHTML(mac)}">
+      <label for="identity-split-phrase">Type <strong>SPLIT</strong> to confirm</label><input id="identity-split-phrase" class="modal-input" autocomplete="off">`, `
+      <button class="btn btn-secondary" id="identity-cancel">Cancel</button><button class="btn btn-danger" id="identity-split-submit" disabled>Split identity</button>`);
+    const phrase = document.getElementById('identity-split-phrase');
+    const submit = document.getElementById('identity-split-submit');
+    phrase.addEventListener('input', () => { submit.disabled = phrase.value !== 'SPLIT'; });
+    document.getElementById('identity-cancel').addEventListener('click', () => this.closeModal());
+    submit.addEventListener('click', async () => {
+      try {
+        await API.splitIdentity(pdid, { mac: document.getElementById('identity-split-mac').value.trim() });
+        this.closeModal(); this.snapshotETag = ''; await this.loadData(); this.showToast('Device identity split completed.');
+      } catch (err) { this.showToast(`Split failed: ${err.message}`, 'danger'); }
+    });
+    phrase.focus();
   }
 
   // Dashboard Live Enforcements Helper Methods
@@ -434,7 +759,7 @@ class App {
     const online = this.devices.filter(d => d.online).length;
     const offline = total - online;
 
-    container.innerHTML = `
+    setSafeHTML(container, `
       <div style="margin-bottom: 20px;">
         <h3 style="font-size: 20px; font-weight: 800; letter-spacing: -0.5px;">Active Enforcements</h3>
         <p style="font-size: 13px; color: var(--text-secondary); margin-top: 2px;">Live status of scheduled policies currently in effect.</p>
@@ -473,7 +798,7 @@ class App {
       <div class="device-grid" style="margin-top:16px;">
         ${this.devices.slice(0, 12).map(d => this.renderDeviceCard(d)).join('')}
       </div>
-    `;
+    `);
 
     this.bindGlobalSwitchEvents();
   }
@@ -612,7 +937,7 @@ class App {
       `;
     });
 
-    container.innerHTML = html;
+    setSafeHTML(container, html);
 
     document.querySelectorAll('.group-header').forEach(hdr => {
       hdr.addEventListener('click', (e) => {
@@ -1001,7 +1326,7 @@ class App {
       </div>
     `;
 
-    container.innerHTML = html;
+    setSafeHTML(container, html);
 
     const addBtn = document.getElementById('btn-add-policy');
     if (addBtn) addBtn.addEventListener('click', () => this.openPolicyWizard());
@@ -1154,7 +1479,7 @@ class App {
       </div>
     `;
 
-    container.innerHTML = html;
+    setSafeHTML(container, html);
 
     const addBtn = document.getElementById('btn-add-schedule');
     if (addBtn) addBtn.addEventListener('click', () => this.openScheduleModal());
@@ -1487,7 +1812,7 @@ class App {
     const { policy } = this.wizardState;
     const container = document.getElementById('wiz-shadow-warning');
     if (!container || policy.type === 'global') {
-      if (container) container.innerHTML = '';
+      if (container) container.replaceChildren();
       return;
     }
 
@@ -1495,12 +1820,12 @@ class App {
     const existing = this.policies.find(p => p.id !== policy.id && p.type === policy.type && p.target_id === target);
 
     if (existing) {
-      container.innerHTML = `
+      setSafeHTML(container, `
         <div class="shadow-policy-banner">
           ⚠️ <strong>Shadow Policy Warning:</strong> '${existing.name}' already targets this ${policy.type}. Creating a second policy will not replace it — the higher-priority rule wins.
           <button class="btn btn-secondary" id="btn-edit-existing-shadow" style="padding:2px 8px; font-size:11px; margin-top:6px; display:block;">Edit Existing Policy Instead</button>
         </div>
-      `;
+      `);
       const editBtn = document.getElementById('btn-edit-existing-shadow');
       if (editBtn) {
         editBtn.addEventListener('click', () => {
@@ -1508,7 +1833,7 @@ class App {
         });
       }
     } else {
-      container.innerHTML = '';
+      container.replaceChildren();
     }
   }
 
@@ -1553,7 +1878,7 @@ class App {
       if (typeSel) {
         typeSel.addEventListener('change', (e) => {
           policy.type = e.target.value;
-          document.getElementById('wiz-target-container').innerHTML = this.renderWizardTargetDropdown(policy.type, policy.target_id);
+          setSafeHTML(document.getElementById('wiz-target-container'), this.renderWizardTargetDropdown(policy.type, policy.target_id));
           this.checkShadowPolicy();
         });
       }
@@ -1607,7 +1932,7 @@ class App {
           policy.schedule_ids = selected;
 
           const selectedScheds = selected.map(id => this.schedules.find(s => s.id === id)).filter(Boolean);
-          document.getElementById('wiz-timeline-container').innerHTML = this.renderWeeklyTimeline(selectedScheds);
+          setSafeHTML(document.getElementById('wiz-timeline-container'), this.renderWeeklyTimeline(selectedScheds));
           
           this.renderPolicyWizardStep();
         });
@@ -1808,7 +2133,7 @@ class App {
         end_time: '06:00',
         action: 'block'
       }, newIdx);
-      container.insertAdjacentHTML('beforeend', newRuleHtml);
+      appendSafeHTML(container, newRuleHtml);
     });
 
     const rulesContainer = document.getElementById('sched-rules-container');
@@ -1830,9 +2155,9 @@ class App {
         const allDayChk = row.querySelector('.rule-all-day');
         if (allDayChk && allDayChk.checked) return;
         if (start && end && end <= start) {
-          overnightContainer.innerHTML = `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${this.formatTimeTo12hr(end)} the FOLLOWING day</div>`;
+          setSafeHTML(overnightContainer, `<div class="overnight-chip moon">🌙 Continues past midnight — ends ${escapeHTML(this.formatTimeTo12hr(end))} the FOLLOWING day</div>`);
         } else {
-          overnightContainer.innerHTML = '';
+          overnightContainer.replaceChildren();
         }
       }
 
@@ -1844,7 +2169,7 @@ class App {
         if (e.target.checked) {
           startInput.value = '00:00'; endInput.value = '23:59';
           startInput.disabled = true; endInput.disabled = true;
-          if (overnightContainer) overnightContainer.innerHTML = '';
+          if (overnightContainer) overnightContainer.replaceChildren();
         } else {
           startInput.disabled = false; endInput.disabled = false;
         }
@@ -1871,12 +2196,12 @@ class App {
   }
 
   async renderAnalyticsView(container) {
-    container.innerHTML = `<div class="loader"><div class="spinner"></div></div>`;
+    setSafeHTML(container, `<div class="loader"><div class="spinner"></div></div>`);
     try {
       const stats = await API.getNetworkStats();
       const topDevName = this.devices.find(d => d.pdid === stats.TopBlockedDevicePDID)?.hostname || stats.TopBlockedDevicePDID || 'N/A';
 
-      container.innerHTML = `
+      setSafeHTML(container, `
         <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap:16px; margin-bottom:24px;">
           <div class="card">
             <div style="font-size:13px; color:var(--danger); font-weight:600;">BLOCKED EVENTS (24H)</div>
@@ -1891,19 +2216,20 @@ class App {
           <h3>Network Activity Insights</h3>
           <p style="color:var(--text-secondary); margin-top:4px;">Detailed flow logs and per-device bandwidth charts will appear here in future updates.</p>
         </div>
-      `;
+      `);
     } catch (err) {
-      container.innerHTML = `<div class="card"><p>Failed to load analytics.</p></div>`;
+      setSafeHTML(container, `<div class="card"><p>Failed to load analytics.</p></div>`);
     }
   }
 
   renderSettingsView(container) {
-    container.innerHTML = `
+    setSafeHTML(container, `
       <div class="card">
         <h3>System Maintenance</h3>
         <p style="font-size:13px; color:var(--text-secondary); margin-top:4px;">Manage underlying netfilter tables and global overrides.</p>
         <div style="margin-top:16px; display:flex; flex-direction:column; gap:12px;">
           <button class="btn btn-danger" id="btn-flush-nft">Flush Nftables Lancontrol Table</button>
+          <button class="btn btn-secondary" id="btn-logout">Sign out of dashboard</button>
           
           <div class="hig-toggle-row">
             <div class="hig-toggle-text">
@@ -1917,7 +2243,14 @@ class App {
           </div>
         </div>
       </div>
-    `;
+    `);
+
+    document.getElementById('btn-logout').addEventListener('click', async () => {
+      try { await API.deleteSession(); } catch (_) { /* an expired session is already signed out */ }
+      this.sse?.close();
+      this.sse = null;
+      this.renderLoginView();
+    });
 
     document.getElementById('btn-flush-nft').addEventListener('click', () => {
       this.openConfirmModal('Flush Nftables', 'Are you sure you want to flush all nftables netdev rules? LIAS will rebuild them on the next sync cycle.', 'Flush Rules', async () => {
@@ -2031,14 +2364,17 @@ class App {
   }
 
   openModal(title, bodyHtml, footerHtml = '') {
+    this.modalPreviousFocus = document.activeElement;
     document.getElementById('modal-title').textContent = title;
-    document.getElementById('modal-body').innerHTML = bodyHtml;
-    document.getElementById('modal-footer').innerHTML = footerHtml;
+    setSafeHTML(document.getElementById('modal-body'), bodyHtml);
+    setSafeHTML(document.getElementById('modal-footer'), footerHtml);
     document.getElementById('modal-root').classList.remove('hidden');
+    requestAnimationFrame(() => document.querySelector('#modal-root input, #modal-root select, #modal-root textarea, #modal-root button')?.focus());
   }
 
   closeModal() {
     document.getElementById('modal-root').classList.add('hidden');
+    this.modalPreviousFocus?.focus?.();
   }
 
   showToast(msg, type = 'info') {
@@ -2047,7 +2383,7 @@ class App {
     const toast = document.createElement('div');
     toast.className = 'toast';
     if (type === 'danger') toast.style.backgroundColor = 'var(--danger)';
-    toast.innerHTML = msg;
+    toast.textContent = String(msg);
     root.appendChild(toast);
     setTimeout(() => toast.remove(), 4000);
   }

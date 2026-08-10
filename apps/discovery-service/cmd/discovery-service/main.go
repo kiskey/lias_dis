@@ -5,201 +5,230 @@
 package main
 
 import (
-    "context"
-    "encoding/json"
-    "errors"
-    "log/slog"
-    "net/http"
-    "os"
-    "os/signal"
-    "strings"
-    "syscall"
-    "time"
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 
-    disAPI "github.com/user/lias-dis/apps/discovery-service/internal/api"
-    "github.com/user/lias-dis/apps/discovery-service/internal/config"
-    "github.com/user/lias-dis/apps/discovery-service/internal/correlation"
-    "github.com/user/lias-dis/apps/discovery-service/internal/discovery"
-    "github.com/user/lias-dis/apps/discovery-service/internal/inventory"
-    "github.com/user/lias-dis/apps/discovery-service/internal/storage"
-    "github.com/user/lias-dis/pkg/oui"
-    sharedAPI "github.com/user/lias-dis/shared/api"
+	disAPI "github.com/user/lias-dis/apps/discovery-service/internal/api"
+	"github.com/user/lias-dis/apps/discovery-service/internal/config"
+	"github.com/user/lias-dis/apps/discovery-service/internal/correlation"
+	"github.com/user/lias-dis/apps/discovery-service/internal/discovery"
+	"github.com/user/lias-dis/apps/discovery-service/internal/inventory"
+	"github.com/user/lias-dis/apps/discovery-service/internal/storage"
+	"github.com/user/lias-dis/pkg/oui"
+	sharedAPI "github.com/user/lias-dis/shared/api"
 )
 
 var version = "dev"
 
 func main() {
-    _ = oui.Get()
+	_ = oui.Get()
 
-    cfgPath := "/etc/dis/config.yaml"
-    if envPath := os.Getenv("DIS_CONFIG"); envPath != "" {
-        cfgPath = envPath
-    }
+	cfgPath := "/etc/dis/config.yaml"
+	if envPath := os.Getenv("DIS_CONFIG"); envPath != "" {
+		cfgPath = envPath
+	}
 
-    cfg, err := config.Load(cfgPath)
-    if err != nil {
-        slog.Error("Failed to load configuration", "error", err)
-        os.Exit(1)
-    }
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		slog.Error("Failed to load configuration", "error", err)
+		os.Exit(1)
+	}
 
-    var level slog.Level
-    switch strings.ToLower(cfg.Logging.Level) {
-    case "debug":
-        level = slog.LevelDebug
-    case "warn":
-        level = slog.LevelWarn
-    case "error":
-        level = slog.LevelError
-    default:
-        level = slog.LevelInfo
-    }
+	var level slog.Level
+	switch strings.ToLower(cfg.Logging.Level) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
 
-    opts := &slog.HandlerOptions{Level: level}
-    var handler slog.Handler
-    if strings.ToLower(cfg.Logging.Format) == "text" {
-        handler = slog.NewTextHandler(os.Stdout, opts)
-    } else {
-        handler = slog.NewJSONHandler(os.Stdout, opts)
-    }
-    slog.SetDefault(slog.New(handler))
+	opts := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
+	if strings.ToLower(cfg.Logging.Format) == "text" {
+		handler = slog.NewTextHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	}
+	slog.SetDefault(slog.New(handler))
 
-    cache := inventory.NewCache()
-    defer cache.Stop()
+	cache := inventory.NewCache()
+	defer cache.Stop()
 
-    st, err := storage.NewStorage(cfg.Storage.Path)
-    if err != nil {
-        slog.Warn("DIS Storage initialization failed, running in memory-only mode", "error", err)
-    } else {
-        defer st.Close()
-        if hydratedDevs, err := st.LoadHydrate(); err == nil {
-            for _, dev := range hydratedDevs {
-                dCopy := dev
-                cache.Upsert(&dCopy)
-            }
-        }
-    }
+	st, err := storage.NewStorage(cfg.Storage.Path)
+	if err != nil {
+		slog.Warn("DIS Storage initialization failed, running in memory-only mode", "error", err)
+	} else {
+		defer st.Close()
+		if hydratedDevs, err := st.LoadHydrate(); err == nil {
+			for _, dev := range hydratedDevs {
+				dCopy := dev
+				cache.Upsert(&dCopy)
+			}
+		}
+	}
 
-    broker := disAPI.NewBroker(cache)
-    eng := correlation.NewEngine(cache, broker)
-    if st != nil {
-        eng.SetStorage(st)
-    }
+	broker := disAPI.NewBroker(cache)
+	defer broker.Stop()
+	eng := correlation.NewEngine(cache, broker)
+	if st != nil {
+		eng.SetStorage(st)
+	}
 
-    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-    defer stop()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-    var providers []discovery.DiscoveryProvider
-    if cfg.Discovery.Netlink.Enabled {
-        p := discovery.NewNetlinkProvider(cfg.Discovery.Interface)
-        providers = append(providers, p)
-        defer p.Stop()
-    }
-    if cfg.Discovery.Pihole.Enabled {
-        p := discovery.NewPiholeProvider(cfg.Discovery.Pihole)
-        providers = append(providers, p)
-        defer p.Stop()
-    }
-    if cfg.Discovery.DHCP.Enabled {
-        p := discovery.NewDHCPProvider(cfg.Discovery.DHCP)
-        providers = append(providers, p)
-        defer p.Stop()
-    }
+	var providers []discovery.DiscoveryProvider
+	if cfg.Discovery.Netlink.Enabled {
+		p := discovery.NewNetlinkProvider(cfg.Discovery.Interface)
+		providers = append(providers, p)
+		defer p.Stop()
+	}
+	if cfg.Discovery.Pihole.Enabled {
+		p := discovery.NewPiholeProvider(cfg.Discovery.Pihole)
+		providers = append(providers, p)
+		defer p.Stop()
+	}
+	if cfg.Discovery.DHCP.Enabled {
+		p := discovery.NewDHCPProvider(cfg.Discovery.DHCP)
+		providers = append(providers, p)
+		defer p.Stop()
+	}
 
-    for _, p := range providers {
-        if err := p.Start(ctx); err != nil {
-            slog.Error("Failed to start provider", "name", p.Name(), "error", err)
-        } else {
-            slog.Info("Started provider", "name", p.Name())
-        }
-    }
+	for _, p := range providers {
+		if err := p.Start(ctx); err != nil {
+			slog.Error("Failed to start provider", "name", p.Name(), "error", err)
+		} else {
+			slog.Info("Started provider", "name", p.Name())
+		}
+	}
 
-    var primaries []discovery.Enricher
-    var ssdpEnricher *discovery.SSDPEnricher
-    
-    if cfg.Discovery.Enrichment.AvahiEnabled {
-        e := discovery.NewAvahiEnricher()
-        _ = e.Start(ctx)
-        primaries = append(primaries, e)
-        defer e.Stop()
-    }
-    if cfg.Discovery.Enrichment.SSDPEnabled {
-        ssdpEnricher = discovery.NewSSDPEnricher(cfg.Discovery.Interface)
-        _ = ssdpEnricher.Start(ctx)
-        primaries = append(primaries, ssdpEnricher)
-        defer ssdpEnricher.Stop()
-    }
-    if cfg.Discovery.Enrichment.NetbiosEnabled {
-        e := discovery.NewNetBIOSEnricher()
-        _ = e.Start(ctx)
-        primaries = append(primaries, e)
-        defer e.Stop()
-    }
-    if cfg.Discovery.Enrichment.TLSEnabled {
-        e := discovery.NewTLSFingerprinter()
-        _ = e.Start(ctx)
-        primaries = append(primaries, e)
-        defer e.Stop()
-    }
+	var primaries []discovery.Enricher
+	var ssdpEnricher *discovery.SSDPEnricher
 
-    var fallback discovery.Enricher
-    if cfg.Discovery.Enrichment.NmapEnabled {
-        e := discovery.NewNmapEnricher()
-        _ = e.Start(ctx)
-        fallback = e
-        defer e.Stop()
-    }
+	if cfg.Discovery.Enrichment.AvahiEnabled {
+		e := discovery.NewAvahiEnricher()
+		if err := e.Start(ctx); err != nil {
+			slog.Warn("Avahi enrichment disabled", "error", err)
+		} else {
+			primaries = append(primaries, e)
+			defer e.Stop()
+		}
+	}
+	if cfg.Discovery.Enrichment.SSDPEnabled {
+		e := discovery.NewSSDPEnricher(cfg.Discovery.Interface)
+		if err := e.Start(ctx); err != nil {
+			slog.Warn("SSDP enrichment disabled", "error", err)
+		} else {
+			ssdpEnricher = e
+			primaries = append(primaries, e)
+			defer e.Stop()
+		}
+	}
+	if cfg.Discovery.Enrichment.NetbiosEnabled {
+		e := discovery.NewNetBIOSEnricher()
+		if err := e.Start(ctx); err != nil {
+			slog.Warn("NetBIOS enrichment disabled", "error", err)
+		} else {
+			primaries = append(primaries, e)
+			defer e.Stop()
+		}
+	}
+	if cfg.Discovery.Enrichment.TLSEnabled {
+		e := discovery.NewTLSMetadataEnricher()
+		if err := e.Start(ctx); err != nil {
+			slog.Warn("TLS metadata enrichment disabled", "error", err)
+		} else {
+			primaries = append(primaries, e)
+			defer e.Stop()
+		}
+	}
 
-    // P3-FIX: Pass ValidationInterval to Orchestrator
-    orch := discovery.NewOrchestrator(cache, broker, primaries, fallback, cfg.Discovery.Enrichment.ValidationInterval)
-    eng.SetOrchestrator(orch)
-    
-    orch.SetDeviceManager(eng)
+	var fallback discovery.Enricher
+	if cfg.Discovery.Enrichment.NmapEnabled {
+		e := discovery.NewNmapEnricher(discovery.NmapOptions{
+			HostTimeout:       cfg.Discovery.Enrichment.NmapHostTimeout,
+			ProcessTimeout:    cfg.Discovery.Enrichment.NmapProcessTimeout,
+			MaxRate:           cfg.Discovery.Enrichment.NmapMaxRate,
+			MaxOutputBytes:    cfg.Discovery.Enrichment.NmapMaxOutputBytes,
+			EnableOSDetection: cfg.Discovery.Enrichment.NmapOSDetection,
+		})
+		if err := e.Start(ctx); err != nil {
+			slog.Warn("Nmap enrichment disabled", "error", err)
+		} else {
+			fallback = e
+			defer e.Stop()
+		}
+	}
 
-    if ssdpEnricher != nil {
-        ssdpEnricher.SetCache(cache)
-        ssdpEnricher.SetEnrichmentTriggerer(orch)
-    }
+	orch := discovery.NewOrchestratorWithOptions(cache, broker, primaries, fallback, cfg.Discovery.Enrichment.ValidationInterval, discovery.OrchestratorOptions{
+		WorkerCount:     cfg.Discovery.Enrichment.WorkerCount,
+		QueueSize:       cfg.Discovery.Enrichment.QueueSize,
+		PrimaryTimeout:  cfg.Discovery.Enrichment.PrimaryTimeout,
+		FallbackTimeout: cfg.Discovery.Enrichment.FallbackTimeout,
+	})
+	defer orch.Stop()
+	eng.SetOrchestrator(orch)
 
-    eng.Run(ctx, providers)
+	orch.SetDeviceManager(eng)
 
-    mux := http.NewServeMux()
-    handlers := disAPI.NewHandlers(cache, broker, orch)
-    handlers.RegisterRoutes(mux, cfg.HTTP.AuthToken)
+	if ssdpEnricher != nil {
+		ssdpEnricher.SetCache(cache)
+		ssdpEnricher.SetEnrichmentTriggerer(orch)
+	}
 
-    mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusOK)
-        _ = json.NewEncoder(w).Encode(sharedAPI.HealthResponse{
-            Status:  "ok",
-            Version: version,
-        })
-    })
+	eng.Run(ctx, providers)
 
-    srv := &http.Server{
-        Addr:         cfg.HTTP.Listen,
-        Handler:      mux,
-        ReadTimeout:  10 * time.Second,
-        WriteTimeout: 0,
-        IdleTimeout:  120 * time.Second,
-    }
+	mux := http.NewServeMux()
+	handlers := disAPI.NewHandlers(cache, broker, orch)
+	handlers.SetIdentityManager(eng)
+	handlers.RegisterRoutes(mux, cfg.HTTP.AuthToken)
 
-    go func() {
-        slog.Info("Starting Discovery Intelligence Service", "version", version, "listen_addr", cfg.HTTP.Listen)
-        if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-            slog.Error("HTTP server failed", "error", err)
-            os.Exit(1)
-        }
-    }()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(sharedAPI.HealthResponse{
+			Status:  "ok",
+			Version: version,
+		})
+	})
 
-    <-ctx.Done()
-    slog.Info("Shutdown signal received, draining connections...")
+	srv := &http.Server{
+		Addr:         cfg.HTTP.Listen,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 0,
+		IdleTimeout:  120 * time.Second,
+	}
 
-    shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-    defer cancel()
+	go func() {
+		slog.Info("Starting Discovery Intelligence Service", "version", version, "listen_addr", cfg.HTTP.Listen)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("HTTP server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
 
-    if err := srv.Shutdown(shutdownCtx); err != nil {
-        slog.Error("Graceful shutdown error", "error", err)
-    }
+	<-ctx.Done()
+	slog.Info("Shutdown signal received, draining connections...")
 
-    slog.Info("Discovery Intelligence Service stopped gracefully")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("Graceful shutdown error", "error", err)
+	}
+
+	slog.Info("Discovery Intelligence Service stopped gracefully")
 }
