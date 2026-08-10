@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -23,6 +24,42 @@ var (
 type identityCandidateCursor struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	ID        int64     `json:"id"`
+}
+
+type identityAliasKey struct {
+	DeviceID string
+	Type     models.IdentityAliasType
+	Hash     string
+}
+
+type identityAliasActivity struct {
+	ID                int64
+	FirstSeen         time.Time
+	LastSeen          time.Time
+	LatestSource      string
+	LatestConfidence  float64
+	DurableSource     string
+	DurableConfidence float64
+	DurableVerified   bool
+	Revoked           bool
+}
+
+func (e *Engine) loadIdentityAliasActivity(store *storage.Storage) {
+	aliases, err := store.LoadIdentityAliases()
+	if err != nil {
+		return
+	}
+	e.aliasMu.Lock()
+	defer e.aliasMu.Unlock()
+	for _, alias := range aliases {
+		key := identityAliasKey{DeviceID: alias.DeviceID, Type: alias.Type, Hash: alias.ValueHash}
+		e.aliases[key] = identityAliasActivity{
+			ID: alias.ID, FirstSeen: alias.FirstSeen, LastSeen: alias.LastSeen,
+			LatestSource: alias.Source, LatestConfidence: alias.Confidence,
+			DurableSource: alias.Source, DurableConfidence: alias.Confidence,
+			DurableVerified: alias.Verified, Revoked: alias.RevokedAt != nil,
+		}
+	}
 }
 
 func (e *Engine) resolveVerifiedObservation(signals []identitycore.Signal) *models.Device {
@@ -61,26 +98,50 @@ func (e *Engine) recordIdentitySignals(d *models.Device, signals []identitycore.
 	if e.store == nil || d == nil || d.DeviceID == "" {
 		return
 	}
-	key := d.DeviceID
-	e.identityMu.Lock()
-	last := e.identityLastWrite[key]
-	if observedAt.Sub(last) < 5*time.Minute && candidate == nil {
-		e.identityMu.Unlock()
-		return
-	}
-	e.identityLastWrite[key] = observedAt
-	e.identityMu.Unlock()
 
 	for _, signal := range signals {
 		hash, err := identitycore.HashAlias(signal.Type, signal.Value)
 		if err != nil {
 			continue
 		}
-		_, _ = e.store.UpsertIdentityAlias(models.IdentityAlias{
+		key := identityAliasKey{DeviceID: d.DeviceID, Type: signal.Type, Hash: hash}
+		e.aliasMu.Lock()
+		activity, known := e.aliases[key]
+		if activity.FirstSeen.IsZero() {
+			activity.FirstSeen = observedAt
+		}
+		if observedAt.After(activity.LastSeen) {
+			activity.LastSeen = observedAt
+		}
+		activity.LatestSource = signal.Source
+		if signal.Confidence > activity.LatestConfidence {
+			activity.LatestConfidence = signal.Confidence
+		}
+		materialChanged := !known || (!activity.Revoked &&
+			((signal.Verified && !activity.DurableVerified) || signal.Confidence > activity.DurableConfidence))
+		e.aliases[key] = activity
+		e.aliasMu.Unlock()
+		if !materialChanged {
+			continue
+		}
+		id, persistErr := e.store.UpsertIdentityAlias(models.IdentityAlias{
 			DeviceID: d.DeviceID, PDID: d.PDID, Type: signal.Type,
 			ValueHash: hash, Source: signal.Source, Confidence: signal.Confidence,
-			Verified: signal.Verified, FirstSeen: observedAt, LastSeen: observedAt,
+			Verified: signal.Verified, FirstSeen: activity.FirstSeen, LastSeen: observedAt,
 		})
+		if persistErr == nil {
+			e.aliasMu.Lock()
+			activity = e.aliases[key]
+			activity.ID = id
+			activity.DurableSource = signal.Source
+			if signal.Confidence > activity.DurableConfidence {
+				activity.DurableConfidence = signal.Confidence
+			}
+			activity.DurableVerified = activity.DurableVerified || signal.Verified
+			activity.Revoked = false
+			e.aliases[key] = activity
+			e.aliasMu.Unlock()
+		}
 	}
 	if candidate == nil || decision.Probability < identitycore.PassiveCandidateThreshold {
 		return
@@ -123,7 +184,40 @@ func (e *Engine) GetIdentityProfile(pdid string) (*models.IdentityProfile, error
 	if e.store == nil {
 		return nil, errors.New("identity persistence unavailable")
 	}
-	return e.store.IdentityProfile(e.ResolvePDID(pdid))
+	profile, err := e.store.IdentityProfile(e.ResolvePDID(pdid))
+	if err != nil {
+		return nil, err
+	}
+	e.aliasMu.RLock()
+	for i := range profile.Aliases {
+		alias := &profile.Aliases[i]
+		activity, ok := e.aliases[identityAliasKey{DeviceID: alias.DeviceID, Type: alias.Type, Hash: alias.ValueHash}]
+		if !ok {
+			continue
+		}
+		if activity.LastSeen.After(alias.LastSeen) {
+			alias.LastSeen = activity.LastSeen
+		}
+		if activity.LatestSource != "" {
+			alias.Source = activity.LatestSource
+		}
+		if activity.LatestConfidence > alias.Confidence {
+			alias.Confidence = activity.LatestConfidence
+		}
+	}
+	e.aliasMu.RUnlock()
+	// Preserve the route's established activity ordering even though the
+	// freshest timestamps are now overlaid from memory rather than SQLite.
+	sort.SliceStable(profile.Aliases, func(i, j int) bool {
+		if profile.Aliases[i].Verified != profile.Aliases[j].Verified {
+			return profile.Aliases[i].Verified
+		}
+		if !profile.Aliases[i].LastSeen.Equal(profile.Aliases[j].LastSeen) {
+			return profile.Aliases[i].LastSeen.After(profile.Aliases[j].LastSeen)
+		}
+		return profile.Aliases[i].ID > profile.Aliases[j].ID
+	})
+	return profile, nil
 }
 
 func (e *Engine) BindIdentityAlias(pdid string, req models.IdentityBindingRequest) (models.IdentityAlias, error) {
@@ -150,6 +244,14 @@ func (e *Engine) BindIdentityAlias(pdid string, req models.IdentityBindingReques
 	id, err := e.store.UpsertIdentityAlias(alias)
 	alias.ID = id
 	if err == nil {
+		key := identityAliasKey{DeviceID: d.DeviceID, Type: alias.Type, Hash: alias.ValueHash}
+		e.aliasMu.Lock()
+		e.aliases[key] = identityAliasActivity{
+			ID: id, FirstSeen: alias.FirstSeen, LastSeen: alias.LastSeen,
+			LatestSource: alias.Source, LatestConfidence: alias.Confidence,
+			DurableSource: alias.Source, DurableConfidence: alias.Confidence, DurableVerified: true,
+		}
+		e.aliasMu.Unlock()
 		d.IdentityAssurance = models.IdentityVerified
 		d.IdentityProbability = 1
 		d.IdentityAmbiguous = false
@@ -171,6 +273,15 @@ func (e *Engine) RevokeIdentityAlias(pdid string, aliasID int64) error {
 	pdid = e.ResolvePDID(pdid)
 	err := e.store.RevokeIdentityAlias(pdid, aliasID)
 	if err == nil {
+		e.aliasMu.Lock()
+		for key, activity := range e.aliases {
+			if activity.ID == aliasID {
+				activity.Revoked = true
+				e.aliases[key] = activity
+				break
+			}
+		}
+		e.aliasMu.Unlock()
 		e.broker.Broadcast(models.NewEvent(models.EventIdentityBindingChanged, pdid, models.IdentityBindingEventPayload{
 			PDID: pdid, AliasID: aliasID, Action: "revoked", Timestamp: time.Now(),
 		}))

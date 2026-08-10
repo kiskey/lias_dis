@@ -59,6 +59,46 @@ func TestVerifiedAliasCannotBelongToTwoDevices(t *testing.T) {
 	}
 }
 
+func TestIdenticalAliasRefreshDoesNotWriteSQLite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "alias-refresh.db")
+	s, err := NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	if err := s.SaveDevice(&models.Device{DeviceID: "dev_a", PDID: "pdid_a", FirstSeen: now, LastSeen: now}); err != nil {
+		t.Fatal(err)
+	}
+	alias := models.IdentityAlias{DeviceID: "dev_a", PDID: "pdid_a", Type: models.AliasMAC, ValueHash: "hash", Source: "openwrt_ap", Confidence: .9, FirstSeen: now, LastSeen: now}
+	if _, err := s.UpsertIdentityAlias(alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatal(err)
+	}
+	before := sqliteTotalChanges(t, s)
+	alias.LastSeen = now.Add(5 * time.Minute)
+	if _, err := s.UpsertIdentityAlias(alias); err != nil {
+		t.Fatal(err)
+	}
+	if after := sqliteTotalChanges(t, s); after != before {
+		t.Fatalf("identical alias refresh changed SQLite: before=%d after=%d", before, after)
+	}
+	aliases, err := s.ListIdentityAliases("pdid_a")
+	if err != nil || len(aliases) != 1 || !aliases[0].LastSeen.Equal(now) {
+		t.Fatalf("durable alias activity changed: aliases=%+v err=%v", aliases, err)
+	}
+
+	alias.Confidence = .95
+	if _, err := s.UpsertIdentityAlias(alias); err != nil {
+		t.Fatal(err)
+	}
+	if after := sqliteTotalChanges(t, s); after <= before {
+		t.Fatalf("material confidence increase did not write SQLite: before=%d after=%d", before, after)
+	}
+}
+
 func TestCandidateDecisionAndRedirect(t *testing.T) {
 	s, err := NewStorage(filepath.Join(t.TempDir(), "candidate.db"))
 	if err != nil {

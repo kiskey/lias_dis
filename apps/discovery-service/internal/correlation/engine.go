@@ -27,8 +27,6 @@ type EnrichmentOrchestrator interface {
 	TriggerEnrichment(pdid string, force bool)
 }
 
-const stableHeartbeatWriteInterval = 5 * time.Minute
-
 type Engine struct {
 	cache       *inventory.Cache
 	broker      *api.Broker
@@ -38,29 +36,28 @@ type Engine struct {
 	dedupMu     sync.Mutex
 	lastSeenObs map[string]time.Time
 
-	dirtyMu       sync.Mutex
-	dirtyDevices  map[string]struct{}
-	persistedSeen map[string]time.Time
+	dirtyMu      sync.Mutex
+	dirtyDevices map[string]struct{}
 
 	deferredMu     sync.Mutex
 	deferredOnline map[string]time.Time
 
-	promoteMu         sync.Mutex
-	identityMu        sync.Mutex
-	identityLastWrite map[string]time.Time
+	promoteMu  sync.Mutex
+	identityMu sync.Mutex
+	aliasMu    sync.RWMutex
+	aliases    map[identityAliasKey]identityAliasActivity
 }
 
 func NewEngine(cache *inventory.Cache, broker *api.Broker) *Engine {
 	deb := NewDebouncer(broker)
 	return &Engine{
-		cache:             cache,
-		broker:            broker,
-		debouncer:         deb,
-		lastSeenObs:       make(map[string]time.Time),
-		dirtyDevices:      make(map[string]struct{}),
-		persistedSeen:     make(map[string]time.Time),
-		deferredOnline:    make(map[string]time.Time),
-		identityLastWrite: make(map[string]time.Time),
+		cache:          cache,
+		broker:         broker,
+		debouncer:      deb,
+		lastSeenObs:    make(map[string]time.Time),
+		dirtyDevices:   make(map[string]struct{}),
+		deferredOnline: make(map[string]time.Time),
+		aliases:        make(map[identityAliasKey]identityAliasActivity),
 	}
 }
 
@@ -73,6 +70,7 @@ func (e *Engine) SetStorage(store *storage.Storage) {
 	e.debouncer.SetStore(store)
 
 	if store != nil {
+		e.loadIdentityAliasActivity(store)
 		if owners, err := store.LoadHostnameOwners(); err == nil {
 			e.cache.LoadHostnameOwners(owners)
 		}
@@ -160,19 +158,6 @@ func (e *Engine) markDirty(pdid string) {
 	e.dirtyMu.Unlock()
 }
 
-func (e *Engine) markSeenDirty(pdid string, seenAt time.Time) {
-	if e.store == nil || pdid == "" {
-		return
-	}
-	e.dirtyMu.Lock()
-	defer e.dirtyMu.Unlock()
-	if last, ok := e.persistedSeen[pdid]; ok && seenAt.Sub(last) < stableHeartbeatWriteInterval {
-		return
-	}
-	e.persistedSeen[pdid] = seenAt
-	e.dirtyDevices[pdid] = struct{}{}
-}
-
 func (e *Engine) runDedupSweep(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
@@ -190,13 +175,6 @@ func (e *Engine) runDedupSweep(ctx context.Context) {
 				}
 			}
 			e.dedupMu.Unlock()
-			e.identityMu.Lock()
-			for key, last := range e.identityLastWrite {
-				if now.Sub(last) > 24*time.Hour {
-					delete(e.identityLastWrite, key)
-				}
-			}
-			e.identityMu.Unlock()
 		}
 	}
 }
@@ -216,7 +194,6 @@ func (e *Engine) runStalenessSweep(ctx context.Context) {
 				if d == nil {
 					continue
 				}
-				e.markDirty(pdid)
 				e.broker.Broadcast(models.NewEvent(models.EventDeviceOffline, d.PDID, models.DeviceEventPayload{
 					PDID:      d.PDID,
 					MAC:       d.CurrentMAC,
@@ -369,11 +346,11 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 			e.markDirty(existing.PDID)
 		}
 	}
-	dirty := false
+	materialDirty := false
 
 	if macStr != "" && d != nil && d.HasMAC(macStr) && d.CurrentMAC != macStr {
 		d.CurrentMAC = macStr
-		dirty = true
+		materialDirty = true
 	}
 
 	if macStr != "" && d != nil && !d.HasMAC(macStr) {
@@ -387,7 +364,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 			e.debouncer.Submit(d.PDID, models.EventMACChanged, obs.Source, obs.Group, models.DeviceEventPayload{
 				PDID: d.PDID, MAC: macStr, OldMAC: oldMAC, Timestamp: time.Now(),
 			})
-			dirty = true
+			materialDirty = true
 		} else {
 			candidateTarget = d
 			candidateDecision = identitycore.ScorePassive(identitycore.PassiveInput{
@@ -531,14 +508,15 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 			d.PendingOnlineObs = append(d.PendingOnlineObs, obs.Source)
 		}
 
-		ApplySmartClassifications(d)
+		if ApplySmartClassifications(d) {
+			materialDirty = true
+		}
 		isInfra := d.HasTag("infrastructure") || d.DeviceType == "infrastructure"
 
 		if isAuthoritativeL2 || isInfra || len(d.PendingOnlineObs) >= 2 || hasL2AndL3Confirmation(d.PendingOnlineObs) {
 			d.Online = true
 			d.PendingOnlineObs = nil
 			e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
-			dirty = true
 		} else {
 			e.scheduleDeferredOnline(d.PDID, 30*time.Second)
 		}
@@ -566,7 +544,7 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 			OldCanonicalHostname: CanonicalizeHostname(oldHost),
 			Timestamp:            time.Now(),
 		})
-		dirty = true
+		materialDirty = true
 	}
 
 	if ipStr != "" && canUpdateCurrentIP(obs.Source) && d.CurrentIP != ipStr {
@@ -579,38 +557,36 @@ func (e *Engine) processObservation(obs discovery.Observation) {
 			OldIP:     oldIP,
 			Timestamp: time.Now(),
 		})
-		dirty = true
+		materialDirty = true
 	}
 
 	seenAt := normalizedObservationTime(obs.Timestamp)
 	if recordObservationSource(d, obs, seenAt) {
-		dirty = true
+		materialDirty = true
 	}
 	for _, svc := range obs.Services {
 		if d.AddService(svc) {
-			dirty = true
+			materialDirty = true
 		}
 	}
 	if d.Vendor == "" && strings.TrimSpace(obs.Vendor) != "" {
 		d.Vendor = strings.TrimSpace(obs.Vendor)
-		dirty = true
+		materialDirty = true
 	}
 	if d.Model == "" && strings.TrimSpace(obs.Model) != "" {
 		d.Model = strings.TrimSpace(obs.Model)
-		dirty = true
+		materialDirty = true
 	}
 
-	if dirty {
-		if seenAt.After(d.LastSeen) {
-			d.Touch(seenAt)
-		}
-		e.cache.Upsert(d)
+	// Presence is deliberately volatile. Keep the authoritative live timestamp
+	// and online state in the cache used by REST/SSE, but persist only material
+	// inventory or identity changes.
+	if seenAt.After(d.LastSeen) {
+		d.Touch(seenAt)
+	}
+	e.cache.Upsert(d)
+	if materialDirty {
 		e.markDirty(d.PDID)
-	} else {
-		if seenAt.After(d.LastSeen) {
-			e.cache.TouchLastSeen(d.PDID, seenAt)
-			e.markSeenDirty(d.PDID, seenAt)
-		}
 	}
 }
 
@@ -689,7 +665,6 @@ func (e *Engine) flushDeferredOnline(now time.Time) {
 			d.Online = true
 			d.PendingOnlineObs = nil
 			e.cache.Upsert(d)
-			e.markDirty(d.PDID)
 			e.broker.Broadcast(models.NewEvent(models.EventDeviceOnline, d.PDID, d))
 		}
 	}
@@ -718,17 +693,38 @@ func recordObservationSource(d *models.Device, obs discovery.Observation, seenAt
 		Timestamp:  seenAt,
 		Raw:        obs.Raw,
 	}
-	if exists && previous.Confidence == current.Confidence && reflect.DeepEqual(previous.Raw, current.Raw) {
-		return false
-	}
 	d.SourceInfo[obs.Source] = current
-	return true
+	return !exists || previous.Confidence != current.Confidence || !materialRawEqual(previous.Raw, current.Raw)
 }
 
-func ApplySmartClassifications(d *models.Device) {
-	if d == nil {
-		return
+var volatileObservationRawKeys = map[string]struct{}{
+	"lease_expires_at": {}, "observation_timestamp": {}, "observed_at": {},
+	"poll_timestamp": {}, "timestamp": {},
+}
+
+func materialRawEqual(left, right map[string]interface{}) bool {
+	return reflect.DeepEqual(materialRaw(left), materialRaw(right))
+}
+
+func materialRaw(raw map[string]interface{}) map[string]interface{} {
+	if raw == nil {
+		return nil
 	}
+	filtered := make(map[string]interface{}, len(raw))
+	for key, value := range raw {
+		if _, volatile := volatileObservationRawKeys[strings.ToLower(strings.TrimSpace(key))]; volatile {
+			continue
+		}
+		filtered[key] = value
+	}
+	return filtered
+}
+
+func ApplySmartClassifications(d *models.Device) bool {
+	if d == nil {
+		return false
+	}
+	beforeType, beforeName, beforeVendor := d.DeviceType, d.FriendlyName, d.Vendor
 
 	if d.CurrentIP != "" {
 		ip := net.ParseIP(d.CurrentIP)
@@ -750,4 +746,5 @@ func ApplySmartClassifications(d *models.Device) {
 			d.FriendlyName = "Amazon Alexa Device"
 		}
 	}
+	return beforeType != d.DeviceType || beforeName != d.FriendlyName || beforeVendor != d.Vendor
 }

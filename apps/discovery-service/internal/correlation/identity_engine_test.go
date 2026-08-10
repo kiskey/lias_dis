@@ -9,6 +9,7 @@ import (
 
 	"github.com/user/lias-dis/apps/discovery-service/internal/api"
 	"github.com/user/lias-dis/apps/discovery-service/internal/discovery"
+	identitycore "github.com/user/lias-dis/apps/discovery-service/internal/identity"
 	"github.com/user/lias-dis/apps/discovery-service/internal/inventory"
 	"github.com/user/lias-dis/apps/discovery-service/internal/storage"
 	"github.com/user/lias-dis/shared/models"
@@ -142,6 +143,59 @@ func TestIdentityCandidatePaginationAndReopen(t *testing.T) {
 	}
 	if _, err := eng.ListIdentityCandidates("pending", 2, "not-a-cursor"); err == nil {
 		t.Fatal("invalid cursor accepted")
+	}
+}
+
+func TestAliasActivityRehydratesDurableBaselineThenStaysVolatile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "alias-restart.db")
+	initialSeen := time.Now().Add(-time.Hour).UTC().Truncate(time.Millisecond)
+	store, err := storage.NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := &models.Device{DeviceID: "dev_restart", PDID: "pdid_restart", FirstSeen: initialSeen, LastSeen: initialSeen}
+	if err := store.SaveDevice(device); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := identitycore.HashAlias(models.AliasMAC, "00:11:22:33:44:55")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertIdentityAlias(models.IdentityAlias{DeviceID: device.DeviceID, PDID: device.PDID,
+		Type: models.AliasMAC, ValueHash: hash, Source: "openwrt_ap", Confidence: .9,
+		FirstSeen: initialSeen, LastSeen: initialSeen}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = storage.NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cache := inventory.NewCache()
+	defer cache.Stop()
+	cache.Upsert(device)
+	broker := api.NewBroker(cache)
+	defer broker.Stop()
+	eng := NewEngine(cache, broker)
+	eng.SetStorage(store)
+	profile, err := eng.GetIdentityProfile(device.PDID)
+	if err != nil || len(profile.Aliases) != 1 || !profile.Aliases[0].LastSeen.Equal(initialSeen) {
+		t.Fatalf("durable activity baseline did not rehydrate: profile=%+v err=%v", profile, err)
+	}
+
+	liveSeen := initialSeen.Add(30 * time.Minute)
+	eng.recordIdentitySignals(device, []identitycore.Signal{{Type: models.AliasMAC, Value: "00:11:22:33:44:55", Source: "openwrt_ap", Confidence: .9}}, nil, identitycore.Decision{}, liveSeen)
+	profile, err = eng.GetIdentityProfile(device.PDID)
+	if err != nil || !profile.Aliases[0].LastSeen.Equal(liveSeen) {
+		t.Fatalf("fresh activity was not available after restart: profile=%+v err=%v", profile, err)
+	}
+	durable, err := store.ListIdentityAliases(device.PDID)
+	if err != nil || len(durable) != 1 || !durable[0].LastSeen.Equal(initialSeen) {
+		t.Fatalf("fresh activity was persisted after restart: aliases=%+v err=%v", durable, err)
 	}
 }
 

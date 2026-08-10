@@ -6,6 +6,7 @@ package storage
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -128,7 +129,7 @@ func TestHydratePreservesCompleteDeviceState(t *testing.T) {
 		t.Fatalf("expected one device, got %d", len(hydrated))
 	}
 	got := hydrated[0]
-	if got.UserID != dev.UserID || !got.IsTentative || len(got.Services) != 1 || len(got.Tags) != 1 || len(got.PendingOnlineObs) != 1 {
+	if got.UserID != dev.UserID || !got.IsTentative || len(got.Services) != 1 || len(got.Tags) != 1 || got.Online || len(got.PendingOnlineObs) != 0 {
 		encoded, _ := json.Marshal(got)
 		t.Fatalf("hydrated state incomplete: %s", encoded)
 	}
@@ -137,13 +138,13 @@ func TestHydratePreservesCompleteDeviceState(t *testing.T) {
 	}
 }
 
-func TestHydrateDemotesStaleOnlineState(t *testing.T) {
+func TestHydrateAlwaysStartsPresenceOffline(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "stale-online.db")
 	s, err := NewStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	stale := time.Now().Add(-hydrationOnlineFreshness - time.Minute)
+	stale := time.Now()
 	dev := &models.Device{
 		PDID: "pdid_stale_restart", DeviceID: "dev_stale_restart",
 		CurrentMAC: "00:11:22:33:44:55", MACs: []string{"00:11:22:33:44:55"},
@@ -167,6 +168,75 @@ func TestHydrateDemotesStaleOnlineState(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(devices) != 1 || devices[0].Online || len(devices[0].PendingOnlineObs) != 0 {
-		t.Fatalf("stale presence survived restart: %+v", devices)
+		t.Fatalf("volatile presence survived restart: %+v", devices)
 	}
+}
+
+func TestVolatileDeviceStateDoesNotWriteSQLite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "volatile-device.db")
+	s, err := NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	initialSeen := time.Now().UTC().Truncate(time.Millisecond)
+	dev := &models.Device{
+		PDID: "pdid_volatile", DeviceID: "dev_volatile", Hostname: "phone",
+		FirstSeen: initialSeen.Add(-time.Hour), LastSeen: initialSeen, Online: true,
+		CurrentMAC: "00:11:22:33:44:55", MACs: []string{"00:11:22:33:44:55"},
+		SourceInfo: map[string]models.SourceMeta{
+			"openwrt_ap": {Source: "openwrt_ap", Confidence: .9, Timestamp: initialSeen, Raw: map[string]interface{}{"state": "reachable", "lease_expires_at": "soon"}},
+		},
+	}
+	if err := s.SaveDevice(dev); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatal(err)
+	}
+	before := sqliteTotalChanges(t, s)
+
+	dev.LastSeen = initialSeen.Add(10 * time.Minute)
+	dev.Online = false
+	dev.PendingOnlineObs = []string{"netlink"}
+	meta := dev.SourceInfo["openwrt_ap"]
+	meta.Timestamp = dev.LastSeen
+	meta.Raw["lease_expires_at"] = "later"
+	dev.SourceInfo["openwrt_ap"] = meta
+	if err := s.SaveDevicesBatch([]*models.Device{dev}); err != nil {
+		t.Fatal(err)
+	}
+	if after := sqliteTotalChanges(t, s); after != before {
+		t.Fatalf("volatile-only save changed SQLite: before=%d after=%d", before, after)
+	}
+	if info, err := os.Stat(path + "-wal"); err == nil && info.Size() != 0 {
+		t.Fatalf("volatile-only save appended %d bytes to WAL", info.Size())
+	}
+
+	hydrated, err := s.LoadHydrate()
+	if err != nil || len(hydrated) != 1 {
+		t.Fatalf("hydrate: devices=%+v err=%v", hydrated, err)
+	}
+	got := hydrated[0]
+	if !got.LastSeen.Equal(initialSeen) || got.Online || len(got.PendingOnlineObs) != 0 {
+		t.Fatalf("volatile state was persisted: %+v", got)
+	}
+
+	dev.Hostname = "phone-renamed"
+	if err := s.SaveDevicesBatch([]*models.Device{dev}); err != nil {
+		t.Fatal(err)
+	}
+	if after := sqliteTotalChanges(t, s); after <= before {
+		t.Fatalf("material hostname change did not write SQLite: before=%d after=%d", before, after)
+	}
+}
+
+func sqliteTotalChanges(t *testing.T, s *Storage) int64 {
+	t.Helper()
+	var changes int64
+	if err := s.db.QueryRow("SELECT total_changes()").Scan(&changes); err != nil {
+		t.Fatal(err)
+	}
+	return changes
 }

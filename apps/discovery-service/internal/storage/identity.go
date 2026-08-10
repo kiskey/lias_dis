@@ -58,24 +58,75 @@ func (s *Storage) UpsertIdentityAlias(alias models.IdentityAlias) (int64, error)
 		verified = 1
 	}
 	var id int64
-	err = tx.QueryRow(`
-        INSERT INTO identity_aliases (
-            device_id, alias_type, value_hash, source, confidence,
-            verified, first_seen, last_seen, revoked_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-        ON CONFLICT(device_id, alias_type, value_hash) DO UPDATE SET
-            source = excluded.source,
-            confidence = MAX(identity_aliases.confidence, excluded.confidence),
-            verified = MAX(identity_aliases.verified, excluded.verified),
-            last_seen = MAX(identity_aliases.last_seen, excluded.last_seen),
-            revoked_at = NULL
-        RETURNING id
-    `, alias.DeviceID, string(alias.Type), alias.ValueHash, alias.Source,
-		alias.Confidence, verified, alias.FirstSeen, alias.LastSeen).Scan(&id)
+	var existingSource string
+	var existingConfidence float64
+	var existingVerified int
+	var revoked sql.NullTime
+	err = tx.QueryRow(`SELECT id, source, confidence, verified, revoked_at
+        FROM identity_aliases WHERE device_id = ? AND alias_type = ? AND value_hash = ?`,
+		alias.DeviceID, string(alias.Type), alias.ValueHash).Scan(
+		&id, &existingSource, &existingConfidence, &existingVerified, &revoked)
+	if err == nil {
+		// last_seen is volatile activity. Identical observations return the
+		// existing ID without modifying a page or appending a WAL frame.
+		if existingSource == alias.Source && existingConfidence >= alias.Confidence &&
+			existingVerified >= verified && !revoked.Valid {
+			return id, nil
+		}
+		_, err = tx.Exec(`UPDATE identity_aliases SET source = ?, confidence = MAX(confidence, ?),
+            verified = MAX(verified, ?), revoked_at = NULL WHERE id = ?`,
+			alias.Source, alias.Confidence, verified, id)
+		if err != nil {
+			return 0, err
+		}
+		return id, tx.Commit()
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	result, err := tx.Exec(`INSERT INTO identity_aliases (
+        device_id, alias_type, value_hash, source, confidence,
+        verified, first_seen, last_seen, revoked_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`, alias.DeviceID, string(alias.Type), alias.ValueHash,
+		alias.Source, alias.Confidence, verified, alias.FirstSeen, alias.LastSeen)
+	if err != nil {
+		return 0, err
+	}
+	id, err = result.LastInsertId()
 	if err != nil {
 		return 0, err
 	}
 	return id, tx.Commit()
+}
+
+// LoadIdentityAliases hydrates the material alias index used to suppress
+// repeat writes while live observation times remain in memory.
+func (s *Storage) LoadIdentityAliases() ([]models.IdentityAlias, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT id, device_id, alias_type, value_hash, source,
+        confidence, verified, first_seen, last_seen, revoked_at FROM identity_aliases`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	aliases := make([]models.IdentityAlias, 0)
+	for rows.Next() {
+		var alias models.IdentityAlias
+		var verified int
+		var revoked sql.NullTime
+		if err := rows.Scan(&alias.ID, &alias.DeviceID, &alias.Type, &alias.ValueHash, &alias.Source,
+			&alias.Confidence, &verified, &alias.FirstSeen, &alias.LastSeen, &revoked); err != nil {
+			return nil, err
+		}
+		alias.Verified = verified == 1
+		if revoked.Valid {
+			value := revoked.Time
+			alias.RevokedAt = &value
+		}
+		aliases = append(aliases, alias)
+	}
+	return aliases, rows.Err()
 }
 
 func (s *Storage) FindVerifiedAliasPDIDs(aliasType models.IdentityAliasType, valueHash string) ([]string, error) {

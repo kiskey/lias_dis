@@ -49,6 +49,47 @@ func TestDeferredOnlineUsesOneBoundedScheduler(t *testing.T) {
 	}
 }
 
+func TestDeferredOnlineRemainsLiveOnlyAndEmitsExistingEvent(t *testing.T) {
+	cache := inventory.NewCache()
+	defer cache.Stop()
+	broker := api.NewBroker(cache)
+	defer broker.Stop()
+	client := broker.Subscribe("volatile-online", 0)
+	defer broker.Unsubscribe(client.ID)
+	store, err := storage.NewStorage(t.TempDir() + "/volatile-online.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	engine := NewEngine(cache, broker)
+	engine.SetStorage(store)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	device := &models.Device{DeviceID: "dev_online", PDID: "pdid_online", FirstSeen: now, LastSeen: now,
+		PendingOnlineObs: []string{"netlink"}}
+	if err := store.SaveDevice(device); err != nil {
+		t.Fatal(err)
+	}
+	cache.Upsert(device)
+	engine.scheduleDeferredOnline(device.PDID, time.Minute)
+	engine.flushDeferredOnline(now.Add(2 * time.Minute))
+
+	if live := cache.Get(device.PDID); live == nil || !live.Online || len(live.PendingOnlineObs) != 0 {
+		t.Fatalf("live presence was not promoted: %+v", live)
+	}
+	select {
+	case event := <-client.Events:
+		if event.Type != models.EventDeviceOnline || event.DeviceID != device.PDID {
+			t.Fatalf("existing SSE event contract changed: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("online SSE event was not emitted")
+	}
+	durable, err := store.LoadHydrate()
+	if err != nil || len(durable) != 1 || durable[0].Online || len(durable[0].PendingOnlineObs) != 0 {
+		t.Fatalf("volatile online state reached SQLite: devices=%+v err=%v", durable, err)
+	}
+}
+
 func TestObservationStormIsDeduplicatedAndBounded(t *testing.T) {
 	cache := inventory.NewCache()
 	defer cache.Stop()
@@ -74,7 +115,7 @@ func TestObservationStormIsDeduplicatedAndBounded(t *testing.T) {
 	}
 }
 
-func TestStableHeartbeatWriteBudget(t *testing.T) {
+func TestStableHeartbeatAndAliasActivityAreMemoryOnly(t *testing.T) {
 	cache := inventory.NewCache()
 	defer cache.Stop()
 	broker := api.NewBroker(cache)
@@ -86,25 +127,55 @@ func TestStableHeartbeatWriteBudget(t *testing.T) {
 	defer store.Close()
 	engine := NewEngine(cache, broker)
 	engine.SetStorage(store)
-	now := time.Now()
-
-	engine.markSeenDirty("pdid_heartbeat", now)
-	engine.dirtyMu.Lock()
-	delete(engine.dirtyDevices, "pdid_heartbeat")
-	engine.dirtyMu.Unlock()
-	engine.markSeenDirty("pdid_heartbeat", now.Add(stableHeartbeatWriteInterval-time.Second))
-	engine.dirtyMu.Lock()
-	_, tooSoon := engine.dirtyDevices["pdid_heartbeat"]
-	engine.dirtyMu.Unlock()
-	if tooSoon {
-		t.Fatal("stable heartbeat scheduled a write before the five-minute budget")
+	mac, _ := net.ParseMAC("00:11:22:33:44:55")
+	initialSeen := time.Now().Add(-20 * time.Minute).UTC().Truncate(time.Millisecond)
+	obs := discovery.Observation{
+		Source: "openwrt_ap", Group: discovery.GroupA, MAC: mac,
+		IP: net.ParseIP("192.168.1.20"), Online: true, Confidence: .9,
+		Timestamp: initialSeen,
 	}
-	engine.markSeenDirty("pdid_heartbeat", now.Add(stableHeartbeatWriteInterval))
-	engine.dirtyMu.Lock()
-	_, due := engine.dirtyDevices["pdid_heartbeat"]
-	engine.dirtyMu.Unlock()
-	if !due {
-		t.Fatal("stable heartbeat was not scheduled at the five-minute boundary")
+	engine.processObservation(obs)
+	devices := cache.List()
+	if len(devices) != 1 {
+		t.Fatalf("expected one correlated device, got %d", len(devices))
+	}
+	pdid := devices[0].PDID
+	durableDevices, err := store.LoadHydrate()
+	if err != nil || len(durableDevices) != 1 {
+		t.Fatalf("initial durable device: devices=%+v err=%v", durableDevices, err)
+	}
+	durableSeen := durableDevices[0].LastSeen
+	durableAliases, err := store.ListIdentityAliases(pdid)
+	if err != nil || len(durableAliases) == 0 {
+		t.Fatalf("initial durable aliases: aliases=%+v err=%v", durableAliases, err)
+	}
+	durableAliasSeen := durableAliases[0].LastSeen
+
+	// Bypass only the two-second input deduplicator; this models the next
+	// normal heartbeat without waiting in the test.
+	engine.dedupMu.Lock()
+	engine.lastSeenObs = make(map[string]time.Time)
+	engine.dedupMu.Unlock()
+	liveSeen := initialSeen.Add(10 * time.Minute)
+	obs.Timestamp = liveSeen
+	engine.processObservation(obs)
+	engine.flushDirty()
+
+	live := cache.Get(pdid)
+	if live == nil || !live.LastSeen.Equal(liveSeen) || !live.Online {
+		t.Fatalf("live REST/SSE cache was not refreshed: %+v", live)
+	}
+	profile, err := engine.GetIdentityProfile(pdid)
+	if err != nil || len(profile.Aliases) == 0 || !profile.Aliases[0].LastSeen.Equal(liveSeen) {
+		t.Fatalf("live identity activity was not overlaid: profile=%+v err=%v", profile, err)
+	}
+	durableDevices, err = store.LoadHydrate()
+	if err != nil || !durableDevices[0].LastSeen.Equal(durableSeen) {
+		t.Fatalf("heartbeat reached durable device state: devices=%+v err=%v", durableDevices, err)
+	}
+	durableAliases, err = store.ListIdentityAliases(pdid)
+	if err != nil || !durableAliases[0].LastSeen.Equal(durableAliasSeen) {
+		t.Fatalf("alias refresh reached durable state: aliases=%+v err=%v", durableAliases, err)
 	}
 }
 

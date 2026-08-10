@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,8 +29,6 @@ type PendingEventRecord struct {
 	Confirmations int
 	Sources       string
 }
-
-const hydrationOnlineFreshness = 3 * time.Minute
 
 type Storage struct {
 	mu       sync.Mutex
@@ -372,8 +371,6 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
 		return nil, fmt.Errorf("failed to query devices from DB: %w", err)
 	}
 	deviceMap := make(map[string]*models.Device)
-	loadedAt := time.Now()
-
 	for rows.Next() {
 		var d models.Device
 		var onlineInt int
@@ -397,10 +394,9 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
 
 		d.FirstSeen = firstSeen
 		d.LastSeen = lastSeen
-		age := loadedAt.Sub(lastSeen)
-		storedOnline := onlineInt == 1
-		freshOnline := !lastSeen.IsZero() && age >= 0 && age <= hydrationOnlineFreshness
-		d.Online = storedOnline && freshOnline
+		// Presence is session state. Never revive a device as online from disk;
+		// a fresh positive observation must establish current liveness.
+		d.Online = false
 		if lastEnrichedAt.Valid {
 			d.LastEnrichedAt = lastEnrichedAt.Time
 		}
@@ -418,12 +414,9 @@ func (s *Storage) LoadHydrate() ([]models.Device, error) {
 		_ = json.Unmarshal([]byte(servicesJSON), &d.Services)
 		_ = json.Unmarshal([]byte(tagsJSON), &d.Tags)
 		_ = json.Unmarshal([]byte(sourceInfoJSON), &d.SourceInfo)
-		_ = json.Unmarshal([]byte(pendingOnlineJSON), &d.PendingOnlineObs)
-		if storedOnline && !freshOnline {
-			// Pre-restart presence confirmations are stale session state. A fresh
-			// positive observation must re-establish online status.
-			d.PendingOnlineObs = nil
-		}
+		_ = onlineInt
+		_ = pendingOnlineJSON
+		d.PendingOnlineObs = nil
 
 		devCopy := d
 		deviceMap[d.PDID] = &devCopy
@@ -597,7 +590,7 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
 	if err != nil {
 		return fmt.Errorf("failed to encode tags for %s: %w", d.PDID, err)
 	}
-	sourceInfoJSON, err := json.Marshal(d.SourceInfo)
+	sourceInfoJSON, err := json.Marshal(materialSourceInfo(d.SourceInfo))
 	if err != nil {
 		return fmt.Errorf("failed to encode source metadata for %s: %w", d.PDID, err)
 	}
@@ -629,8 +622,7 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
             model=excluded.model,
             device_type=excluded.device_type,
             confidence=excluded.confidence,
-            last_seen=excluded.last_seen,
-            online=excluded.online,
+	            -- last_seen and online are intentionally volatile session state.
             last_enriched_at=excluded.last_enriched_at,
             last_nmap_scan_at=excluded.last_nmap_scan_at,
             nmap_attempt_count=excluded.nmap_attempt_count,
@@ -639,11 +631,35 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
             tags_json=excluded.tags_json,
             user_id=excluded.user_id,
             source_info_json=excluded.source_info_json,
-            pending_online_obs_json=excluded.pending_online_obs_json,
 	            is_tentative=excluded.is_tentative,
 	            identity_assurance=excluded.identity_assurance,
 	            identity_probability=excluded.identity_probability,
 	            identity_ambiguous=excluded.identity_ambiguous
+	        WHERE devices.device_id IS NOT excluded.device_id
+	           OR devices.identity_tier IS NOT excluded.identity_tier
+	           OR devices.identity_anchor IS NOT excluded.identity_anchor
+	           OR devices.canonical_hostname IS NOT excluded.canonical_hostname
+	           OR devices.current_mac IS NOT excluded.current_mac
+	           OR devices.current_ip IS NOT excluded.current_ip
+	           OR devices.hostname IS NOT excluded.hostname
+	           OR devices.friendly_name IS NOT excluded.friendly_name
+	           OR devices.manufacturer IS NOT excluded.manufacturer
+	           OR devices.vendor IS NOT excluded.vendor
+	           OR devices.model IS NOT excluded.model
+	           OR devices.device_type IS NOT excluded.device_type
+	           OR devices.confidence IS NOT excluded.confidence
+	           OR devices.last_enriched_at IS NOT excluded.last_enriched_at
+	           OR devices.last_nmap_scan_at IS NOT excluded.last_nmap_scan_at
+	           OR devices.nmap_attempt_count IS NOT excluded.nmap_attempt_count
+	           OR devices.is_fully_identified IS NOT excluded.is_fully_identified
+	           OR devices.services_json IS NOT excluded.services_json
+	           OR devices.tags_json IS NOT excluded.tags_json
+	           OR devices.user_id IS NOT excluded.user_id
+	           OR devices.source_info_json IS NOT excluded.source_info_json
+	           OR devices.is_tentative IS NOT excluded.is_tentative
+	           OR devices.identity_assurance IS NOT excluded.identity_assurance
+	           OR devices.identity_probability IS NOT excluded.identity_probability
+	           OR devices.identity_ambiguous IS NOT excluded.identity_ambiguous
 	    `, d.DeviceID, d.PDID, string(d.IdentityTier), d.IdentityAnchor, d.CanonicalHostname, d.CurrentMAC, d.CurrentIP, d.Hostname, d.FriendlyName, d.Manufacturer, d.Vendor, d.Model, d.DeviceType, d.Confidence, d.FirstSeen, d.LastSeen, onlineInt, d.LastEnrichedAt, d.LastNmapScanAt, d.NmapAttemptCount, isFullyIdentifiedInt, string(servicesJSON), string(tagsJSON), d.UserID, string(sourceInfoJSON), string(pendingOnlineJSON), isTentativeInt, string(d.IdentityAssurance), d.IdentityProbability, identityAmbiguousInt)
 
 	if err != nil {
@@ -709,6 +725,29 @@ func (s *Storage) saveDeviceTx(tx *sql.Tx, d *models.Device) error {
 	}
 
 	return nil
+}
+
+func materialSourceInfo(sourceInfo map[string]models.SourceMeta) map[string]models.SourceMeta {
+	if sourceInfo == nil {
+		return nil
+	}
+	result := make(map[string]models.SourceMeta, len(sourceInfo))
+	for source, meta := range sourceInfo {
+		meta.Timestamp = time.Time{}
+		if meta.Raw != nil {
+			filtered := make(map[string]interface{}, len(meta.Raw))
+			for key, value := range meta.Raw {
+				switch strings.ToLower(strings.TrimSpace(key)) {
+				case "lease_expires_at", "observation_timestamp", "observed_at", "poll_timestamp", "timestamp":
+					continue
+				}
+				filtered[key] = value
+			}
+			meta.Raw = filtered
+		}
+		result[source] = meta
+	}
+	return result
 }
 
 func (s *Storage) ReplaceDevicePDID(oldPDID, newPDID string, d *models.Device) error {
