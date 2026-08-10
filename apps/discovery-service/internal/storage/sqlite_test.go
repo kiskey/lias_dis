@@ -388,3 +388,98 @@ func sqliteTotalChanges(t *testing.T, s *Storage) int64 {
 	}
 	return changes
 }
+
+func TestReconcileZeroMACOrphanDuplicate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reconcile-orphan.db")
+	s, err := NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	owner := &models.Device{
+		DeviceID: "dev_owner_reconcile", PDID: "pdid_owner_reconcile",
+		CurrentMAC: "00:11:22:33:44:55", MACs: []string{"00:11:22:33:44:55"},
+		Hostname: "owner", FirstSeen: now, LastSeen: now,
+	}
+	if err := s.SaveDevice(owner); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.db.Exec(`
+		INSERT INTO devices(device_id, pdid, current_mac, hostname, first_seen, last_seen)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, "dev_orphan_reconcile", "pdid_orphan_reconcile", owner.CurrentMAC, "orphan-host", now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	repaired, err := s.ReconcileZeroMACOrphanDuplicates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired != 1 {
+		t.Fatalf("expected 1 repaired orphan, got %d", repaired)
+	}
+
+	var redirect string
+	if err := s.db.QueryRow(`SELECT new_pdid FROM pdid_redirects WHERE old_pdid = ?`, "pdid_orphan_reconcile").Scan(&redirect); err != nil || redirect != owner.PDID {
+		t.Fatalf("redirect=%q err=%v", redirect, err)
+	}
+
+	devices, err := s.LoadHydrate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].PDID != owner.PDID {
+		t.Fatalf("orphan still hydrated: %+v", devices)
+	}
+}
+
+func TestReconcileDoesNotAutoMergeVerifiedAliasOrphan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reconcile-ambiguous.db")
+	s, err := NewStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	owner := &models.Device{
+		DeviceID: "dev_owner_ambiguous", PDID: "pdid_owner_ambiguous",
+		CurrentMAC: "00:11:22:33:44:77", MACs: []string{"00:11:22:33:44:77"},
+		FirstSeen: now, LastSeen: now,
+	}
+	if err := s.SaveDevice(owner); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.db.Exec(`
+		INSERT INTO devices(device_id, pdid, current_mac, hostname, first_seen, last_seen)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, "dev_orphan_ambiguous", "pdid_orphan_ambiguous", owner.CurrentMAC, "ambiguous-host", now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO identity_aliases(device_id, alias_type, value_hash, source, confidence, verified, first_seen, last_seen)
+		VALUES (?, 'auth_alias', 'verified-different-device', 'test', 1.0, 1, ?, ?)
+	`, "dev_orphan_ambiguous", now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	repaired, err := s.ReconcileZeroMACOrphanDuplicates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired != 0 {
+		t.Fatalf("ambiguous orphan was auto-merged")
+	}
+
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM devices WHERE pdid = ?`, "pdid_orphan_ambiguous").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("ambiguous orphan missing count=%d err=%v", count, err)
+	}
+}

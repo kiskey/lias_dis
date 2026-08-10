@@ -65,3 +65,26 @@ func TestIPOwnershipReleasePreservesHistory(t *testing.T) {
 		t.Fatal("released IP still had a current owner")
 	}
 }
+
+func TestDormantHistoricalMACStillResolves(t *testing.T) {
+	cache := NewCache()
+	defer cache.Stop()
+
+	device := &models.Device{
+		DeviceID:   "dev_multi_mac",
+		PDID:       "pdid_multi_mac",
+		CurrentMAC: "00:11:22:33:44:66",
+		MACs:       []string{"00:11:22:33:44:55", "00:11:22:33:44:66"},
+		LastSeen:   time.Now().Add(-offlineTTL - time.Minute),
+		Online:     false,
+	}
+	cache.Upsert(device)
+	cache.purgeOffline()
+
+	for _, mac := range device.MACs {
+		got := cache.GetByMAC(mac)
+		if got == nil || got.PDID != device.PDID {
+			t.Fatalf("dormant historical MAC %s resolved to %+v", mac, got)
+		}
+	}
+}

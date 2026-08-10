@@ -905,6 +905,151 @@ func materialSourceInfo(sourceInfo map[string]models.SourceMeta) map[string]mode
 	return result
 }
 
+// ReconcileZeroMACOrphanDuplicates repairs only the confirmed corruption pattern
+// documented in DIS.md:
+//
+//	orphan devices.current_mac is owned by a different PDID in device_macs
+//	orphan owns zero rows in device_macs
+//	orphan has no verified identity aliases that would make the merge ambiguous
+//
+// device_macs remains the authoritative MAC ownership table. Ambiguous rows are
+// deliberately left untouched so an admin/review flow can inspect them later.
+func (s *Storage) ReconcileZeroMACOrphanDuplicates() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	type orphan struct {
+		OrphanPDID     string
+		OrphanDeviceID string
+		OwnerPDID      string
+		OwnerDeviceID  string
+		MAC            string
+	}
+
+	rows, err := s.db.Query(`
+		SELECT d.pdid, d.device_id, owner.pdid, owner_dev.device_id, d.current_mac
+		FROM devices d
+		JOIN device_macs owner ON owner.mac = d.current_mac
+		JOIN devices owner_dev ON owner_dev.pdid = owner.pdid
+		WHERE d.current_mac != ''
+		  AND owner.pdid != d.pdid
+		  AND NOT EXISTS (SELECT 1 FROM device_macs mine WHERE mine.pdid = d.pdid)
+		  AND NOT EXISTS (
+		      SELECT 1 FROM identity_aliases ia
+		      WHERE ia.device_id = d.device_id
+		        AND ia.verified = 1
+		        AND ia.revoked_at IS NULL
+		  )
+	`)
+	if err != nil {
+		return 0, err
+	}
+	var orphans []orphan
+	for rows.Next() {
+		var o orphan
+		if err := rows.Scan(&o.OrphanPDID, &o.OrphanDeviceID, &o.OwnerPDID, &o.OwnerDeviceID, &o.MAC); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		orphans = append(orphans, o)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	repaired := 0
+	for _, o := range orphans {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return repaired, err
+		}
+
+		committed := false
+		func() {
+			defer func() {
+				if !committed {
+					_ = tx.Rollback()
+				}
+			}()
+
+			var currentOwner string
+			err = tx.QueryRow(`SELECT pdid FROM device_macs WHERE mac = ?`, o.MAC).Scan(&currentOwner)
+			if err != nil || currentOwner != o.OwnerPDID {
+				return
+			}
+			var orphanMACRows int
+			if err = tx.QueryRow(`SELECT COUNT(*) FROM device_macs WHERE pdid = ?`, o.OrphanPDID).Scan(&orphanMACRows); err != nil || orphanMACRows != 0 {
+				return
+			}
+			var verifiedAliases int
+			if err = tx.QueryRow(`
+				SELECT COUNT(*) FROM identity_aliases
+				WHERE device_id = ? AND verified = 1 AND revoked_at IS NULL
+			`, o.OrphanDeviceID).Scan(&verifiedAliases); err != nil || verifiedAliases != 0 {
+				return
+			}
+
+			if _, err = tx.Exec(`
+				UPDATE devices
+				SET
+					hostname = CASE WHEN hostname = '' THEN (SELECT hostname FROM devices WHERE pdid = ?) ELSE hostname END,
+					canonical_hostname = CASE WHEN canonical_hostname = '' THEN (SELECT canonical_hostname FROM devices WHERE pdid = ?) ELSE canonical_hostname END,
+					friendly_name = CASE WHEN friendly_name = '' THEN (SELECT friendly_name FROM devices WHERE pdid = ?) ELSE friendly_name END,
+					manufacturer = CASE WHEN manufacturer = '' THEN (SELECT manufacturer FROM devices WHERE pdid = ?) ELSE manufacturer END,
+					vendor = CASE WHEN vendor = '' THEN (SELECT vendor FROM devices WHERE pdid = ?) ELSE vendor END,
+					model = CASE WHEN model = '' THEN (SELECT model FROM devices WHERE pdid = ?) ELSE model END,
+					device_type = CASE WHEN device_type = '' THEN (SELECT device_type FROM devices WHERE pdid = ?) ELSE device_type END,
+					confidence = MAX(confidence, (SELECT confidence FROM devices WHERE pdid = ?))
+				WHERE pdid = ?
+			`, o.OrphanPDID, o.OrphanPDID, o.OrphanPDID, o.OrphanPDID, o.OrphanPDID, o.OrphanPDID, o.OrphanPDID, o.OrphanPDID, o.OwnerPDID); err != nil {
+				return
+			}
+
+			if _, err = tx.Exec(`
+				INSERT OR IGNORE INTO identity_aliases(device_id, alias_type, value_hash, source, confidence, verified, first_seen, last_seen, revoked_at)
+				SELECT ?, alias_type, value_hash, source, confidence, verified, first_seen, last_seen, revoked_at
+				FROM identity_aliases WHERE device_id = ?
+			`, o.OwnerDeviceID, o.OrphanDeviceID); err != nil {
+				return
+			}
+			if _, err = tx.Exec(`DELETE FROM identity_aliases WHERE device_id = ?`, o.OrphanDeviceID); err != nil {
+				return
+			}
+			if _, err = tx.Exec(`
+				UPDATE identity_evidence
+				SET device_id = CASE WHEN device_id = ? THEN ? ELSE device_id END,
+				    candidate_device_id = CASE WHEN candidate_device_id = ? THEN ? ELSE candidate_device_id END
+				WHERE device_id = ? OR candidate_device_id = ?
+			`, o.OrphanDeviceID, o.OwnerDeviceID, o.OrphanDeviceID, o.OwnerDeviceID, o.OrphanDeviceID, o.OrphanDeviceID); err != nil {
+				return
+			}
+			if _, err = tx.Exec(`DELETE FROM identity_candidates WHERE source_pdid = ? OR target_pdid = ?`, o.OrphanPDID, o.OrphanPDID); err != nil {
+				return
+			}
+			if _, err = tx.Exec(`
+				INSERT OR IGNORE INTO pdid_redirects(old_pdid, new_pdid, reason, created_at)
+				VALUES (?, ?, 'zero_mac_orphan_duplicate', ?)
+			`, o.OrphanPDID, o.OwnerPDID, time.Now()); err != nil {
+				return
+			}
+			if _, err = tx.Exec(`DELETE FROM devices WHERE pdid = ?`, o.OrphanPDID); err != nil {
+				return
+			}
+			if err = tx.Commit(); err != nil {
+				return
+			}
+			committed = true
+			repaired++
+		}()
+	}
+
+	return repaired, nil
+}
+
 func (s *Storage) ReplaceDevicePDID(oldPDID, newPDID string, d *models.Device) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
