@@ -206,6 +206,7 @@ class App {
 
   handleRealtimeEvent(event) {
     const pdid = (event.payload && event.payload.pdid) || event.device_id || 'device';
+    const deviceName = this.deviceNameFromPDID(pdid);
     
     const confirmedBy = event.payload?.confirmed_by || [];
     const verifiedBadge = confirmedBy.length > 0
@@ -213,14 +214,14 @@ class App {
         : '';
 
     if (event.type === 'device.added') {
-      this.showToast(`✨ New Device Discovered: ${pdid}${verifiedBadge}`);
+      this.showToast(`✨ New Device Discovered: ${deviceName}${verifiedBadge}`);
     } else if (event.type === 'device.online') {
-      this.showToast(`🟢 Device Online: ${pdid}${verifiedBadge}`);
+      this.showToast(`🟢 Device Online: ${deviceName}${verifiedBadge}`);
     } else if (event.type === 'device.offline') {
-      this.showToast(`🔴 Device Offline: ${pdid}`);
+      this.showToast(`🔴 Device Offline: ${deviceName}`);
     } else if (event.type === 'device.reidentified') {
       const payload = event.payload || {};
-      this.showToast(`🔄 Device identified: ${payload.new_pdid || 'device'} (promoted from ${payload.reason || 'tentative'})`);
+      this.showToast(`🔄 Device identified: ${this.deviceNameFromPDID(payload.new_pdid || pdid)} (promoted from ${payload.reason || 'tentative'})`);
     } else if (event.type === 'security.alert') {
       this.showToast(`🚨 Security Alert: ${event.payload.details || 'Unknown alert'}`, 'danger');
     }
@@ -366,9 +367,38 @@ class App {
     return Number.isFinite(first) && (first & 2) === 2;
   }
 
+  displayDeviceName(device, fallback = 'Unknown Device') {
+    if (!device) return fallback;
+    const vendorModel = `${device.vendor || ''} ${device.model || ''}`.trim();
+    return device.friendly_name || device.hostname || vendorModel || device.current_mac || device.pdid || fallback;
+  }
+
+  deviceNameFromPDID(pdid) {
+    const device = this.devices.find(item => item.pdid === pdid);
+    return this.displayDeviceName(device, pdid || 'device');
+  }
+
+  findDeviceForPolicyTarget(targetID) {
+    if (!targetID) return null;
+    const target = String(targetID).trim();
+    const direct = this.devices.find(device => device.pdid === target);
+    if (direct) return direct;
+
+    // Defensive fallback for legacy/migrated policy references.
+    // Active Enforcements should still show the visible device identity
+    // instead of a raw stale target token whenever MAC history can resolve it.
+    const lowerTarget = target.toLowerCase();
+    return this.devices.find(device => {
+      const macs = [device.current_mac, ...(Array.isArray(device.macs) ? device.macs : [])]
+        .filter(Boolean)
+        .map(mac => String(mac).toLowerCase());
+      return macs.includes(lowerTarget);
+    }) || null;
+  }
+
   identityDeviceName(summary, fallbackPDID) {
     const device = this.devices.find(item => item.pdid === fallbackPDID);
-    return summary?.display_name || device?.friendly_name || device?.hostname || fallbackPDID;
+    return summary?.display_name || this.displayDeviceName(device, fallbackPDID || 'Unknown Device');
   }
 
   renderIdentityReviewView(container) {
@@ -655,8 +685,8 @@ class App {
         targetName = tag ? tag.name : p.target_id;
         targetColor = tag ? tag.color : '#8e8e93';
       } else if (p.type === 'device') {
-        const dev = this.devices.find(d => d.pdid === p.target_id);
-        targetName = dev ? (dev.friendly_name || dev.hostname || dev.pdid) : p.target_id;
+        const dev = this.findDeviceForPolicyTarget(p.target_id);
+        targetName = this.displayDeviceName(dev, p.target_id || 'Unknown Device');
       }
 
       let action = null;
@@ -743,8 +773,8 @@ class App {
               <div class="live-activity-status">${item.isGlobal ? (item.action === 'block' ? 'Global Block Active' : 'Global Allow Active') : (item.action === 'block' ? 'Internet Blocked' : 'Internet Allowed')}</div>
               <div class="live-activity-details">
                 <span class="group-dot" style="background-color: ${item.targetColor};"></span>
-                <strong>${item.targetName}</strong> 
-                <span style="color: var(--text-secondary); margin-left: 4px;">${item.scheduleName}</span>
+                <strong>${escapeHTML(item.targetName)}</strong> 
+                <span style="color: var(--text-secondary); margin-left: 4px;">${escapeHTML(item.scheduleName)}</span>
               </div>
             </div>
             ${item.isDST ? '<div class="dst-pill">DST Active</div>' : ''}
@@ -992,7 +1022,7 @@ class App {
   }
 
   renderDeviceCard(d) {
-    const dispName = d.friendly_name || d.hostname || `${d.vendor || ''} ${d.model || ''}`.trim() || d.current_mac || d.pdid;
+    const dispName = this.displayDeviceName(d, d?.pdid || 'Unknown Device');
     const tags = (d.tags && d.tags.length > 0) ? d.tags : ['generic'];
     const isInfra = tags.includes('infrastructure');
     
